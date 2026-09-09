@@ -191,8 +191,19 @@ pub async fn run(rt: Shared) {
 ///
 /// Three missed pings before giving up: one lost frame on a marina's Wi-Fi is not a dead socket, and
 /// reconnecting on every hiccup would be its own outage.
-const PING_EVERY: Duration = Duration::from_secs(30);
-const SILENCE_LIMIT: Duration = Duration::from_secs(95);
+///
+/// 🔴 TIGHTENED 2026-09-09 (30s/95s -> 10s/35s) because 95s of detection latency was a real product
+/// failure: the cloud relay edge resets this socket every 20 min-2 hr (Cloudflare recycling the
+/// hibernated connection — see brvg-cloud-server/src/hubLink.ts), the hub reconnected fine, but a
+/// valve command routed through the relay in that up-to-95s window got "no hub took that command."
+/// The web app has NO LAN path to the hub (browser mixed-content blocks http://hub from an https
+/// page), so it depends entirely on this socket. Faster pings catch a reset on the next ping WRITE
+/// (the os-error-10054 case) within ~10s instead of ~30, and shorten the silent-drop ceiling to
+/// ~35s. Still three intervals of grace, so a single lost frame is not mistaken for a dead peer —
+/// the pairing the test below enforces. The worker also now waits briefly for a reconnect before it
+/// answers "no hub", so a command arriving mid-reconnect rides over the gap instead of failing.
+const PING_EVERY: Duration = Duration::from_secs(10);
+const SILENCE_LIMIT: Duration = Duration::from_secs(35);
 
 /// PURE: has the peer gone silent long enough to call the socket dead?
 ///
