@@ -68,6 +68,10 @@ pub fn redact(text: &str, secret: &str) -> String {
 #[derive(Debug, PartialEq)]
 pub enum WorkerMessage {
     Keys(Vec<MemberKey>),
+    /// The worker's answer to our application ping. Its VALUE is nothing; its ARRIVAL is everything —
+    /// it is the one frame only the live Durable Object can send, which is why it, not a control-frame
+    /// PONG, is what proves the socket is real. See the heartbeat in `serve_once`.
+    Pong,
     Call {
         id: String,
         uid: String,
@@ -103,6 +107,7 @@ pub fn parse_worker_message(raw: &str) -> Option<WorkerMessage> {
     let f: RawFrame = serde_json::from_str(raw).ok()?;
     match f.kind.as_str() {
         "keys" => Some(WorkerMessage::Keys(f.keys.unwrap_or_default())),
+        "pong" => Some(WorkerMessage::Pong),
         "call" => {
             let id = f.id.filter(|s| !s.is_empty())?;
             // A call with no caller is not answerable: every action here is role-gated, and a
@@ -132,6 +137,13 @@ pub fn result_frame(id: &str, answer: &Answer) -> String {
         "body": answer.body,
     })
     .to_string()
+}
+
+/// PURE: the application heartbeat. A TEXT frame, deliberately — a control-frame PING is answered by
+/// the Cloudflare edge for a hibernating object, so it would prove the edge is reachable, not that
+/// the object still holds this socket. Only the live Durable Object answers this, with a `pong`.
+fn app_ping_frame() -> String {
+    r#"{"type":"ping"}"#.to_string()
 }
 
 fn hello_frame(cfg: &HubConfig) -> String {
@@ -189,6 +201,17 @@ pub async fn run(rt: Shared) {
 /// to notice: it ANSWERED pings and never SENT one, so nothing ever asked the connection a question
 /// it could fail to answer. A TCP connection that nobody writes to can stay "open" indefinitely.
 ///
+/// 🔴 THE FIRST FIX WAS INCOMPLETE, and the same failure recurred 2026-09-09. Sending a ping is not
+/// enough if it is a CONTROL-frame PING: the Durable Object hibernates between messages, and while it
+/// sleeps the Cloudflare EDGE answers control PINGs with PONGs itself — the object is never woken and
+/// never consulted. So the hub kept "seeing pongs" and reading `connected` while the object had again
+/// lost the socket, and a 1:00 PM valve command got "no hub took that command". The real question a
+/// heartbeat must ask is "is the OBJECT there", not "is the edge there". So the ping is now an
+/// APPLICATION message (TEXT `{"type":"ping"}`) that the object answers with a TEXT `pong`, and ONLY
+/// a TEXT frame counts as proof of life — a control PONG no longer does. TEXT wakes the object; the
+/// edge cannot forge the reply. See app_ping_frame, the `Message::Text` liveness rule, and
+/// brvg-cloud-server/src/hubLink.ts::webSocketMessage.
+///
 /// Three missed pings before giving up: one lost frame on a marina's Wi-Fi is not a dead socket, and
 /// reconnecting on every hiccup would be its own outage.
 ///
@@ -238,21 +261,25 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
             frame = read.next() => {
                 let Some(frame) = frame else { return Ok(()) }; // the stream ended cleanly
                 let frame = frame.map_err(|e| e.to_string())?;
-                // ANY frame is proof of life, a Pong included — that is the point of sending pings.
-                last_seen = tokio::time::Instant::now();
                 let text = match frame {
-                    Message::Text(t) => t,
+                    // Only a TEXT frame is proof of life. A control-frame PONG is NOT — the Cloudflare
+                    // edge answers our control PINGs itself while the object hibernates, so counting
+                    // one would recreate the exact half-open outage this heartbeat exists to prevent.
+                    // TEXT (keys / call / pong) can only come from the live object on the far end.
+                    Message::Text(t) => { last_seen = tokio::time::Instant::now(); t }
                     Message::Ping(p) => {
+                        // Answer for transport hygiene, but do NOT treat it as liveness.
                         write.send(Message::Pong(p)).await.map_err(|e| e.to_string())?;
                         continue;
                     }
                     Message::Close(_) => return Ok(()),
-                    // Binary/Pong/raw frames are not part of this protocol, but they still count as
-                    // liveness above before being dropped here.
+                    // Binary / control-frame Pong / raw frames carry nothing this protocol reads and,
+                    // deliberately, do not count as liveness.
                     _ => continue,
                 };
                 let Some(msg) = parse_worker_message(&text) else { continue };
                 match msg {
+                    WorkerMessage::Pong => { /* liveness already recorded above; nothing else to do */ }
                     WorkerMessage::Keys(keys) => {
                         crate::hlog!("hub: member keys pushed ({})", keys.len());
                         apply_keys(rt, keys).await;
@@ -277,7 +304,10 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
                         last_seen.elapsed().as_secs()
                     ));
                 }
-                write.send(Message::Ping(Vec::new())).await.map_err(|e| e.to_string())?;
+                // A TEXT ping, not a control-frame one: the object must answer it with a `pong`, and
+                // a hibernating object's control PINGs are answered by the edge instead — see
+                // app_ping_frame and the `Message::Text` liveness rule above.
+                write.send(Message::Text(app_ping_frame())).await.map_err(|e| e.to_string())?;
             }
         }
     }
@@ -338,6 +368,14 @@ mod tests {
         // "trust nobody" is a legitimate instruction — it must not read as "no message".
         assert_eq!(parse_worker_message(r#"{"type":"keys","keys":[]}"#), Some(WorkerMessage::Keys(vec![])));
         assert_eq!(parse_worker_message(r#"{"type":"keys"}"#), Some(WorkerMessage::Keys(vec![])));
+    }
+
+    #[test]
+    fn the_worker_pong_is_read_as_proof_of_life() {
+        // The frame whose ARRIVAL is the whole point: only the live object sends it, so it, not a
+        // control-frame PONG, is what the liveness check trusts. Losing this parse would silently
+        // reopen the half-open outage — a pong would fall through to "unknown frame" and be ignored.
+        assert_eq!(parse_worker_message(r#"{"type":"pong"}"#), Some(WorkerMessage::Pong));
     }
 
     #[test]
