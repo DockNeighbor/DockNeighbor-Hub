@@ -238,7 +238,14 @@ jobs:
 
       - name: Build the Windows installer
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y nsis
+          # The runner image ships a google-chrome apt source that periodically serves a
+          # hash-sum-mismatched index; `apt-get update` then exits non-zero and the old
+          # `update && install` chain short-circuited, so nsis never installed and the release
+          # died at `makensis: command not found` (exit 127). nsis lives in Ubuntu universe, not
+          # that repo — drop the offending source and don't let a partial update block the install.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list
+          sudo apt-get update -qq || true
+          sudo apt-get install -y nsis
           cp brvg-hub-windows-x64.exe daemon/windows/brvg-hub.exe
           cp brvg-hub-tray-windows-x64.exe daemon/windows/brvg-hub-tray.exe
           # -WX for the same reason as the ci.yml gate: NSIS recovers from an unknown $VARIABLE by
