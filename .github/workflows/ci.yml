@@ -117,7 +117,11 @@ jobs:
       # cannot afford, since nobody re-reads a green log.
       - name: Windows installer script compiles
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y nsis
+          # See daemon-release.yml: a flaky google-chrome apt source on the runner makes
+          # `apt-get update` fail intermittently; drop it so nsis (in universe) still installs.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list
+          sudo apt-get update -qq || true
+          sudo apt-get install -y nsis
           cp target/release/brvg-hub windows/brvg-hub.exe
           # The installer also embeds the tray monitor, so the gate needs a file at that name or
           # makensis fails on a missing File. Same Linux-ELF-wearing-a-.exe trick as above: this
