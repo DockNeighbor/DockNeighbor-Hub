@@ -280,6 +280,13 @@ pub struct Rt {
     /// nap and beats NOW (in ACTIVE cadence) instead of after the current — possibly 20-minute —
     /// interval. This is what makes quiet-mode backoff free of latency: the alarm path wakes it.
     pub wake: tokio::sync::Notify,
+    /// Rung by do_valve the instant a valve command executes, so the linktap poll loop breaks its
+    /// (up to 60s) nap and reports the new state to the cloud within a couple seconds instead of on
+    /// its next scheduled pass. The gateway PUSH already covers this when it is configured and
+    /// reaching us; this makes a command's own result reach the cloud promptly regardless — the
+    /// off-boat half of "the hub and the app should talk in real-time" (owner, 2026-08-31), the
+    /// on-boat half being valve_rev. See linktap_poll_loop.
+    pub linktap_wake: tokio::sync::Notify,
     /// Command ids this PROCESS has already acted on, so a command still in the queue (waiting for
     /// its ack to be read) is not run a second time. In-memory and bounded — forgetting an id is
     /// harmless (at worst one extra up-to-date check). See handle_agent_commands.
@@ -314,6 +321,7 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         update_available: tokio::sync::RwLock::new(None),
         last_activity_ms: AtomicI64::new(now_ms()),
         wake: tokio::sync::Notify::new(),
+        linktap_wake: tokio::sync::Notify::new(),
         handled_cmds: tokio::sync::Mutex::new(HashSet::new()),
         pending_acks: tokio::sync::Mutex::new(Vec::new()),
     })
@@ -1464,6 +1472,11 @@ async fn key_sync_loop(rt: Shared) {
 /// missed push cannot strand stale state.
 const LINKTAP_POLL_SECS: u64 = 60;
 
+/// After a valve command wakes the poll loop, wait this long before re-polling so the gateway has
+/// applied the command and its status read reflects the new state — a poll issued the same
+/// millisecond as the open could read the valve still closed and report a spurious "closed".
+const LINKTAP_WAKE_SETTLE: Duration = Duration::from_millis(1500);
+
 /// Longest a `/api/hub/linktap/state` call may be held open.
 ///
 /// 🔴 SIXTY, NOT TEN, AND THE REASON MATTERS. This was 10s to survive the worker relay's own 15s
@@ -1736,7 +1749,16 @@ async fn linktap_poll_loop(rt: Shared) {
                 .map(|h| h.min(Duration::from_secs(LINKTAP_POLL_SECS)))
                 .unwrap_or(Duration::from_secs(LINKTAP_POLL_SECS))
         };
-        tokio::time::sleep(nap).await;
+        // Sleep the computed nap, but cut it short the instant a valve command rings linktap_wake —
+        // then settle briefly so the gateway has applied the command before we read it back. A
+        // notify delivered mid-poll is not lost: Notify holds one permit, so the next `notified()`
+        // returns at once and this pass reports the change without waiting out the nap.
+        tokio::select! {
+            _ = tokio::time::sleep(nap) => {}
+            _ = rt.linktap_wake.notified() => {
+                tokio::time::sleep(LINKTAP_WAKE_SETTLE).await;
+            }
+        }
     }
 }
 
@@ -2137,6 +2159,13 @@ async fn do_valve(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             }
         }
     }
+
+    // 🔴 REPORT WHAT WE JUST DID, NOW. The valve state the app sees off-boat comes from the linktap
+    // poll loop, which otherwise sleeps up to LINKTAP_POLL_SECS between passes — so a command's
+    // result took up to a minute to reach the cloud (and the web app, which has no LAN path). Wake
+    // the loop: it re-polls after a short settle and reports the new state within a couple seconds.
+    // Fires for open AND close.
+    rt.linktap_wake.notify_one();
 
     ok_json(&serde_json::json!({ "ok": true }))
 }
