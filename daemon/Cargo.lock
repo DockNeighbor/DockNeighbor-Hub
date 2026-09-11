@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "brvg-hub"
-version = "0.3.34"
+version = "0.3.35"
 dependencies = [
  "axum",
  "futures-util",

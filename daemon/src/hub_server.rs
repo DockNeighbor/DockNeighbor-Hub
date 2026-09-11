@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 
@@ -329,6 +329,12 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
 
 pub fn router(rt: Shared) -> Router {
     Router::new()
+        // The local management web UI, served over plain HTTP on the LAN so a browser can open it
+        // directly at http://<hub-ip>:<port>/ — no cloud, no app, and (unlike the HTTPS web app) no
+        // mixed-content block reaching this HTTP hub. The page is inert static HTML/JS: it carries
+        // no secret and calls the SAME key-gated API below, so serving it unauthenticated changes
+        // no security boundary (the API is the boundary). Actions need a member key the user pastes.
+        .route("/", get(h_index))
         .route("/api/hub/status", get(h_status))
         .route("/api/hub/logs", get(h_logs))
         .route("/api/hub/config", post(h_config))
@@ -698,6 +704,12 @@ fn answer_response(a: Answer) -> Response {
 ///
 /// Nothing here is a secret. Anyone who can reach this port can already see it is open; telling
 /// them a hub answers on it, and whether it has a vehicle, adds nothing they could not infer.
+/// The local management web UI. Baked into the binary (include_str!) so a hub on a boat with no
+/// internet still serves its own console; inert static HTML that talks to the key-gated API.
+async fn h_index() -> Response {
+    Html(include_str!("../webui/index.html")).into_response()
+}
+
 async fn h_ping(State(rt): State<Shared>) -> Response {
     let damage = hub_config::config_damage_in(&rt.base);
     let cfg = hub_config::read_config_in(&rt.base);
@@ -2704,6 +2716,22 @@ mod tests {
         let (origin, _rt) = spawn_server(base, vec![key("owner")]).await;
         let r = reqwest::Client::new().get(format!("{origin}/api/hub/linktap/state")).send().await.unwrap();
         assert_eq!(r.status(), 401, "the LAN read is a member call like every other");
+    }
+
+    #[tokio::test]
+    async fn the_web_ui_is_served_unauthenticated_at_root() {
+        // The console page itself is inert static HTML with no secret, so it needs no key — the
+        // key-gated API it calls is the security boundary. A browser on the LAN must be able to open
+        // it directly (no mixed-content block, unlike the HTTPS app reaching this HTTP hub).
+        let base = temp_base("webui");
+        hub_config::write_config_in(&base, &valve_cfg(true)).unwrap();
+        let (origin, _rt) = spawn_server(base, vec![key("owner")]).await;
+        let r = reqwest::Client::new().get(format!("{origin}/")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.headers().get("content-type").unwrap().to_str().unwrap().contains("text/html"));
+        let body = r.text().await.unwrap();
+        assert!(body.contains("DockNeighbor Hub"), "serves the console page");
+        assert!(body.contains("x-brvg-key"), "the page authenticates its own API calls with a member key");
     }
 
     #[tokio::test]
