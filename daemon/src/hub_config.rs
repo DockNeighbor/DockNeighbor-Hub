@@ -98,7 +98,38 @@ pub struct HubConfig {
     /// to lock down. Never returned by any endpoint.
     #[serde(default)]
     pub shelly_secret: String,
+    /// A GPS/location source on the LAN (a cellular router's GPS, a NMEA feed) the hub POLLS and
+    /// reports as `gps.measurement`. Empty host ⇒ no source configured. The hub is the acquirer,
+    /// not the app: a browser cannot reach a LAN router over HTTPS, and only the hub is always
+    /// aboard. Its admin sign-in lives here for the same reason `token` does — this file is already
+    /// the hub's one credential store (SYSTEM/0600). Never returned in full by any endpoint.
+    #[serde(default)]
+    pub gps: GpsConfig,
 }
+
+/// The hub's GPS source: what to poll on the LAN and how to sign in. `kind` selects the driver
+/// (`cradlepoint` today). Mirrors the app's GpsSourceSpec so a source can be entered on the hub
+/// (console / app push) once, and polled with no app aboard.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GpsConfig {
+    /// Driver: `cradlepoint` (NCOS `/api/status/gps`). Others (peplink, nmea) are future drivers.
+    pub kind: String,
+    pub host: String,
+    /// Default 443 — a Cradlepoint CBA850 serves its NCOS API over HTTPS; `0`/absent ⇒ 443.
+    pub port: u16,
+    pub username: String,
+    /// Router admin password. Never returned by any endpoint (redacted in status like `token`).
+    pub password: String,
+    /// The `brv_gps_*` device id fixes are reported under — the app's gps_source record id, so the
+    /// cloud lands them on the SAME device the app created (hub takes over acquisition for it).
+    pub dev_id: String,
+    /// A configured-but-paused source. Absent ⇒ enabled when a host is set.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool { true }
 
 /// The hub's LinkTap configuration and the cloud's PERMISSION for it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -130,6 +161,7 @@ impl Default for HubConfig {
             member_keys: Vec::new(),
             linktap: LinkTapConfig::default(),
             shelly_secret: String::new(),
+            gps: GpsConfig::default(),
         }
     }
 }
@@ -413,9 +445,16 @@ mod tests {
                 dev_ids: vec!["aaaabbbbccccdddd".into()], allowed: true,
             },
             shelly_secret: "wh-secret".into(),
+            gps: GpsConfig {
+                kind: "cradlepoint".into(), host: "192.168.10.1".into(), port: 443,
+                username: "admin".into(), password: "routerpw".into(),
+                dev_id: "brv_gps_gkljr4kx9".into(), enabled: true,
+            },
         };
         let text = serde_json::to_string(&cfg).unwrap();
         assert_eq!(serde_json::from_str::<HubConfig>(&text).unwrap(), cfg);
+        // The GPS source round-trips as camelCase, password included (it is the hub's to hold).
+        assert!(text.contains("\"devId\":\"brv_gps_gkljr4kx9\""));
         // A file written by an older build (or hand-edited) must not fail to parse — and the
         // fields it does not know get REAL defaults: a #388-era hub.json must come up on the
         // default management port, not port 0.

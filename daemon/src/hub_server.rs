@@ -287,6 +287,9 @@ pub struct Rt {
     /// off-boat half of "the hub and the app should talk in real-time" (owner, 2026-08-31), the
     /// on-boat half being valve_rev. See linktap_poll_loop.
     pub linktap_wake: tokio::sync::Notify,
+    /// Rung by do_gps when the GPS source is (re)configured, so the poll loop reads a fix from the
+    /// new source at once instead of waiting out its interval.
+    pub gps_wake: tokio::sync::Notify,
     /// Command ids this PROCESS has already acted on, so a command still in the queue (waiting for
     /// its ack to be read) is not run a second time. In-memory and bounded — forgetting an id is
     /// harmless (at worst one extra up-to-date check). See handle_agent_commands.
@@ -333,6 +336,7 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         last_activity_ms: AtomicI64::new(now_ms()),
         wake: tokio::sync::Notify::new(),
         linktap_wake: tokio::sync::Notify::new(),
+        gps_wake: tokio::sync::Notify::new(),
         handled_cmds: tokio::sync::Mutex::new(HashSet::new()),
         pending_acks: tokio::sync::Mutex::new(Vec::new()),
         pending_reports: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -355,6 +359,7 @@ pub fn router(rt: Shared) -> Router {
         .route("/api/hub/clear", post(h_clear))
         .route("/api/hub/update", post(h_update))
         .route("/api/hub/linktap/valve", post(h_valve))
+        .route("/api/hub/gps", post(h_gps))
         .route("/api/hub/linktap/state", get(h_valve_state))
         // The GATEWAY's own push (vendor doc §4.1: full status on every change + a 2-min
         // heartbeat). ⚠️ UNAUTHENTICATED BY NECESSITY — the LinkTap gateway is a fixed-firmware
@@ -422,6 +427,37 @@ struct StatusBody {
     /// local app show "update available" next to the running version. Visibility only (phase 1a).
     #[serde(skip_serializing_if = "Option::is_none")]
     update_available: Option<String>,
+    /// The configured GPS source, REDACTED (host/port/username/device, never the password). Absent
+    /// when no source is set, so the console can show "add a GPS" vs the current one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gps: Option<GpsStatus>,
+}
+
+/// The GPS source as the status exposes it — deliberately without the password (only `hasPassword`),
+/// the same redaction rule the hub token follows.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GpsStatus {
+    kind: String,
+    host: String,
+    port: u16,
+    username: String,
+    dev_id: String,
+    enabled: bool,
+    has_password: bool,
+}
+
+fn gps_status(g: &hub_config::GpsConfig) -> Option<GpsStatus> {
+    if g.host.is_empty() { return None; }
+    Some(GpsStatus {
+        kind: g.kind.clone(),
+        host: g.host.clone(),
+        port: if g.port == 0 { 443 } else { g.port },
+        username: g.username.clone(),
+        dev_id: g.dev_id.clone(),
+        enabled: g.enabled,
+        has_password: !g.password.is_empty(),
+    })
 }
 
 async fn status_body(rt: &Rt) -> StatusBody {
@@ -442,6 +478,7 @@ async fn status_body(rt: &Rt) -> StatusBody {
         capabilities: capabilities_of(&cfg.linktap),
         shelly_ingest_armed: !cfg.shelly_secret.is_empty(),
         update_available: rt.update_available.read().await.clone(),
+        gps: gps_status(&cfg.gps),
     }
 }
 
@@ -523,6 +560,7 @@ pub async fn dispatch(rt: &Rt, caller: &Caller, method: &str, path: &str, body: 
         ("POST", "/api/hub/clear") => do_clear(rt, caller).await,
         ("POST", "/api/hub/update") => do_update(caller).await,
         ("POST", "/api/hub/linktap/valve") => do_valve(rt, caller, body).await,
+        ("POST", "/api/hub/gps") => do_gps(rt, caller, body).await,
         _ => err(404, "no such hub endpoint"),
     }
 }
@@ -904,6 +942,10 @@ async fn h_update(State(rt): State<Shared>, headers: HeaderMap) -> Response {
 
 async fn h_valve(State(rt): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     lan_call(&rt, &headers, "POST", "/api/hub/linktap/valve", &body).await
+}
+
+async fn h_gps(State(rt): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    lan_call(&rt, &headers, "POST", "/api/hub/gps", &body).await
 }
 
 
@@ -1811,6 +1853,56 @@ async fn linktap_poll_loop(rt: Shared) {
 /// running it on an unentitled vehicle is that a boat which was going to flood does not. There is
 /// no revenue to protect on the closing side of a valve.
 ///
+/// How often the hub reads a fix from the configured GPS source. One a minute matches the LinkTap
+/// floor and is plenty for a boat's position; the loop re-reads config each pass, so a source
+/// configured after boot is picked up with no restart.
+const GPS_POLL_SECS: u64 = 60;
+
+/// Poll the configured LAN GPS source and report `gps.measurement` — the hub as GPS acquirer
+/// (owner 2026-09-11). Reports through spool_report, so a fix taken while the uplink is down is
+/// queued and delivered on reconnect like any other telemetry. Errors are logged only when they
+/// CHANGE, so a boat with no lock (or a wrong password) does not fill the log once a minute.
+async fn gps_poll_loop(rt: Shared) {
+    let client = http_client();
+    let mut last_note: Option<String> = None; // dedupe the log line across identical passes
+    loop {
+        let g = hub_config::read_config_in(&rt.base).gps;
+        if !g.host.is_empty() && g.enabled && !g.dev_id.is_empty() {
+            let result = match g.kind.as_str() {
+                "cradlepoint" => crate::gps::poll_cradlepoint(&client, &g.host, g.port, &g.username, &g.password).await,
+                other => Err(format!("no driver for GPS source kind '{other}'")),
+            };
+            match result {
+                Ok(fix) => {
+                    if last_note.is_some() { crate::hlog!("gps: {} - fix acquired", g.host); last_note = None; }
+                    let mut params = vec![
+                        ("lat".to_string(), format!("{:.6}", fix.lat)),
+                        ("lon".to_string(), format!("{:.6}", fix.lon)),
+                    ];
+                    if let Some(acc) = fix.acc { params.push(("acc".to_string(), format!("{acc:.1}"))); }
+                    spool_report(&rt, &crate::linktap_runtime::Report {
+                        device: g.dev_id.clone(),
+                        event: "gps.measurement".to_string(),
+                        params,
+                    }).await;
+                }
+                Err(why) => {
+                    if last_note.as_deref() != Some(why.as_str()) {
+                        crate::hlog!("gps: {} - {why}", g.host);
+                        last_note = Some(why);
+                    }
+                }
+            }
+        } else {
+            last_note = None; // no source configured — reset so a later fault logs once
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(GPS_POLL_SECS)) => {}
+            _ = rt.gps_wake.notified() => {}
+        }
+    }
+}
+
 /// So: the machine supplies the gateway when it exists (it also carries `note_stop`, which is what
 /// makes the eventual close classify as `flood_shutoff` rather than `unknown`), and when it does
 /// not, the CONFIGURED gateway is used directly — `allowed` unread.
@@ -2105,6 +2197,8 @@ where
         // The LinkTap poll floor. It re-reads its own configuration each pass, so a gateway
         // configured (or a plan revoked) after boot is picked up without a restart.
         tokio::spawn(linktap_poll_loop(rt.clone()));
+        // GPS acquisition on the LAN — re-reads its own config each pass, same as the LinkTap loop.
+        tokio::spawn(gps_poll_loop(rt.clone()));
         // The outbound socket to the worker: remote control, and live member-key pushes. Failing
         // to connect is not fatal — the LAN API and the polling sync carry on without it.
         tokio::spawn(crate::hub_relay::run(rt.clone()));
@@ -2149,6 +2243,51 @@ struct ValveReq {
     /// The app's "Start 'Normal Run' when timer expires" checkbox, for a WASHDOWN. Carried on the
     /// run so the hub honours it whether or not any app is open — see cycle::should_resume_normal.
     resume_normal: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GpsReq {
+    #[serde(default)] kind: String,
+    #[serde(default)] host: String,
+    #[serde(default)] port: Option<u16>,
+    #[serde(default)] username: String,
+    /// Omitted ⇒ keep the stored password, so re-saving other fields never wipes the sign-in.
+    #[serde(default)] password: Option<String>,
+    #[serde(default)] dev_id: String,
+    #[serde(default)] enabled: Option<bool>,
+}
+
+/// Configure the LAN GPS source the hub polls (owner/co-owner). The hub is the acquirer now, so the
+/// router admin sign-in is entered ONCE here (hub console or an app push) and stored in the hub's
+/// credential file — never in app storage, never returned by any endpoint. See crate::gps.
+async fn do_gps(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
+    if !may_administer(&caller.role) {
+        return err(403, "configuring the GPS source needs a co-owner or the owner");
+    }
+    let req: GpsReq = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return err(422, &format!("invalid JSON body: {e}")),
+    };
+    {
+        let _g = rt.store.lock().await;
+        let mut cfg = hub_config::read_config_in(&rt.base);
+        cfg.gps.kind = req.kind.trim().to_string();
+        cfg.gps.host = req.host.trim().to_string();
+        cfg.gps.port = req.port.unwrap_or(0); // 0 ⇒ the driver defaults to 443
+        cfg.gps.username = req.username.trim().to_string();
+        if let Some(p) = req.password {
+            if !p.is_empty() { cfg.gps.password = p; }
+        }
+        cfg.gps.dev_id = req.dev_id.trim().to_string();
+        cfg.gps.enabled = req.enabled.unwrap_or(true);
+        if let Err(e) = hub_config::write_config_in(&rt.base, &cfg) {
+            return err(500, &e);
+        }
+    }
+    // Poll the just-configured source now rather than waiting out the interval.
+    rt.gps_wake.notify_one();
+    ok_json(&status_body(rt).await)
 }
 
 async fn do_valve(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
