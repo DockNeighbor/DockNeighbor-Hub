@@ -296,6 +296,17 @@ pub struct Rt {
     /// command; a self-update that actually swaps restarts BEFORE acking, on purpose (see
     /// run_commanded_self_update), so a crash mid-update leaves the command to be retried.
     pub pending_acks: tokio::sync::Mutex<Vec<String>>,
+    /// Telemetry reports the uplink refused or dropped, oldest first. A boat's cellular link fails
+    /// sends constantly (`report … failed to send`), and each failed report USED TO BE LOST — a gap
+    /// in the cloud with no retry. They now queue here and drain FIFO on the next successful send or
+    /// heartbeat. BOUNDED (drop-oldest at MAX_SPOOL_REPORTS): a long outage sheds the oldest samples
+    /// rather than growing without limit. In-memory only — a restart clears it, which is acceptable
+    /// (stale telemetry has little value, and restarts are rare). See spool_report / drain_reports.
+    pub pending_reports: tokio::sync::Mutex<std::collections::VecDeque<crate::linktap_runtime::Report>>,
+    /// Held for the duration of a drain so the poll loop and the heartbeat loop cannot drain at once
+    /// and double-send the front report. Pushes take `pending_reports` only briefly and never wait
+    /// on this, so enqueuing never blocks behind a network flush.
+    pub report_flush: tokio::sync::Mutex<()>,
 }
 
 /// Record that something happened locally and wake the heartbeat to report it immediately.
@@ -324,6 +335,8 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         linktap_wake: tokio::sync::Notify::new(),
         handled_cmds: tokio::sync::Mutex::new(HashSet::new()),
         pending_acks: tokio::sync::Mutex::new(Vec::new()),
+        pending_reports: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+        report_flush: tokio::sync::Mutex::new(()),
     })
 }
 
@@ -1295,6 +1308,9 @@ async fn heartbeat_loop(rt: Shared) {
                 Ok(body) => {
                     apply_linktap_reply(&rt, &body).await;
                     handle_agent_commands(&rt, &client, &body).await;
+                    // A good heartbeat means the uplink is up — flush any telemetry that failed to
+                    // send while it was down (drain_reports is a no-op when the queue is empty).
+                    drain_reports(&rt).await;
                 }
                 Err(e) => {
                     if !sending.is_empty() {
@@ -1884,57 +1900,124 @@ async fn forward_shelly_to_cloud(rt: &Rt, call: &ShellyCall) {
 /// Report one telemetry line to the cloud, through the same /api/agent path the heartbeat uses.
 /// Best-effort by design: telemetry that cannot be delivered must never block the valve logic that
 /// produced it.
-async fn spool_report(rt: &Rt, report: &crate::linktap_runtime::Report) {
-    // A report means the local state just changed — wake the heartbeat into ACTIVE cadence so the
-    // cloud/app track it live, even if the hub was in a 20-minute quiet nap.
-    note_activity(rt);
+/// The most telemetry the hub buffers across a uplink outage before shedding its oldest samples.
+/// ~4 hours at one report a minute — long enough to ride out a cellular dead zone, bounded so a
+/// multi-day outage cannot grow the queue without limit.
+const MAX_SPOOL_REPORTS: usize = 240;
+
+/// PURE: append to a bounded FIFO, dropping oldest entries to stay within `cap`. Returns how many
+/// were dropped — the stalest samples go first, because on a slow link the freshest state matters
+/// most and old readings are the least worth resending.
+fn push_bounded<T>(q: &mut std::collections::VecDeque<T>, item: T, cap: usize) -> usize {
+    q.push_back(item);
+    let mut dropped = 0;
+    while q.len() > cap {
+        q.pop_front();
+        dropped += 1;
+    }
+    dropped
+}
+
+/// The fate of one delivery attempt: delivered, worth retrying (the uplink), or hopeless (a refusal
+/// that will never change on a re-send — do not wedge the queue behind it).
+enum SendOutcome {
+    Sent,
+    Transient,
+    Permanent,
+}
+
+/// Deliver ONE telemetry report to `/api/agent`, classifying the result.
+///
+/// ⚠️ NAME OURSELVES AS THE VOUCHER. `/api/agent` authenticates the token against the token's OWN
+/// device; a hub speaks for hardware with no cloud credential (a LinkTap valve driven over the LAN),
+/// so it must claim its hub id or the worker looks up `agenttoken_lt_<valve>`, finds nothing, and
+/// answers 401 — which is how every valve measurement was silently dead 2026-08-26..31. The worker
+/// verifies this token against THIS hub id and then allows only `lt_*` devices
+/// (cloud-server agentToken.ts::hubMayReportFor).
+async fn send_report_once(rt: &Rt, report: &crate::linktap_runtime::Report) -> SendOutcome {
     let cfg = hub_config::read_config_in(&rt.base);
     if cfg.token.is_empty() || cfg.vid.is_empty() {
-        return;
+        return SendOutcome::Permanent; // unregistered — there is nothing to deliver to; do not hoard
     }
     let base = rt.worker_base.trim_end_matches('/');
-    let Ok(mut u) = url::Url::parse(&format!("{base}/api/agent")) else { return };
+    let Ok(mut u) = url::Url::parse(&format!("{base}/api/agent")) else { return SendOutcome::Permanent };
     u.query_pairs_mut()
         .append_pair("vid", &cfg.vid)
         .append_pair("device", &report.device)
         .append_pair("event", &report.event)
         .append_pair("t", &cfg.token);
-    // ⚠️ NAME OURSELVES AS THE VOUCHER. `/api/agent` authenticates a token against the token's OWN
-    // device, which is right for a router agent reporting as itself and wrong for a hub, whose job
-    // is to speak for hardware that has no cloud credential — a LinkTap valve is driven over the
-    // LAN and has never enrolled with anything.
-    //
-    // Without this the worker looks up `agenttoken_lt_<valve>`, finds nothing, and answers 401.
-    // That is not hypothetical: it is what happened to EVERY linktap.measurement from 2026-08-26 to
-    // 2026-08-31, leaving the vehicle with no valve state in the cloud at all.
-    //
-    // The claim is explicit on purpose — the worker verifies this token against THIS hub id and
-    // then allows only `lt_*` devices (cloud-server agentToken.ts::hubMayReportFor). Nothing is
-    // inferred from the shape of the request, so a token that is not a hub's vouches for nothing.
     if !cfg.hub_id.is_empty() {
         u.query_pairs_mut().append_pair("hub", &cfg.hub_id);
     }
     for (k, v) in &report.params {
         u.query_pairs_mut().append_pair(k, v);
     }
-    // 🔴 A NON-2xx IS A FAILURE. This used to be `if let Err(e) = ...send()`, which catches only a
-    // TRANSPORT error — a refusal is a perfectly good HTTP response, so `Ok(401)` fell through as
-    // success and logged nothing.
-    //
-    // That is not a tidiness point. Every `linktap.measurement` this hub has ever sent was answered
-    // 401 (the hub's token authenticates it for its OWN device id, not for `lt_<valve>`), so the
-    // vehicle's valve telemetry had been dead in the cloud since 2026-08-26 — four days — while the
-    // log stayed clean and every check said the reports were fine. The bug that hid the bug.
-    //
-    // Best-effort still: telemetry that cannot be delivered must never block the valve logic that
-    // produced it. Best-effort means DO NOT RETRY HERE, not DO NOT MENTION IT.
-    let outcome = match http_client().get(u).send().await {
-        Err(e) => Some(format!("failed to send: {}", e.without_url())),
-        Ok(res) => report_refusal(res.status().as_u16(), &report.device),
-    };
-    if let Some(why) = outcome {
-        crate::hlog!("linktap: report {} {why}", report.event);
+    match http_client().get(u).send().await {
+        // A transport error is the uplink, not the report — retry it.
+        Err(e) => {
+            crate::hlog!("linktap: report {} queued (failed to send: {})", report.event, e.without_url());
+            SendOutcome::Transient
+        }
+        Ok(res) => {
+            let code = res.status().as_u16();
+            match report_refusal(code, &report.device) {
+                None => SendOutcome::Sent,
+                // 5xx / 408 / 429 are the worker or edge having a moment — retry. Any other non-2xx
+                // is a refusal a re-send cannot fix (bad request, auth, not found); DROP it, or it
+                // would sit at the front of the queue forever and block every report behind it.
+                Some(why) => {
+                    if code >= 500 || code == 408 || code == 429 {
+                        crate::hlog!("linktap: report {} queued ({why})", report.event);
+                        SendOutcome::Transient
+                    } else {
+                        crate::hlog!("linktap: report {} dropped ({why})", report.event);
+                        SendOutcome::Permanent
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Flush queued telemetry oldest-first, stopping at the first TRANSIENT failure — the uplink is
+/// still down, so keep that report and the rest for the next drain. Serialized by `report_flush` so
+/// the poll loop and the heartbeat loop cannot drain at once and double-send. Pop-send-refront keeps
+/// a retryable report at the front without holding the queue lock across the network call.
+async fn drain_reports(rt: &Rt) {
+    let _flush = rt.report_flush.lock().await;
+    loop {
+        let next = { rt.pending_reports.lock().await.pop_front() };
+        let Some(r) = next else { break };
+        match send_report_once(rt, &r).await {
+            SendOutcome::Sent | SendOutcome::Permanent => {} // delivered, or hopeless — either way it leaves the queue
+            SendOutcome::Transient => {
+                rt.pending_reports.lock().await.push_front(r);
+                break; // uplink down — leave the backlog for the next successful send or heartbeat
+            }
+        }
+    }
+}
+
+/// Deliver a telemetry report, retrying past a flaky uplink.
+///
+/// 🔴 WHY A QUEUE AND NOT A FIRE-AND-FORGET SEND. This used to send once and, on failure, log and
+/// DROP the report — a permanent gap in the cloud for every `report … failed to send`, which on a
+/// boat's cellular link is constant. The state the app shows would simply skip whatever the hub
+/// observed while the uplink hiccuped. Now the report is enqueued (bounded) and the backlog drains
+/// the moment a send succeeds — here, and again after every good heartbeat (heartbeat_loop). Still
+/// never blocks the valve logic that produced it.
+async fn spool_report(rt: &Rt, report: &crate::linktap_runtime::Report) {
+    // A report means the local state just changed — wake the heartbeat into ACTIVE cadence so the
+    // cloud/app track it live, even if the hub was in a 20-minute quiet nap.
+    note_activity(rt);
+    let dropped = {
+        let mut q = rt.pending_reports.lock().await;
+        push_bounded(&mut q, report.clone(), MAX_SPOOL_REPORTS)
+    };
+    if dropped > 0 {
+        crate::hlog!("linktap: report backlog full - dropped {dropped} oldest sample(s)");
+    }
+    drain_reports(rt).await;
 }
 
 /// PURE: is this response a failure worth saying out loud, and what should the line say?
@@ -2188,6 +2271,19 @@ mod tests {
     use axum::extract::Query;
     use axum::Json;
     use std::collections::HashMap;
+
+    #[test]
+    fn the_report_spool_drops_its_oldest_when_full() {
+        use std::collections::VecDeque;
+        let mut q: VecDeque<u32> = VecDeque::new();
+        for i in 0..3 { assert_eq!(push_bounded(&mut q, i, 3), 0, "under cap drops nothing"); }
+        assert_eq!(Vec::from(q.clone()), vec![0, 1, 2]);
+        // At cap: the next push evicts the oldest (0), keeping the freshest three.
+        assert_eq!(push_bounded(&mut q, 3, 3), 1);
+        assert_eq!(Vec::from(q.clone()), vec![1, 2, 3], "oldest sample is the one shed, newest kept");
+        assert_eq!(push_bounded(&mut q, 4, 3), 1);
+        assert_eq!(Vec::from(q), vec![2, 3, 4]);
+    }
 
     #[test]
     fn heartbeat_backs_off_when_idle_and_speeds_up_after_an_event() {
