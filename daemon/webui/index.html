@@ -92,6 +92,36 @@
     <div id="valveList"><div class="muted">Loading…</div></div>
   </div>
 
+  <div class="card" id="gpsCard" hidden>
+    <h2>GPS / Location source</h2>
+    <div class="muted" style="margin-bottom:10px">The hub polls this device on the LAN and reports its position — no phone or app needed aboard. The router sign-in stays on the hub.</div>
+    <div id="gpsState" class="muted" style="margin-bottom:10px"></div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px 10px; max-width:520px">
+      <label>Type
+        <select id="gpsKind" class="form"><option value="cradlepoint">Cradlepoint (NCOS)</option></select>
+      </label>
+      <label>Device id (brv_gps_…)
+        <input type="text" id="gpsDevId" placeholder="brv_gps_…" autocomplete="off" spellcheck="false">
+      </label>
+      <label>Host / IP
+        <input type="text" id="gpsHost" placeholder="192.168.10.1" autocomplete="off" spellcheck="false">
+      </label>
+      <label>Port
+        <input type="number" id="gpsPort" value="443" min="1" max="65535">
+      </label>
+      <label>Username
+        <input type="text" id="gpsUser" placeholder="admin" autocomplete="off" spellcheck="false">
+      </label>
+      <label>Password
+        <input type="password" id="gpsPass" placeholder="(unchanged)" autocomplete="off">
+      </label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn" id="gpsSave">Save GPS source</button>
+      <span class="muted" id="gpsSaveMsg"></span>
+    </div>
+  </div>
+
   <div class="card" id="logCard" hidden>
     <div class="row" style="justify-content:space-between">
       <h2 style="margin:0">Recent log</h2>
@@ -166,8 +196,30 @@
       if (s.shellyIngestArmed) caps.push("shelly-ingest");
       txt("f_caps", caps.length ? caps.join(", ") : "none");
       if (s.updateAvailable) banner("warn", "Update available: "+s.updateAvailable+" (running "+s.version+"). Update from the app.");
+      renderGps(s.gps);
     });
   }
+
+  // ---- keyed: GPS source config --------------------------------------------
+  var gpsDirty = false; // don't stomp a field the user is editing on the 5s refresh
+  function renderGps(g){
+    if (!key) { $("gpsCard").hidden = true; return; }
+    $("gpsCard").hidden = false;
+    if (g) $("gpsState").innerHTML = '<span class="pill '+(g.enabled?"ok":"warn")+'">'+(g.enabled?"configured":"disabled")+'</span> '+esc(g.kind||"")+" · "+esc(g.host||"")+":"+esc(String(g.port||443))+(g.hasPassword?" · sign-in saved":' · <span class="pill bad">no password</span>');
+    else $("gpsState").textContent = "No GPS source configured yet.";
+    if (gpsDirty) return; // leave the form alone mid-edit
+    if (g){
+      $("gpsKind").value = g.kind||"cradlepoint";
+      $("gpsDevId").value = g.devId||"";
+      $("gpsHost").value = g.host||"";
+      $("gpsPort").value = g.port||443;
+      $("gpsUser").value = g.username||"";
+      $("gpsPass").placeholder = g.hasPassword ? "(unchanged — leave blank to keep)" : "router admin password";
+    }
+  }
+  ["gpsKind","gpsDevId","gpsHost","gpsPort","gpsUser","gpsPass"].forEach(function(id){
+    document.addEventListener("input", function(e){ if (e.target && e.target.id===id) gpsDirty = true; });
+  });
 
   // ---- keyed: valves --------------------------------------------------------
   function loadValves(){
@@ -244,9 +296,26 @@
   $("keyClear").addEventListener("click", function(){
     key = ""; try{ localStorage.removeItem(KEY_LS); }catch(e){}
     ["hubname","f_uptime","f_platform","f_vid","f_hubid","f_keys","f_caps"].forEach(function(id){ txt(id,"—"); });
-    $("valveCard").hidden = true; $("logCard").hidden = true; setKeyState(false,"");
+    $("valveCard").hidden = true; $("logCard").hidden = true; $("gpsCard").hidden = true; setKeyState(false,"");
   });
   $("logRefresh").addEventListener("click", loadLogs);
+  $("gpsSave").addEventListener("click", function(){
+    var body = {
+      kind: $("gpsKind").value,
+      devId: $("gpsDevId").value.trim(),
+      host: $("gpsHost").value.trim(),
+      port: parseInt($("gpsPort").value,10) || 443,
+      username: $("gpsUser").value.trim(),
+    };
+    var pw = $("gpsPass").value;
+    if (pw) body.password = pw; // omitted ⇒ hub keeps the stored one
+    $("gpsSaveMsg").textContent = "saving…";
+    api("/api/hub/gps", { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify(body) })
+      .then(function(r){
+        if (r.ok){ $("gpsSaveMsg").textContent = "saved"; $("gpsPass").value = ""; gpsDirty = false; loadStatus(); }
+        else { $("gpsSaveMsg").textContent = "failed ("+r.status+"): "+((r.body&&r.body.error)||r.body||""); }
+      });
+  });
   document.addEventListener("click", function(e){
     var o = e.target.getAttribute && e.target.getAttribute("data-open");
     var c = e.target.getAttribute && e.target.getAttribute("data-close");
