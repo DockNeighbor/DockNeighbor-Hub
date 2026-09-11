@@ -14,7 +14,7 @@
 # contract and its fixtures, not source — see the repo README.
 [package]
 name = "brvg-hub"
-version = "0.3.35"
+version = "0.3.36"
 description = "DockNeighbor hub — the always-on service that carries a vehicle's local work"
 edition = "2021"
 rust-version = "1.77.2"
