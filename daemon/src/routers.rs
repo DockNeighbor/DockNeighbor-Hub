@@ -167,18 +167,69 @@ fn str_of(v: Option<&Value>) -> Option<String> {
     if t.is_empty() { None } else { Some(t.to_string()) }
 }
 
+/// The most a `read` may answer. Under the relay's reply cap with room for the envelope.
+pub const MAX_READ_BYTES: usize = 256 * 1024;
+
+/// Validate a path for `read`: NCOS status or config only, one clean segment list, nothing that
+/// could be a query, a fragment, a traversal or a control endpoint.
+pub fn readable_path(raw: &str) -> Result<String, String> {
+    let p = raw.trim();
+    let ok_prefix = p.starts_with("/api/status/") || p.starts_with("/api/config/") || p == "/api/status" || p == "/api/config";
+    if !ok_prefix {
+        return Err("read takes an /api/status/… or /api/config/… path".into());
+    }
+    if p.contains("..") || p.contains("//") || p.contains('?') || p.contains('#') || p.ends_with('/') {
+        return Err("that is not a plain path".into());
+    }
+    if !p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.')) {
+        return Err("a path is letters, digits, '/', '_', '-' and '.'".into());
+    }
+    Ok(p.to_string())
+}
+
+/// Blank anything that looks like a credential, recursively, before a config read leaves the hub.
+/// A config tree carries the admin password hash, Wi-Fi keys, VPN secrets and SNMP communities;
+/// the person reading is control-or-above, and still has no business seeing those in a diagnostic.
+pub fn scrub_secrets(v: &mut Value) {
+    const NEEDLES: [&str; 9] = ["password", "passwd", "secret", "wpapsk", "psk", "private_key", "community", "token", "shared_key"];
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                let lk = k.to_ascii_lowercase();
+                if NEEDLES.iter().any(|n| lk.contains(n)) && !val.is_null() && !val.is_object() && !val.is_array() {
+                    *val = Value::String("•••".into());
+                } else {
+                    scrub_secrets(val);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(scrub_secrets),
+        _ => {}
+    }
+}
+
 /// NCOS envelope: `{success:true, data}` on success; anything else is a fault. Returns the payload.
 pub fn ncos_data(body: &Value) -> Result<&Value, String> {
     let Some(obj) = body.as_object() else {
         return Err("the router did not answer with JSON".into());
     };
     if obj.get("success") == Some(&Value::Bool(false)) {
-        let why = obj
-            .get("reason")
-            .or_else(|| obj.get("data"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("the router refused the request");
-        return Err(why.to_string());
+        // NCOS says WHY in `reason`, or in `data` — and a config write that fails validation puts
+        // the per-field complaint in `data` as an OBJECT, not a string. Carry it whatever its shape:
+        // "the router refused the request" told nobody what the CBA850 disliked about the APN write.
+        let why = obj.get("reason").or_else(|| obj.get("data")).filter(|v| !v.is_null());
+        return Err(match why {
+            Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+            Some(v) if !v.is_string() => {
+                let d = v.to_string();
+                if d.chars().count() > 300 {
+                    format!("the router refused the request: {}…", d.chars().take(300).collect::<String>())
+                } else {
+                    format!("the router refused the request: {d}")
+                }
+            }
+            _ => "the router refused the request".into(),
+        });
     }
     match obj.get("data") {
         Some(d) => Ok(d),
@@ -458,17 +509,38 @@ impl<'a> Ncos<'a> {
         parse_apn(&rules).ok_or_else(|| "the router reports no cellular WAN rule to read an APN from".into())
     }
 
-    /// Write the APN: `manual` with a name, or `auto` (clears the pinned name).
+    /// Write the APN: `manual` with a name, or `auto` (the modem picks the carrier profile).
+    ///
+    /// One PUT per LEAF, never the `modem` object: bench 2026-09-12 (CBA850 fw 7.0.50) — a PUT of
+    /// `{"apn_mode":"auto"}` to `/api/config/wan/rules2/<i>/modem` came back `success:false`, the
+    /// same way `/api/config/system/gps/enabled` is written as its own leaf and works. The name is
+    /// written FIRST so the mode flip never points at an empty name.
     pub async fn set_apn(&self, cfg: &ApnConfig) -> Result<ApnConfig, String> {
         let (idx, _) = self.apn().await?;
-        let body = if cfg.mode == "manual" {
+        let modem = format!("/api/config/wan/rules2/{idx}/modem");
+        if cfg.mode == "manual" {
             let apn = cfg.apn.as_deref().map(str::trim).filter(|a| !a.is_empty()).ok_or("an APN name is required for manual mode")?;
-            serde_json::json!({ "apn_mode": "manual", "manual_apn": apn })
+            self.put(&format!("{modem}/manual_apn"), &Value::String(apn.to_string())).await?;
+            self.put(&format!("{modem}/apn_mode"), &Value::String("manual".into())).await?;
         } else {
-            serde_json::json!({ "apn_mode": "auto" })
-        };
-        self.put(&format!("/api/config/wan/rules2/{idx}/modem"), &body).await?;
+            self.put(&format!("{modem}/apn_mode"), &Value::String("auto".into())).await?;
+        }
         Ok(self.apn().await?.1)
+    }
+
+    /// Read any `/api/status/…` or `/api/config/…` path — the diagnostic behind the app's router
+    /// "read a path" tool and the way a driver for a new model is bench-checked before it is written.
+    /// Read-only by construction (GET), scrubbed of anything that looks like a secret before it
+    /// leaves the hub, and capped so a whole config tree cannot be pulled through the relay.
+    pub async fn read_path(&self, path: &str) -> Result<Value, String> {
+        let path = readable_path(path)?;
+        let mut v = self.get(&path).await?;
+        scrub_secrets(&mut v);
+        let size = v.to_string().len();
+        if size > MAX_READ_BYTES {
+            return Err(format!("that path answers {size} bytes — ask for a narrower one (limit {MAX_READ_BYTES})"));
+        }
+        Ok(v)
     }
 
     pub async fn reboot(&self) -> Result<(), String> {
@@ -667,5 +739,56 @@ mod tests {
         assert_eq!(p.model.as_deref(), Some("CBA850"));
         let bad = Ncos::new(&client, "127.0.0.1", port, "admin", "wrong");
         assert_eq!(bad.probe().await.unwrap_err(), "unauthorized");
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_read_takes_status_or_config_paths_and_nothing_else() {
+        assert!(readable_path("/api/status/lan/clients").is_ok());
+        assert!(readable_path(" /api/config/wlan ").is_ok());
+        assert!(readable_path("/api/config/wan/rules2/0/modem").is_ok());
+        // Control endpoints reboot routers; the read tool must not reach them even with a GET.
+        assert!(readable_path("/api/control/system").is_err());
+        assert!(readable_path("/api/config/../control/system").is_err());
+        assert!(readable_path("/api/config/lan?x=1").is_err());
+        assert!(readable_path("/api/config/lan/").is_err());
+        assert!(readable_path("/api/status//lan").is_err());
+        assert!(readable_path("/api/config/lan;rm").is_err());
+        assert!(readable_path("").is_err());
+    }
+
+    #[test]
+    fn a_config_read_leaves_the_hub_without_its_secrets() {
+        let mut v = json!({
+            "system": { "admin": { "password": "$1$abc", "username": "admin" } },
+            "wlan": { "radio": [ { "bss": [ { "ssid": "Boat", "wpapsk": "hunter2", "enabled": true } ] } ] },
+            "vpn": { "ipsec": { "shared_key": "k" }, "sections": [] },
+            "snmp": { "community": "public" },
+            "nested": { "passwordPolicy": { "min": 8 } }
+        });
+        scrub_secrets(&mut v);
+        assert_eq!(v["system"]["admin"]["password"], "•••");
+        assert_eq!(v["system"]["admin"]["username"], "admin");
+        assert_eq!(v["wlan"]["radio"][0]["bss"][0]["wpapsk"], "•••");
+        assert_eq!(v["wlan"]["radio"][0]["bss"][0]["ssid"], "Boat");
+        assert_eq!(v["vpn"]["ipsec"]["shared_key"], "•••");
+        assert_eq!(v["snmp"]["community"], "•••");
+        // An OBJECT under a secret-looking key is descended into, not blanked — a policy is not a secret.
+        assert_eq!(v["nested"]["passwordPolicy"]["min"], 8);
+    }
+
+    #[test]
+    fn a_refusal_carries_the_routers_reason_whatever_its_shape() {
+        let s = ncos_data(&json!({"success": false, "reason": "bad value"})).unwrap_err();
+        assert_eq!(s, "bad value");
+        let o = ncos_data(&json!({"success": false, "data": {"apn_mode": "invalid choice"}})).unwrap_err();
+        assert!(o.contains("apn_mode") && o.contains("invalid choice"), "{o}");
+        let bare = ncos_data(&json!({"success": false})).unwrap_err();
+        assert_eq!(bare, "the router refused the request");
     }
 }

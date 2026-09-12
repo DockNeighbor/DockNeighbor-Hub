@@ -2135,6 +2135,11 @@ pub async fn linktap_flood_stop_all(rt: &Rt) {
             }).await;
         }
     }
+    // Ring the poll loop the way `do_valve` does, so the closed state is READ BACK and reported
+    // within seconds instead of on the next 60 s pass. The close itself is already done above;
+    // this is only about how soon the cloud (and the Water tab) learn about it — the WhatsApp
+    // session measured the cloud's valve state lagging a hub-local flood close by ~40 s+.
+    rt.linktap_wake.notify_one();
 }
 
 /// Forward a Shelly's report to the cloud AS THAT SHELLY — same endpoint and credential the sensor
@@ -2536,6 +2541,8 @@ struct RouterReq {
     /// `apn` action: `auto` | `manual` (+ `apn` name). Omitted ⇒ read only.
     #[serde(default)] mode: Option<String>,
     #[serde(default)] apn: Option<String>,
+    /// `read` action: the `/api/status/…` or `/api/config/…` path to read.
+    #[serde(default)] path: Option<String>,
 }
 
 /// What `probe` answers: identity plus the modem/WAN/GPS state read in the same breath, so the
@@ -2567,7 +2574,7 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
         Err(e) => return err(422, &format!("invalid JSON body: {e}")),
     };
     let action = req.action.trim().to_ascii_lowercase();
-    if action == "refresh" {
+    if action == "refresh" || action == "read" {
         if !may_control(&caller.role) {
             return err(403, "reading a router needs control access or above");
         }
@@ -2724,7 +2731,7 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             ok_json(&serde_json::json!({ "ok": true }))
         }
         // The per-router actions below all start by finding the router.
-        "refresh" | "apn" | "gps" | "password" | "reboot" => {
+        "refresh" | "read" | "apn" | "gps" | "password" | "reboot" => {
             let id = req.id.trim().to_string();
             let Some(r) = hub_config::read_config_in(&rt.base).routers.into_iter().find(|r| r.id == id) else {
                 return err(404, "no managed router with that id");
@@ -2815,6 +2822,18 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                             crate::hlog!("routers: {} - reboot requested by {}", r.host, caller.uid);
                             ok_json(&serde_json::json!({ "ok": true }))
                         }
+                        Err(why) => err(502, &why),
+                    }
+                }
+                // A read-only diagnostic: one NCOS status/config path, scrubbed and capped
+                // (routers::read_path). This is how a parser for a tree the bench has not seen yet
+                // (Wi-Fi, LAN, DHCP reservations) gets pinned to what the router actually says.
+                "read" => {
+                    let path = req.path.as_deref().unwrap_or("").to_string();
+                    let ncos = crate::routers::Ncos::for_router(&client, &r);
+                    match ncos.read_path(&path).await {
+                        Ok(data) => ok_json(&serde_json::json!({ "path": path.trim(), "data": data })),
+                        Err(why) if why.starts_with("read takes") || why.starts_with("that is not") || why.starts_with("a path is") => err(422, &why),
                         Err(why) => err(502, &why),
                     }
                 }
