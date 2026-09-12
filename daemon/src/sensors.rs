@@ -161,11 +161,11 @@ fn rand_u32() -> u32 {
 /// PURE: the app may not know the hub's LAN address (a phone that has only ever reached the hub
 /// through the cloud), so it writes `__HUB__` where the host goes and the hub — which does know —
 /// fills it in. A url without the placeholder passes through untouched.
-pub fn substitute_hub_host(hooks: &mut [DesiredHook], lan_ip: &str, port: u16) {
+pub fn substitute_hub_host(hooks: &mut [DesiredHook], lan_ip: &str) {
     for h in hooks.iter_mut() {
         for u in h.urls.iter_mut() {
             if u.contains("__HUB__") {
-                *u = u.replace("__HUB__", &format!("{lan_ip}")).replace(&format!("{lan_ip}:{port}"), &format!("{lan_ip}:{port}"));
+                *u = u.replace("__HUB__", lan_ip);
             }
         }
     }
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn hub_placeholder_becomes_the_hub_s_lan_address() {
         let mut hooks = vec![DesiredHook { event: "flood.alarm".into(), urls: vec!["http://__HUB__:8722/api/hub/shelly?vid=v".into(), "https://api.dockneighbor.com/api/shelly?vid=v".into()] }];
-        substitute_hub_host(&mut hooks, "172.31.0.105", 8722);
+        substitute_hub_host(&mut hooks, "172.31.0.105");
         assert_eq!(hooks[0].urls, vec!["http://172.31.0.105:8722/api/hub/shelly?vid=v".to_string(), "https://api.dockneighbor.com/api/shelly?vid=v".to_string()]);
     }
 

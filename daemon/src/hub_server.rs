@@ -2876,9 +2876,8 @@ async fn do_sensors(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             }
             // `__HUB__` ⇒ this hub's own LAN address (the phone may only know the hub via the cloud).
             if hooks.iter().any(|h| h.urls.iter().any(|u| u.contains("__HUB__"))) {
-                let cfg0 = hub_config::read_config_in(&rt.base);
                 match crate::linktap_discover::local_ipv4s().into_iter().next() {
-                    Some(ip) => crate::sensors::substitute_hub_host(&mut hooks, &ip, cfg0.http_port),
+                    Some(ip) => crate::sensors::substitute_hub_host(&mut hooks, &ip),
                     None => {
                         // No LAN address to offer: keep the cloud urls, drop the hub ones rather
                         // than writing a url the sensor can never dial.
