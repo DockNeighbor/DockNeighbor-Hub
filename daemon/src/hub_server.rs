@@ -298,6 +298,11 @@ pub struct Rt {
     pub router_state: tokio::sync::RwLock<HashMap<String, crate::routers::Snapshot>>,
     /// Rings the router poll loop to read now — after an add/edit, or an owner's Refresh.
     pub router_wake: tokio::sync::Notify,
+    /// Sensor wiring (sensors.rs): each pending job's live state, keyed by Shelly id. The hunt loop
+    /// writes; `/api/hub/sensors` and the status read. Jobs themselves persist in hub.json.
+    pub sensor_state: tokio::sync::RwLock<HashMap<String, crate::sensors::SensorState>>,
+    /// Rings the hunt loop — a job was added, or a sensor just reported from an address.
+    pub sensor_wake: tokio::sync::Notify,
     /// Command ids this PROCESS has already acted on, so a command still in the queue (waiting for
     /// its ack to be read) is not run a second time. In-memory and bounded — forgetting an id is
     /// harmless (at worst one extra up-to-date check). See handle_agent_commands.
@@ -349,6 +354,8 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         gps_wake: tokio::sync::Notify::new(),
         router_state: tokio::sync::RwLock::new(HashMap::new()),
         router_wake: tokio::sync::Notify::new(),
+        sensor_state: tokio::sync::RwLock::new(HashMap::new()),
+        sensor_wake: tokio::sync::Notify::new(),
         handled_cmds: tokio::sync::Mutex::new(HashSet::new()),
         pending_acks: tokio::sync::Mutex::new(Vec::new()),
         pending_reports: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -373,6 +380,7 @@ pub fn router(rt: Shared) -> Router {
         .route("/api/hub/linktap/valve", post(h_valve))
         .route("/api/hub/gps", post(h_gps))
         .route("/api/hub/routers", get(h_routers_list).post(h_routers))
+        .route("/api/hub/sensors", get(h_sensors_list).post(h_sensors))
         .route("/api/hub/linktap/state", get(h_valve_state))
         // The GATEWAY's own push (vendor doc §4.1: full status on every change + a 2-min
         // heartbeat). ⚠️ UNAUTHENTICATED BY NECESSITY — the LinkTap gateway is a fixed-firmware
@@ -454,6 +462,9 @@ struct StatusBody {
     /// The routers this hub manages (routers.rs), redacted, with what the last poll learned.
     /// Always present (empty when none) so a caller can tell "none configured" from "old daemon".
     routers: Vec<RouterStatus>,
+    /// Sensor wiring jobs (sensors.rs) — pending, wired or failed — so the wizard can wait for
+    /// the hub's confirmation before it lets the user leave. Always present.
+    sensors: Vec<crate::sensors::SensorState>,
 }
 
 /// One managed router as the status exposes it — the config WITHOUT the password or the agent
@@ -534,8 +545,10 @@ fn gps_status(g: &hub_config::GpsConfig) -> Option<GpsStatus> {
 async fn status_body(rt: &Rt) -> StatusBody {
     let cfg = hub_config::read_config_in(&rt.base);
     let routers = routers_status(rt, &cfg).await;
+    let sensors = sensors_status(rt).await;
     StatusBody {
         routers,
+        sensors,
         config_damaged: hub_config::config_damage_in(&rt.base),
         registered: !cfg.token.is_empty(),
         hub_id: cfg.hub_id,
@@ -568,6 +581,8 @@ fn capabilities_of(lt: &hub_config::LinkTapConfig) -> Vec<String> {
     // shows "Cradlepoint / Peplink" in Add Router only when a hub advertising this is reachable
     // (owner: without a hub those vendors are not offered at all).
     caps.push("routers".to_string());
+    // Sensor wiring (sensors.rs): the hub finishes a sleepy sensor's setup on the LAN.
+    caps.push("sensors".to_string());
     caps
 }
 
@@ -641,6 +656,8 @@ pub async fn dispatch(rt: &Rt, caller: &Caller, method: &str, path: &str, body: 
         ("POST", "/api/hub/gps") => do_gps(rt, caller, body).await,
         ("GET", "/api/hub/routers") => do_routers_list(rt).await,
         ("POST", "/api/hub/routers") => do_routers(rt, caller, body).await,
+        ("GET", "/api/hub/sensors") => do_sensors_list(rt).await,
+        ("POST", "/api/hub/sensors") => do_sensors(rt, caller, body).await,
         _ => err(404, "no such hub endpoint"),
     }
 }
@@ -1080,6 +1097,14 @@ async fn h_routers(State(rt): State<Shared>, headers: HeaderMap, body: axum::bod
     lan_call(&rt, &headers, "POST", "/api/hub/routers", &body).await
 }
 
+async fn h_sensors_list(State(rt): State<Shared>, headers: HeaderMap) -> Response {
+    lan_call(&rt, &headers, "GET", "/api/hub/sensors", b"").await
+}
+
+async fn h_sensors(State(rt): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    lan_call(&rt, &headers, "POST", "/api/hub/sensors", &body).await
+}
+
 
 /// Valve state for a LOCAL app, with an optional wait.
 ///
@@ -1420,6 +1445,8 @@ async fn h_shelly(
     // a stop-and-confirm loop against a 15-second gateway timeout would produce a retry storm on
     // top of a flood. The spawned task starts immediately, so "before anything else" is measured
     // in microseconds, not in a round trip.
+    // Taken before the spawn moves `rt` and `call`: the wiring note below runs on this task.
+    let (rt_seen, seen_device, seen_ip) = (rt.clone(), call.device.clone(), peer.ip());
     tokio::spawn(async move {
         // ⚠️ THE CLOSE COMES FIRST, UNCONDITIONALLY, AND BEFORE ANY NETWORK CALL. Not after the
         // forward, not concurrently with it: the entire reason this route exists is the case where
@@ -1454,6 +1481,9 @@ async fn h_shelly(
         // agent-token vouch to cover every device id.
         forward_shelly_to_cloud(&rt, &call).await;
     });
+    // A report from a sensor the hub is still trying to WIRE says exactly where it is and that it
+    // is awake right now — the best moment there is. Remember the address and ring the hunt loop.
+    note_sensor_seen(&rt_seen, &seen_device, seen_ip).await;
     answer_response(ok_json(&serde_json::json!({ "ok": true })))
 }
 
@@ -2366,6 +2396,8 @@ where
         tokio::spawn(gps_poll_loop(rt.clone()));
         // Managed routers (routers.rs) — the hub reads each on its cadence and reports as it.
         tokio::spawn(router_poll_loop(rt.clone()));
+        // Sensor wiring — hunts each pending sleepy sensor on the LAN until it answers (sensors.rs).
+        tokio::spawn(sensor_hunt_loop(rt.clone()));
         // The outbound socket to the worker: remote control, and live member-key pushes. Failing
         // to connect is not fatal — the LAN API and the polling sync carry on without it.
         tokio::spawn(crate::hub_relay::run(rt.clone()));
@@ -2790,6 +2822,192 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             }
         }
         other => err(422, &format!("unknown action '{other}'")),
+    }
+}
+
+// --- Sensor wiring (sensors.rs) ---------------------------------------------------------------------
+
+async fn sensors_status(rt: &Rt) -> Vec<crate::sensors::SensorState> {
+    let mut v: Vec<_> = rt.sensor_state.read().await.values().cloned().collect();
+    v.sort_by_key(|s| std::cmp::Reverse(s.added_at));
+    v
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SensorsListBody {
+    sensors: Vec<crate::sensors::SensorState>,
+}
+
+async fn do_sensors_list(rt: &Rt) -> Answer {
+    ok_json(&SensorsListBody { sensors: sensors_status(rt).await })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SensorReq {
+    #[serde(default)] action: String,
+    #[serde(default)] id: String,
+    #[serde(default)] hosts: Vec<String>,
+    #[serde(default)] hooks: Vec<crate::sensors::DesiredHook>,
+    #[serde(default)] password: Option<String>,
+    #[serde(default)] ble_off: Option<bool>,
+}
+
+/// `wire` hands the hub a sleepy sensor to finish; `cancel` withdraws it; `forget` drops a finished
+/// entry from the list. Adding devices is co-owner+ (the same authority the wizard runs under).
+async fn do_sensors(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
+    if !may_administer(&caller.role) {
+        return err(403, "wiring a sensor needs a co-owner or the owner");
+    }
+    let req: SensorReq = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return err(422, &format!("invalid JSON body: {e}")),
+    };
+    let id = req.id.trim().to_ascii_lowercase();
+    if id.is_empty() {
+        return err(422, "id (the Shelly device id) is required");
+    }
+    match req.action.trim().to_ascii_lowercase().as_str() {
+        "wire" => {
+            let mut hooks: Vec<_> = req.hooks.into_iter().filter(|h| !h.event.is_empty() && !h.urls.is_empty()).collect();
+            if hooks.is_empty() {
+                return err(422, "at least one hook (event + urls) is required");
+            }
+            // `__HUB__` ⇒ this hub's own LAN address (the phone may only know the hub via the cloud).
+            if hooks.iter().any(|h| h.urls.iter().any(|u| u.contains("__HUB__"))) {
+                match crate::linktap_discover::local_ipv4s().into_iter().next() {
+                    Some(ip) => crate::sensors::substitute_hub_host(&mut hooks, &ip),
+                    None => {
+                        // No LAN address to offer: keep the cloud urls, drop the hub ones rather
+                        // than writing a url the sensor can never dial.
+                        for h in hooks.iter_mut() { h.urls.retain(|u| !u.contains("__HUB__")); }
+                        hooks.retain(|h| !h.urls.is_empty());
+                        if hooks.is_empty() { return err(409, "this hub has no LAN address to offer the sensor"); }
+                    }
+                }
+            }
+            let hosts: Vec<String> = req.hosts.into_iter().map(|h| h.trim().to_string()).filter(|h| !h.is_empty() && h != "0.0.0.0").collect();
+            let job = crate::sensors::SensorJob {
+                id: id.clone(),
+                hosts: if hosts.is_empty() { vec![format!("{id}.local")] } else { hosts },
+                hooks,
+                password: req.password.unwrap_or_default(),
+                ble_off: req.ble_off.unwrap_or(true),
+                added_at: now_ms(),
+            };
+            {
+                let _g = rt.store.lock().await;
+                let mut cfg = hub_config::read_config_in(&rt.base);
+                cfg.sensor_jobs.retain(|j| j.id != id);
+                cfg.sensor_jobs.push(job.clone());
+                if let Err(e) = hub_config::write_config_in(&rt.base, &cfg) {
+                    return err(500, &e);
+                }
+            }
+            let st = crate::sensors::SensorState::pending(&job);
+            rt.sensor_state.write().await.insert(id.clone(), st.clone());
+            crate::hlog!("sensors: {id} - wiring job accepted ({} hook(s), hosts {:?}, ble off {})", job.hooks.len(), job.hosts, job.ble_off);
+            rt.sensor_wake.notify_one();
+            ok_json(&st)
+        }
+        "cancel" | "forget" => {
+            {
+                let _g = rt.store.lock().await;
+                let mut cfg = hub_config::read_config_in(&rt.base);
+                cfg.sensor_jobs.retain(|j| j.id != id);
+                if let Err(e) = hub_config::write_config_in(&rt.base, &cfg) {
+                    return err(500, &e);
+                }
+            }
+            rt.sensor_state.write().await.remove(&id);
+            ok_json(&serde_json::json!({ "ok": true }))
+        }
+        other => err(422, &format!("unknown action '{other}'")),
+    }
+}
+
+/// A sensor with a pending job just reported from `ip`: put that address first and wake the hunt.
+async fn note_sensor_seen(rt: &Rt, device: &str, ip: std::net::IpAddr) {
+    let id = device.trim().to_ascii_lowercase();
+    if !rt.sensor_state.read().await.get(&id).map_or(false, |s| s.state == "pending") {
+        return;
+    }
+    let host = ip.to_string();
+    {
+        let _g = rt.store.lock().await;
+        let mut cfg = hub_config::read_config_in(&rt.base);
+        if let Some(j) = cfg.sensor_jobs.iter_mut().find(|j| j.id == id) {
+            j.hosts.retain(|h| h != &host);
+            j.hosts.insert(0, host.clone());
+            let _ = hub_config::write_config_in(&rt.base, &cfg);
+        }
+    }
+    crate::hlog!("sensors: {id} reported from {host} - wiring it now while it is awake");
+    rt.sensor_wake.notify_one();
+}
+
+/// Hunt every pending sensor across its candidate addresses, every few seconds, until it answers;
+/// then wire, verify, switch BLE off, and record the outcome. Pending jobs come from hub.json so a
+/// restart resumes them; a finished job leaves hub.json and stays in the in-memory list for the
+/// wizard (and the console) to read. Silence is logged only when it CHANGES.
+async fn sensor_hunt_loop(rt: Shared) {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(4)).build().expect("reqwest client");
+    // Adopt persisted jobs as pending on boot.
+    {
+        let cfg = hub_config::read_config_in(&rt.base);
+        let mut st = rt.sensor_state.write().await;
+        for j in &cfg.sensor_jobs {
+            st.entry(j.id.clone()).or_insert_with(|| crate::sensors::SensorState::pending(j));
+        }
+    }
+    loop {
+        let jobs = hub_config::read_config_in(&rt.base).sensor_jobs;
+        for job in &jobs {
+            let pending = rt.sensor_state.read().await.get(&job.id).map_or(true, |s| s.state == "pending");
+            if !pending {
+                continue;
+            }
+            let mut outcome: Option<crate::sensors::SensorState> = None;
+            let mut last_err: Option<String> = None;
+            for host in &job.hosts {
+                match crate::sensors::attempt(&client, job, host, now_ms()).await {
+                    Ok(Some(st)) => { outcome = Some(st); break; }
+                    Ok(None) => {}
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            match outcome {
+                Some(st) => {
+                    crate::hlog!(
+                        "sensors: {} - {} at {} ({} destination(s) verified{}){}",
+                        job.id, st.state, st.host.clone().unwrap_or_default(), st.confirmed.len(),
+                        if st.ble_disabled { ", Bluetooth off" } else { "" },
+                        st.last_error.as_ref().map(|e| format!(" - {e}")).unwrap_or_default()
+                    );
+                    rt.sensor_state.write().await.insert(job.id.clone(), st);
+                    let _g = rt.store.lock().await;
+                    let mut cfg = hub_config::read_config_in(&rt.base);
+                    cfg.sensor_jobs.retain(|j| j.id != job.id);
+                    let _ = hub_config::write_config_in(&rt.base, &cfg);
+                    note_activity(&rt);
+                }
+                None => {
+                    let mut st = rt.sensor_state.write().await;
+                    if let Some(s) = st.get_mut(&job.id) {
+                        s.attempts += 1;
+                        if s.last_error != last_err {
+                            if let Some(e) = &last_err { crate::hlog!("sensors: {} - {e}", job.id); }
+                            s.last_error = last_err;
+                        }
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(crate::sensors::HUNT_SECS)) => {}
+            _ = rt.sensor_wake.notified() => {}
+        }
     }
 }
 
@@ -3747,7 +3965,7 @@ mod tests {
             .get(format!("{origin}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
         // `routers` is unconditional (managed routers need no plan or gateway to be OFFERED).
-        assert_eq!(body["capabilities"], serde_json::json!(["linktap", "routers"]));
+        assert_eq!(body["capabilities"], serde_json::json!(["linktap", "routers", "sensors"]));
 
         let base2 = temp_base("caps_denied");
         hub_config::write_config_in(&base2, &valve_cfg(false)).unwrap();
@@ -3755,7 +3973,7 @@ mod tests {
         let body2: serde_json::Value = reqwest::Client::new()
             .get(format!("{origin2}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(body2["capabilities"], serde_json::json!(["routers"]), "an unpermitted plan must not advertise valve capability");
+        assert_eq!(body2["capabilities"], serde_json::json!(["routers", "sensors"]), "an unpermitted plan must not advertise valve capability");
 
         let base3 = temp_base("caps_nogw");
         hub_config::write_config_in(&base3, &seeded_cfg()).unwrap(); // allowed defaults false, no gateway
@@ -3763,7 +3981,7 @@ mod tests {
         let body3: serde_json::Value = reqwest::Client::new()
             .get(format!("{origin3}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(body3["capabilities"], serde_json::json!(["routers"]));
+        assert_eq!(body3["capabilities"], serde_json::json!(["routers", "sensors"]));
     }
 
     #[tokio::test]

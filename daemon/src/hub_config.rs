@@ -111,6 +111,10 @@ pub struct HubConfig {
     /// reason `gps.password` does. Never returned in full by any endpoint.
     #[serde(default)]
     pub routers: Vec<RouterConfig>,
+    /// Sensor wiring jobs still PENDING (sensors.rs) — persisted so a hub restart keeps hunting for
+    /// a sleepy sensor the app handed over. Finished jobs leave this list.
+    #[serde(default)]
+    pub sensor_jobs: Vec<crate::sensors::SensorJob>,
 }
 
 /// One managed router. Mirrors the app's network_device record (`brv_net_<mac>` id, vendor, host,
@@ -220,6 +224,7 @@ impl Default for HubConfig {
             shelly_secret: String::new(),
             gps: GpsConfig::default(),
             routers: Vec::new(),
+            sensor_jobs: Vec::new(),
         }
     }
 }
@@ -514,6 +519,7 @@ mod tests {
                 agent_token: "agt_1".into(), gps_enabled: true, gps_dev_id: "brv_gps_gkljr4kx9".into(),
                 poll_secs: 0, enabled: true,
             }],
+            sensor_jobs: Vec::new(),
         };
         let text = serde_json::to_string(&cfg).unwrap();
         assert_eq!(serde_json::from_str::<HubConfig>(&text).unwrap(), cfg);
