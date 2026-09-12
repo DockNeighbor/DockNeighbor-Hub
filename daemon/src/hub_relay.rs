@@ -146,11 +146,16 @@ fn app_ping_frame() -> String {
     r#"{"type":"ping"}"#.to_string()
 }
 
-fn hello_frame(cfg: &HubConfig) -> String {
+/// PURE. `lanIps` + `webVersion` + `httpPort` are how the cloud learns WHERE this hub is and
+/// whether it hosts the web app — the link-out to the local copy (App banner) is built from these.
+fn hello_frame(cfg: &HubConfig, lan_ips: &[String], web_version: Option<&str>) -> String {
     serde_json::json!({
         "type": "hello",
         "hubId": cfg.hub_id,
         "version": env!("CARGO_PKG_VERSION"),
+        "lanIps": lan_ips,
+        "webVersion": web_version,
+        "httpPort": cfg.http_port,
     })
     .to_string()
 }
@@ -246,8 +251,10 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
     // Split so the ping timer can write while the read half is parked on `next()`. Without this the
     // two borrows collide and the whole liveness check is impossible to express.
     let (mut write, mut read) = socket.split();
+    let lan_ips = crate::linktap_discover::local_ipv4s();
+    let web_version = rt.web.read().await.as_ref().map(|w| w.version.clone());
     write
-        .send(Message::Text(hello_frame(cfg)))
+        .send(Message::Text(hello_frame(cfg, &lan_ips, web_version.as_deref())))
         .await
         .map_err(|e| e.to_string())?;
 

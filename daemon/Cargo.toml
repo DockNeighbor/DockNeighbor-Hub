@@ -14,7 +14,7 @@
 # contract and its fixtures, not source — see the repo README.
 [package]
 name = "brvg-hub"
-version = "0.3.37"
+version = "0.3.38"
 description = "DockNeighbor hub — the always-on service that carries a vehicle's local work"
 edition = "2021"
 rust-version = "1.77.2"
@@ -45,6 +45,12 @@ serde_json = "1.0"
 # SHA-256 for verifying a downloaded release binary before self-update (pure Rust — cross-compiles
 # cleanly to the static-musl ARM target, no C toolchain needed).
 sha2 = "0.10"
+# The hub serves the web app it fetches from the App release (web_bundle.rs): minisign
+# verification against the updater key, gzip + tar to unpack, base64 for the .sig wrapping.
+minisign-verify = "0.2"
+flate2 = "1"
+tar = "0.4"
+base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
 axum = "0.8.4"
 url = "2"

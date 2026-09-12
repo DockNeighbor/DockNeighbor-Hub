@@ -271,6 +271,9 @@ pub struct Rt {
     /// the update-check loop, read by the heartbeat (so the fleet console sees it) and by
     /// /api/hub/status (so the local app does). Visibility only; nothing here installs anything.
     pub update_available: tokio::sync::RwLock<Option<String>>,
+    /// The web app this hub serves at `/` (web_bundle.rs) — None until a signed bundle has been
+    /// fetched from the App release. Swapped whole when a newer one is installed.
+    pub web: tokio::sync::RwLock<Option<crate::web_bundle::WebBundle>>,
     /// Epoch ms of the last local event worth reporting (a valve/gateway report or a forwarded
     /// sensor event). The heartbeat picks its cadence from how stale this is — recent ⇒ ACTIVE/
     /// NORMAL, long-idle ⇒ QUIET (report-by-exception, Phase 2). Boot counts as activity so a fresh
@@ -324,8 +327,10 @@ pub type Shared = Arc<Rt>;
 
 pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
     let keys = hub_config::read_config_in(&base).member_keys;
+    let web = crate::web_bundle::load_current(&base);
     Arc::new(Rt {
         base,
+        web: tokio::sync::RwLock::new(web),
         keys: tokio::sync::RwLock::new(keys),
         store: tokio::sync::Mutex::new(()),
         started: Instant::now(),
@@ -351,7 +356,7 @@ pub fn router(rt: Shared) -> Router {
         // mixed-content block reaching this HTTP hub. The page is inert static HTML/JS: it carries
         // no secret and calls the SAME key-gated API below, so serving it unauthenticated changes
         // no security boundary (the API is the boundary). Actions need a member key the user pastes.
-        .route("/", get(h_index))
+        .route("/console", get(h_index))
         .route("/api/hub/status", get(h_status))
         .route("/api/hub/logs", get(h_logs))
         .route("/api/hub/config", post(h_config))
@@ -385,6 +390,10 @@ pub fn router(rt: Shared) -> Router {
         .route("/api/hub/ping", get(h_ping))
         .route("/api/hub/identity", get(h_identity))
         .route("/api/hub/bootstrap", post(h_bootstrap))
+        // Everything that is not an API route or the console is the WEB APP (web_bundle.rs): its
+        // files by path, the SPA's index.html for any app route. Registered last so it can never
+        // shadow a route above it.
+        .fallback(h_web)
         .with_state(rt)
 }
 
@@ -431,6 +440,9 @@ struct StatusBody {
     /// when no source is set, so the console can show "add a GPS" vs the current one.
     #[serde(skip_serializing_if = "Option::is_none")]
     gps: Option<GpsStatus>,
+    /// The web app version this hub serves at `/`, when it has one (web_bundle.rs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    web_version: Option<String>,
 }
 
 /// The GPS source as the status exposes it — deliberately without the password (only `hasPassword`),
@@ -479,6 +491,7 @@ async fn status_body(rt: &Rt) -> StatusBody {
         shelly_ingest_armed: !cfg.shelly_secret.is_empty(),
         update_available: rt.update_available.read().await.clone(),
         gps: gps_status(&cfg.gps),
+        web_version: rt.web.read().await.as_ref().map(|w| w.version.clone()),
     }
 }
 
@@ -759,6 +772,50 @@ fn answer_response(a: Answer) -> Response {
 /// internet still serves its own console; inert static HTML that talks to the key-gated API.
 async fn h_index() -> Response {
     Html(include_str!("../webui/index.html")).into_response()
+}
+
+/// What `/` says before a web bundle has ever been fetched: plain, and pointing at the console
+/// so the box is still usable. Not a 404 — the hub is fine; it just has nothing to serve yet.
+const NO_WEB_BUNDLE_HTML: &str = concat!(
+    "<!doctype html><meta charset=utf-8><title>DockNeighbor Hub</title>",
+    "<body style=\"font-family:system-ui;margin:3rem;max-width:40rem\">",
+    "<h1>DockNeighbor Hub</h1>",
+    "<p>This hub has not downloaded the web app yet. It fetches the latest signed release on its ",
+    "next update check, which needs internet access.</p>",
+    "<p><a href=\"/console\">Open the hub console</a></p>",
+);
+
+/// The web app, from the bundle in service. A file inside the bundle is served as itself; any other
+/// path is the SPA's `index.html` (client-side routes). Unauthenticated by design — this is public
+/// application code, the same bytes app.dockneighbor.com serves; the API it talks to is still
+/// key-gated route by route. Path traversal is refused in web_bundle::resolve.
+async fn h_web(State(rt): State<Shared>, uri: axum::http::Uri) -> Response {
+    let Some(bundle) = rt.web.read().await.clone() else {
+        return Html(NO_WEB_BUNDLE_HTML).into_response();
+    };
+    if let Some(path) = crate::web_bundle::resolve(&bundle.dir, uri.path()) {
+        return match tokio::fs::read(&path).await {
+            Ok(bytes) => {
+                let ct = crate::web_bundle::content_type(&path);
+                // Hashed Vite assets are immutable by name; index.html and the rest must revalidate
+                // so a newly installed bundle is picked up on the next load.
+                let cache = if uri.path().starts_with("/assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, ct), (axum::http::header::CACHE_CONTROL, cache)],
+                    bytes,
+                )
+                    .into_response()
+            }
+            Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        };
+    }
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"), (axum::http::header::CACHE_CONTROL, "no-cache")],
+        bundle.index,
+    )
+        .into_response()
 }
 
 async fn h_ping(State(rt): State<Shared>) -> Response {
@@ -1327,6 +1384,14 @@ async fn h_shelly(
 
 // --- Loops --------------------------------------------------------------------------------------
 
+/// For the web bundle download only — see update_check_loop.
+fn web_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .build()
+        .expect("reqwest client")
+}
+
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -1398,6 +1463,19 @@ async fn update_check_loop(rt: Shared) {
                     None => if slot.is_some() { crate::hlog!("hub: now up to date at {current}") },
                 }
                 *slot = available;
+            }
+        }
+        // The WEB APP rides the same cadence (web_bundle.rs). Its own client: a bundle is a few MB
+        // and a Starlink afternoon is not a 20 s affair. A failure keeps the bundle in service.
+        {
+            let current = rt.web.read().await.as_ref().map(|w| w.version.clone());
+            match crate::web_bundle::refresh(&web_client(), &rt.base, current.as_deref()).await {
+                Ok(Some(b)) => {
+                    crate::hlog!("hub: web app {} in service from the latest app release", b.version);
+                    *rt.web.write().await = Some(b);
+                }
+                Ok(None) => {}
+                Err(e) => crate::hlog!("hub: web app not refreshed - {e}"),
             }
         }
         tokio::time::sleep(Duration::from_secs(UPDATE_CHECK_SECS)).await;
@@ -2251,7 +2329,9 @@ struct GpsReq {
     #[serde(default)] kind: String,
     #[serde(default)] host: String,
     #[serde(default)] port: Option<u16>,
-    #[serde(default)] username: String,
+    /// Omitted ⇒ keep the stored username — the same rule as the password, so a partial re-send
+    /// (host/port only) never blanks the sign-in. An explicit "" clears it.
+    #[serde(default)] username: Option<String>,
     /// Omitted ⇒ keep the stored password, so re-saving other fields never wipes the sign-in.
     #[serde(default)] password: Option<String>,
     #[serde(default)] dev_id: String,
@@ -2275,7 +2355,9 @@ async fn do_gps(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
         cfg.gps.kind = req.kind.trim().to_string();
         cfg.gps.host = req.host.trim().to_string();
         cfg.gps.port = req.port.unwrap_or(0); // 0 ⇒ the driver defaults to 443
-        cfg.gps.username = req.username.trim().to_string();
+        if let Some(u) = req.username {
+            cfg.gps.username = u.trim().to_string();
+        }
         if let Some(p) = req.password {
             if !p.is_empty() { cfg.gps.password = p; }
         }
@@ -2961,12 +3043,94 @@ mod tests {
         let base = temp_base("webui");
         hub_config::write_config_in(&base, &valve_cfg(true)).unwrap();
         let (origin, _rt) = spawn_server(base, vec![key("owner")]).await;
-        let r = reqwest::Client::new().get(format!("{origin}/")).send().await.unwrap();
+        let r = reqwest::Client::new().get(format!("{origin}/console")).send().await.unwrap();
         assert_eq!(r.status(), 200);
         assert!(r.headers().get("content-type").unwrap().to_str().unwrap().contains("text/html"));
         let body = r.text().await.unwrap();
         assert!(body.contains("DockNeighbor Hub"), "serves the console page");
         assert!(body.contains("x-brvg-key"), "the page authenticates its own API calls with a member key");
+    }
+
+    #[tokio::test]
+    async fn root_says_no_web_app_yet_until_a_bundle_is_installed() {
+        let base = temp_base("noweb");
+        hub_config::write_config_in(&base, &valve_cfg(true)).unwrap();
+        let (origin, _rt) = spawn_server(base, vec![key("owner")]).await;
+        let r = reqwest::Client::new().get(format!("{origin}/")).send().await.unwrap();
+        assert_eq!(r.status(), 200, "the hub is fine, it just has nothing to serve");
+        let body = r.text().await.unwrap();
+        assert!(body.contains("has not downloaded the web app yet"), "{body}");
+        assert!(body.contains("/console"), "points at the console so the box stays usable");
+        // Unknown API-shaped paths are NOT the SPA fallback's business either way.
+        let r = reqwest::Client::new().get(format!("{origin}/api/hub/nope")).send().await.unwrap();
+        assert_ne!(r.status(), 404, "the fallback answers it (200 placeholder), not axum's 404");
+    }
+
+    /// A tiny tar.gz bundle: index.html + one hashed asset, as a Vite build lays them out.
+    fn tiny_web_bundle() -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let gz = flate2::write::GzEncoder::new(&mut out, flate2::Compression::fast());
+            let mut ar = tar::Builder::new(gz);
+            for (name, body) in [("index.html", "<!doctype html><html><head><title>DockNeighbor</title></head><body>app</body></html>"), ("assets/index-abc123.js", "console.log(1)")] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(body.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                ar.append_data(&mut h, name, body.as_bytes()).unwrap();
+            }
+            ar.into_inner().unwrap().finish().unwrap();
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn serves_the_installed_web_app_files_and_spa_routes_and_refuses_traversal() {
+        let base = temp_base("web");
+        hub_config::write_config_in(&base, &valve_cfg(true)).unwrap();
+        crate::web_bundle::install(&base, "1.0.104", &tiny_web_bundle()).unwrap();
+        let (origin, rt) = spawn_server(base, vec![key("owner")]).await;
+        let c = reqwest::Client::new();
+
+        // index.html at /, told it is hub-served, never cached.
+        let r = c.get(format!("{origin}/")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.headers().get("content-type").unwrap().to_str().unwrap().starts_with("text/html"));
+        assert_eq!(r.headers().get("cache-control").unwrap(), "no-cache");
+        let body = r.text().await.unwrap();
+        assert!(body.contains("window.__DN_HUB_SERVED__=true"), "{body}");
+        assert!(body.contains("<title>DockNeighbor</title>"));
+
+        // A hashed asset by path, with its own type, immutable.
+        let r = c.get(format!("{origin}/assets/index-abc123.js")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.headers().get("content-type").unwrap().to_str().unwrap().starts_with("text/javascript"));
+        assert!(r.headers().get("cache-control").unwrap().to_str().unwrap().contains("immutable"));
+        assert_eq!(r.text().await.unwrap(), "console.log(1)");
+
+        // A client-side route is the SPA.
+        let r = c.get(format!("{origin}/settings/devices")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.text().await.unwrap().contains("__DN_HUB_SERVED__"));
+
+        // Traversal never leaves the bundle: the marker file beside it is not reachable.
+        for p in ["/../current", "/assets/../../current", "/assets/..%2f..%2fcurrent", "/.hidden"] {
+            let r = c.get(format!("{origin}{p}")).send().await.unwrap();
+            let body = r.text().await.unwrap();
+            assert!(!body.trim().eq("1.0.104"), "{p} leaked the marker");
+        }
+
+        // The console still lives at /console, and the API is untouched by the fallback.
+        let r = c.get(format!("{origin}/console")).send().await.unwrap();
+        assert!(r.text().await.unwrap().contains("x-brvg-key"));
+        let r = c.get(format!("{origin}/api/hub/ping")).send().await.unwrap();
+        assert!(r.json::<serde_json::Value>().await.unwrap()["ok"].as_bool().unwrap());
+
+        // Status reports the served version (a member key is needed for status).
+        let st = c.get(format!("{origin}/api/hub/status")).header("x-brvg-key", key("owner").key).send().await.unwrap()
+            .json::<serde_json::Value>().await.unwrap();
+        assert_eq!(st["webVersion"], "1.0.104");
+        assert_eq!(rt.web.read().await.as_ref().unwrap().version, "1.0.104");
     }
 
     #[tokio::test]
