@@ -146,8 +146,8 @@ fn app_ping_frame() -> String {
     r#"{"type":"ping"}"#.to_string()
 }
 
-/// PURE. `lanIps` + `webVersion` are how the cloud learns WHERE this hub is and whether it hosts
-/// the web app — the link-out to the local copy (App banner) is built from exactly these two.
+/// PURE. `lanIps` + `webVersion` + `httpPort` are how the cloud learns WHERE this hub is and
+/// whether it hosts the web app — the link-out to the local copy (App banner) is built from these.
 fn hello_frame(cfg: &HubConfig, lan_ips: &[String], web_version: Option<&str>) -> String {
     serde_json::json!({
         "type": "hello",
@@ -155,6 +155,7 @@ fn hello_frame(cfg: &HubConfig, lan_ips: &[String], web_version: Option<&str>) -
         "version": env!("CARGO_PKG_VERSION"),
         "lanIps": lan_ips,
         "webVersion": web_version,
+        "httpPort": cfg.http_port,
     })
     .to_string()
 }
