@@ -346,27 +346,46 @@ pub fn parse_wan(devices: &Value) -> Option<WanStatus> {
     Some(WanStatus { wan: wan.into(), up: true, ip: ip_of(v) })
 }
 
-/// `/api/config/wan/rules2` → the index of the cellular rule and its APN setting. NCOS keeps one
-/// rule per WAN class; the modem's is the one whose `trigger_string` names `mdm`. `apn_mode` is
-/// `auto` unless the owner pinned `manual_apn`.
+/// `/api/config/wan/rules2` → the index of the rule that actually carries the modem's APN, and that
+/// setting in the app's vocabulary (`auto` | `manual` | `select`).
+///
+/// 🔴 NCOS keeps SEVERAL modem rules — generic class rules ("LTE-only Modems", `type|is|mdm%tech|is|lte`)
+/// with no `modem` subtree, and a per-modem rule NCOS creates when the owner configures that SIM
+/// (`…%uid|is|3a201cd3`) which holds the real `apn_mode`/`manual_apn`. Bench 2026-09-12, MVP's CBA850:
+/// the per-modem rule was fifth in the list and held `manual` `mw01.VZWSTATIC` — a Verizon STATIC-IP
+/// APN. The first version of this parser took the first `mdm` rule, found no subtree, reported the
+/// modem as AUTOMATIC, and pointed APN writes at the generic rule; an owner pressing Apply on what the
+/// panel showed would have been asking to drop the static IP. So: among `mdm` rules, one with a
+/// `modem` subtree wins, and a uid-specific one beats a class rule.
+///
+/// NCOS spells automatic `default` (options: `default` | `manual` | `select`); `auto` is the app's word
+/// and is translated at this boundary in both directions.
 pub fn parse_apn(rules: &Value) -> Option<(usize, ApnConfig)> {
     let list = rules.as_array()?;
+    let trigger = |r: &Value| r.get("trigger_string").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let score = |r: &Value| -> Option<u8> {
+        let t = trigger(r);
+        let has_modem = r.get("modem").map(|m| m.is_object()).unwrap_or(false);
+        if !t.contains("mdm") && !has_modem {
+            return None;
+        }
+        Some(u8::from(has_modem) * 4 + u8::from(t.contains("uid|is|")) * 2 + u8::from(t.contains("mdm")))
+    };
     let (idx, rule) = list
         .iter()
         .enumerate()
-        .find(|(_, r)| {
-            r.get("trigger_string")
-                .and_then(|t| t.as_str())
-                .map(|t| t.contains("mdm"))
-                .unwrap_or(false)
-        })
-        .or_else(|| list.iter().enumerate().find(|(_, r)| r.get("modem").is_some()))?;
+        .filter_map(|(i, r)| score(r).map(|sc| (sc, i, r)))
+        // Highest score; on a tie the EARLIEST rule, which is NCOS's own list order.
+        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+        .map(|(_, i, r)| (i, r))?;
     let modem = rule.get("modem");
     let manual = modem.and_then(|m| str_of(m.get("manual_apn")));
-    let mode = modem
-        .and_then(|m| str_of(m.get("apn_mode")))
-        .map(|m| m.to_ascii_lowercase())
-        .unwrap_or_else(|| if manual.is_some() { "manual".into() } else { "auto".into() });
+    let mode = match modem.and_then(|m| str_of(m.get("apn_mode"))).map(|m| m.to_ascii_lowercase()) {
+        Some(m) if m == "default" || m == "auto" => "auto".to_string(),
+        Some(m) => m,
+        None if manual.is_some() => "manual".into(),
+        None => "auto".into(),
+    };
     Some((idx, ApnConfig { apn: if mode == "manual" { manual } else { None }, mode }))
 }
 
@@ -526,7 +545,8 @@ impl<'a> Ncos<'a> {
             self.put(&format!("{modem}/manual_apn"), &Value::String(apn.to_string())).await?;
             self.put(&format!("{modem}/apn_mode"), &Value::String("manual".into())).await?;
         } else {
-            self.put(&format!("{modem}/apn_mode"), &Value::String("auto".into())).await?;
+            // NCOS's word for automatic is `default` — `auto` is refused as not one of the options.
+            self.put(&format!("{modem}/apn_mode"), &Value::String("default".into())).await?;
         }
         Ok(self.apn().await?.1)
     }
@@ -815,6 +835,32 @@ mod tests {
         let (_, a) = parse_apn(&auto).unwrap();
         assert_eq!((a.mode.as_str(), a.apn), ("auto", None));
         assert!(parse_apn(&json!([{"trigger_string": "type|is|ethernet"}])).is_none());
+    }
+
+    #[test]
+    fn apn_reads_the_per_modem_rule_not_the_first_class_rule_bench_cba850() {
+        // Verbatim shape of MVP's CBA850 /api/config/wan/rules2, 2026-09-12 (ids trimmed).
+        let rules = json!([
+            {"priority": 1, "trigger_name": "Ethernet", "trigger_string": "type|is|ethernet"},
+            {"priority": 2, "trigger_name": "LTE-only Modems", "trigger_string": "type|is|mdm%tech|is|lte"},
+            {"priority": 2.5, "trigger_name": "LTE/3G Multi-mode Modems", "trigger_string": "type|is|mdm%tech|is|lte/3g"},
+            {"priority": 5, "trigger_name": "3G-only Modems", "trigger_string": "type|is|mdm%tech|is|3g"},
+            {"modem": {"apn_mode": "manual", "manual_apn": "mw01.VZWSTATIC"}, "priority": 2.25,
+             "trigger_name": "Modem-3a201cd3", "trigger_string": "type|is|mdm%tech|is|lte/3g%uid|is|3a201cd3"}
+        ]);
+        let (idx, apn) = parse_apn(&rules).unwrap();
+        assert_eq!(idx, 4, "the write must target the rule that holds the APN");
+        assert_eq!((apn.mode.as_str(), apn.apn.as_deref()), ("manual", Some("mw01.VZWSTATIC")));
+    }
+
+    #[test]
+    fn ncos_default_is_the_apps_auto() {
+        let rules = json!([{"trigger_string": "type|is|mdm%uid|is|x", "modem": {"apn_mode": "default", "manual_apn": "stale"}}]);
+        let (_, a) = parse_apn(&rules).unwrap();
+        assert_eq!((a.mode.as_str(), a.apn), ("auto", None));
+        // No per-modem rule yet: the first class rule, automatic.
+        let (i, b) = parse_apn(&json!([{"trigger_string": "type|is|ethernet"}, {"trigger_string": "type|is|mdm%tech|is|lte"}])).unwrap();
+        assert_eq!((i, b.mode.as_str()), (1, "auto"));
     }
 
     #[test]
