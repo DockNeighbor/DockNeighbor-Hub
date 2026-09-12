@@ -66,7 +66,10 @@ fn marker_path(base: &Path) -> PathBuf {
 pub fn version_from_manifest(json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let ver = v.get("version")?.as_str()?.trim();
-    crate::update_check::parse_version(ver).map(|_| ver.to_string())
+    // Normalised from the parsed triple, never echoed: parse_version tolerates a leading `v` (it
+    // reads tags too), and what comes back here becomes a directory name and an asset path.
+    let (major, minor, patch) = crate::update_check::parse_version(ver)?;
+    Some(format!("{major}.{minor}.{patch}"))
 }
 
 /// Where a release's assets live on the CDN: `stable/v<version>/<asset>`.
@@ -328,10 +331,15 @@ mod tests {
             r#"{"version":"1.0.104","notes":"","pub_date":"2026-09-12T05:04:05Z","platforms":{}}"#;
         assert_eq!(version_from_manifest(m).as_deref(), Some("1.0.104"));
         assert_eq!(
-            version_from_manifest(r#"{"version":"v1.0.104"}"#),
-            None,
-            "a tag is not a version"
+            version_from_manifest(r#"{"version":"v1.0.104"}"#).as_deref(),
+            Some("1.0.104"),
+            "a leading v is tolerated and normalised away"
         );
+        assert_eq!(
+            version_from_manifest(r#"{"version":" 1.0.104 "}"#).as_deref(),
+            Some("1.0.104")
+        );
+        assert_eq!(version_from_manifest(r#"{"version":"1.0.104.5"}"#), None);
         assert_eq!(
             version_from_manifest(r#"{"version":"../etc"}"#),
             None,
