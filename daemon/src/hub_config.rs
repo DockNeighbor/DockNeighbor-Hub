@@ -113,7 +113,8 @@ pub struct HubConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GpsConfig {
-    /// Driver: `cradlepoint` (NCOS `/api/status/gps`). Others (peplink, nmea) are future drivers.
+    /// Driver: `cradlepoint` (NCOS `/api/status/gps`) or `nmea` (a TCP/UDP sentence feed, gps.rs).
+    /// `peplink` is a future driver.
     pub kind: String,
     pub host: String,
     /// Default 443 — a Cradlepoint CBA850 serves its NCOS API over HTTPS; `0`/absent ⇒ 443.
@@ -127,6 +128,8 @@ pub struct GpsConfig {
     /// A configured-but-paused source. Absent ⇒ enabled when a host is set.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// `nmea` only: `tcp` (connect to host:port; the default) or `udp` (listen on port).
+    pub protocol: String,
 }
 
 fn default_true() -> bool { true }
@@ -448,7 +451,7 @@ mod tests {
             gps: GpsConfig {
                 kind: "cradlepoint".into(), host: "192.168.10.1".into(), port: 443,
                 username: "admin".into(), password: "routerpw".into(),
-                dev_id: "brv_gps_gkljr4kx9".into(), enabled: true,
+                dev_id: "brv_gps_gkljr4kx9".into(), enabled: true, protocol: String::new(),
             },
         };
         let text = serde_json::to_string(&cfg).unwrap();

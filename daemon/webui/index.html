@@ -98,7 +98,7 @@
     <div id="gpsState" class="muted" style="margin-bottom:10px"></div>
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px 10px; max-width:520px">
       <label>Type
-        <select id="gpsKind" class="form"><option value="cradlepoint">Cradlepoint (NCOS)</option></select>
+        <select id="gpsKind" class="form"><option value="cradlepoint">Cradlepoint (NCOS)</option><option value="nmea">NMEA 0183 feed (TCP/UDP)</option></select>
       </label>
       <label>Device id (brv_gps_…)
         <input type="text" id="gpsDevId" placeholder="brv_gps_…" autocomplete="off" spellcheck="false">
@@ -108,6 +108,9 @@
       </label>
       <label>Port
         <input type="number" id="gpsPort" value="443" min="1" max="65535">
+      </label>
+      <label>Protocol (NMEA only)
+        <select id="gpsProto" class="form"><option value="tcp">TCP — connect to host:port</option><option value="udp">UDP — listen on port</option></select>
       </label>
       <label>Username
         <input type="text" id="gpsUser" placeholder="admin" autocomplete="off" spellcheck="false">
@@ -213,11 +216,12 @@
       $("gpsDevId").value = g.devId||"";
       $("gpsHost").value = g.host||"";
       $("gpsPort").value = g.port||443;
+      $("gpsProto").value = g.protocol||"tcp";
       $("gpsUser").value = g.username||"";
       $("gpsPass").placeholder = g.hasPassword ? "(unchanged — leave blank to keep)" : "router admin password";
     }
   }
-  ["gpsKind","gpsDevId","gpsHost","gpsPort","gpsUser","gpsPass"].forEach(function(id){
+  ["gpsKind","gpsDevId","gpsHost","gpsPort","gpsProto","gpsUser","gpsPass"].forEach(function(id){
     document.addEventListener("input", function(e){ if (e.target && e.target.id===id) gpsDirty = true; });
   });
 
@@ -304,7 +308,8 @@
       kind: $("gpsKind").value,
       devId: $("gpsDevId").value.trim(),
       host: $("gpsHost").value.trim(),
-      port: parseInt($("gpsPort").value,10) || 443,
+      port: parseInt($("gpsPort").value,10) || ($("gpsKind").value === "nmea" ? 10110 : 443),
+      protocol: $("gpsProto").value,
       username: $("gpsUser").value.trim(),
     };
     var pw = $("gpsPass").value;
