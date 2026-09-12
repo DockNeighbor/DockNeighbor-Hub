@@ -9,16 +9,19 @@
 // apart), and carries out the owner's writes (APN, GPS on/off, reboot) on request. The app never
 // talks to the router; it talks to the hub — over the LAN aboard, through the relay from shore.
 //
-// Vendor 1 is Cradlepoint NCOS. Every parser mirrors the app's drivers/cradlepoint.ts, which was
-// pinned to payloads captured from the bench CBA850 (fw 7.0.50) on 2026-08-17 — the two must agree
-// on every shape, so the fixtures below are the same captures. Peplink is next (owner: "Cradlepoint
-// first, Peplink right after").
+// Vendor 1 is Cradlepoint NCOS, in this file. Every parser mirrors the app's drivers/cradlepoint.ts,
+// which was pinned to payloads captured from the bench CBA850 (fw 7.0.50) on 2026-08-17 — the two
+// must agree on every shape, so the fixtures below are the same captures. Vendor 2 is Peplink
+// (peplink.rs; owner: "Cradlepoint first, Peplink right after"). `Driver` below is the one door the
+// poll loop and hub_server go through, so the shared shapes here — Snapshot, modem_params — are
+// filled identically whichever vendor answered.
 
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::gps::{cradlepoint_base, parse_cradlepoint_gps, GpsFix};
 use crate::hub_config::RouterConfig;
+use crate::peplink::Peplink;
 
 /// How often a router is read when the owner set nothing. Two minutes: signal and data use move
 /// slowly, and a router's API is not free to hit.
@@ -150,7 +153,7 @@ impl From<&GpsFix> for FixOut {
 
 // --- Pure parsers (Cradlepoint NCOS; fixtures = the 2026-08-17 CBA850 capture) --------------------
 
-fn as_f64(v: &Value) -> Option<f64> {
+pub(crate) fn as_f64(v: &Value) -> Option<f64> {
     match v {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.trim().parse::<f64>().ok(),
@@ -162,7 +165,7 @@ fn as_u64(v: &Value) -> Option<u64> {
     as_f64(v).filter(|n| *n >= 0.0).map(|n| n as u64)
 }
 
-fn str_of(v: Option<&Value>) -> Option<String> {
+pub(crate) fn str_of(v: Option<&Value>) -> Option<String> {
     let t = v?.as_str()?.trim();
     if t.is_empty() { None } else { Some(t.to_string()) }
 }
@@ -548,7 +551,7 @@ impl<'a> Ncos<'a> {
     }
 }
 
-fn reachability(e: reqwest::Error) -> String {
+pub(crate) fn reachability(e: reqwest::Error) -> String {
     if e.is_timeout() {
         "the router did not answer (timed out) — is the hub on the same network?".into()
     } else if e.is_connect() {
@@ -558,33 +561,168 @@ fn reachability(e: reqwest::Error) -> String {
     }
 }
 
+// --- The vendor door ------------------------------------------------------------------------------
+
+/// What one read of a router's GPS side learned: `enabled` is the router's own report (NCOS's
+/// System → GPS switch; a Peplink's `gps` flag — whether the unit has GPS at all), `fix` the lock.
+#[derive(Debug, Default)]
+pub struct GpsRead {
+    pub enabled: Option<bool>,
+    pub fix: Option<GpsFix>,
+}
+
+/// One signed-in router of whichever vendor. hub_server and `poll` speak only to this, so adding a
+/// vendor is one module plus one arm per method — never a branch in the loop or the actions.
+pub enum Driver<'a> {
+    Cradlepoint(Ncos<'a>),
+    Peplink(Peplink<'a>),
+}
+
+/// The vendors this hub manages — what `probe`/`add` accept, and what the app offers.
+pub fn vendor_supported(v: &str) -> bool {
+    matches!(v, "cradlepoint" | "peplink")
+}
+
+impl<'a> Driver<'a> {
+    pub fn new(client: &'a reqwest::Client, vendor: &str, host: &str, port: u16, user: &str, pass: &str) -> Result<Self, String> {
+        match vendor {
+            "cradlepoint" => Ok(Driver::Cradlepoint(Ncos::new(client, host, port, user, pass))),
+            "peplink" => Ok(Driver::Peplink(Peplink::new(client, host, port, user, pass))),
+            other => Err(format!("this hub cannot manage a '{other}' router yet")),
+        }
+    }
+
+    pub fn for_router(client: &'a reqwest::Client, cfg: &RouterConfig) -> Result<Self, String> {
+        Driver::new(client, &cfg.vendor, &cfg.host, cfg.port, &cfg.username, &cfg.password)
+    }
+
+    pub fn vendor(&self) -> &'static str {
+        match self {
+            Driver::Cradlepoint(_) => "cradlepoint",
+            Driver::Peplink(_) => "peplink",
+        }
+    }
+
+    /// PURE: the refusal for a `do_routers` action this vendor cannot carry out through the hub,
+    /// or None when it can. Peplink's local API offers no APN, no reboot, and the `read`
+    /// diagnostic is an NCOS path reader.
+    pub fn unsupported_action(&self, action: &str) -> Option<String> {
+        match (self, action) {
+            (Driver::Peplink(_), "apn") => Some(unsupported("reading or setting the APN")),
+            (Driver::Peplink(_), "reboot") => Some(unsupported("rebooting")),
+            (Driver::Peplink(_), "read") => Some(unsupported("the read diagnostic")),
+            _ => None,
+        }
+    }
+
+    /// Prove the sign-in and read identity.
+    pub async fn probe(&self) -> Result<Probe, String> {
+        match self {
+            Driver::Cradlepoint(n) => n.probe().await,
+            Driver::Peplink(p) => p.probe().await,
+        }
+    }
+
+    /// The modem and WAN state — one request on both vendors.
+    pub async fn status(&self) -> Result<(Option<ModemStatus>, Option<WanStatus>), String> {
+        match self {
+            Driver::Cradlepoint(n) => {
+                let d = n.wan_devices().await?;
+                Ok((parse_modem(&d), parse_wan(&d)))
+            }
+            Driver::Peplink(p) => {
+                let d = p.wan_connection().await?;
+                Ok((crate::peplink::parse_modem(&d), crate::peplink::parse_wan(&d)))
+            }
+        }
+    }
+
+    /// The GPS side. `want_fix` is the hub's own setting: a fix is fetched only when the owner
+    /// asked for this router's position. Best-effort — a router that will not say is a router
+    /// without GPS, not a failed poll.
+    pub async fn gps(&self, want_fix: bool) -> GpsRead {
+        match self {
+            Driver::Cradlepoint(n) => GpsRead {
+                enabled: n.gps_enabled().await.ok(),
+                fix: if want_fix { n.gps_fix().await.ok().flatten() } else { None },
+            },
+            // No router-side switch to read; the `gps` flag arrives with the location, so one
+            // request answers both — and none is made when the owner did not ask.
+            Driver::Peplink(p) => {
+                if !want_fix {
+                    return GpsRead::default();
+                }
+                match p.location().await {
+                    Ok((enabled, fix)) => GpsRead { enabled, fix },
+                    Err(_) => GpsRead::default(),
+                }
+            }
+        }
+    }
+
+    /// Switch the router's own GNSS. A Peplink has no such switch in its local API — GPS is on the
+    /// model or it is not — so for it this is the hub-side setting alone, and succeeds without a
+    /// request (the owner's intent is recorded; the poll reports fixes when the router has them).
+    pub async fn set_gps_enabled(&self, on: bool) -> Result<(), String> {
+        match self {
+            Driver::Cradlepoint(n) => n.set_gps_enabled(on).await,
+            Driver::Peplink(_) => Ok(()),
+        }
+    }
+
+    pub async fn apn(&self) -> Result<ApnConfig, String> {
+        match self {
+            Driver::Cradlepoint(n) => n.apn().await.map(|(_, a)| a),
+            Driver::Peplink(_) => Err(unsupported("reading the APN")),
+        }
+    }
+
+    pub async fn set_apn(&self, cfg: &ApnConfig) -> Result<ApnConfig, String> {
+        match self {
+            Driver::Cradlepoint(n) => n.set_apn(cfg).await,
+            Driver::Peplink(_) => Err(unsupported("setting the APN")),
+        }
+    }
+
+    pub async fn reboot(&self) -> Result<(), String> {
+        match self {
+            Driver::Cradlepoint(n) => n.reboot().await,
+            Driver::Peplink(_) => Err(unsupported("rebooting")),
+        }
+    }
+}
+
+fn unsupported(what: &str) -> String {
+    format!("{what} is not supported on a Peplink through the hub yet — use the router's own admin pages")
+}
+
 /// One full read of a router — the poll loop's unit of work and the `refresh` action.
 pub async fn poll(client: &reqwest::Client, cfg: &RouterConfig, prev: Option<&Snapshot>) -> Snapshot {
     let now = crate::hub_server::now_ms();
     let mut snap = prev.cloned().unwrap_or_default();
     snap.at_ms = now;
-    let ncos = Ncos::for_router(client, cfg);
-    let devices = match ncos.wan_devices().await {
+    let drv = match Driver::for_router(client, cfg) {
         Ok(d) => d,
         Err(why) => {
             snap.error = Some(why);
             return snap;
         }
     };
-    snap.modem = parse_modem(&devices);
-    snap.wan = parse_wan(&devices);
-    if snap.probe.is_none() {
-        snap.probe = ncos.probe().await.ok();
-    }
-    snap.gps_enabled = ncos.gps_enabled().await.ok();
-    snap.fix = if cfg.gps_enabled {
-        match ncos.gps_fix().await {
-            Ok(f) => f.as_ref().map(FixOut::from),
-            Err(_) => None,
+    let (modem, wan) = match drv.status().await {
+        Ok(s) => s,
+        Err(why) => {
+            snap.error = Some(why);
+            return snap;
         }
-    } else {
-        None
     };
+    snap.modem = modem;
+    snap.wan = wan;
+    if snap.probe.is_none() {
+        snap.probe = drv.probe().await.ok();
+    }
+    let gps = drv.gps(cfg.gps_enabled).await;
+    snap.gps_enabled = gps.enabled;
+    snap.fix = gps.fix.as_ref().map(FixOut::from);
     snap.error = None;
     snap.ok_at_ms = Some(now);
     snap
@@ -703,6 +841,34 @@ mod tests {
         assert_eq!(wan_kb_delta(None, (10, 10)), None);
         assert_eq!(wan_kb_delta(Some((1024, 2048)), (2048, 4096)), Some(3));
         assert_eq!(wan_kb_delta(Some((5000, 5000)), (10, 10)), None); // rebooted modem
+    }
+
+    #[test]
+    fn vendors_dispatch_and_peplink_refuses_what_its_local_api_lacks() {
+        let client = lan_client();
+        assert!(vendor_supported("cradlepoint") && vendor_supported("peplink") && !vendor_supported("teltonika"));
+        assert!(Driver::new(&client, "teltonika", "h", 0, "", "").is_err());
+        let cp = Driver::new(&client, "cradlepoint", "h", 0, "", "").unwrap();
+        let pl = Driver::new(&client, "peplink", "h", 0, "", "").unwrap();
+        assert_eq!((cp.vendor(), pl.vendor()), ("cradlepoint", "peplink"));
+        for a in ["apn", "reboot", "read"] {
+            assert!(cp.unsupported_action(a).is_none(), "{a}");
+            assert!(pl.unsupported_action(a).unwrap().contains("not supported on a Peplink"), "{a}");
+        }
+        for a in ["refresh", "gps", "password"] {
+            assert!(pl.unsupported_action(a).is_none(), "{a}");
+        }
+    }
+
+    #[tokio::test]
+    async fn peplink_gps_switch_is_hub_side_only_and_never_calls_the_router() {
+        // Port 1 on localhost: any request would fail to connect, so Ok proves none was made.
+        let client = lan_client();
+        let pl = Driver::new(&client, "peplink", "127.0.0.1", 1, "admin", "x").unwrap();
+        assert!(pl.set_gps_enabled(true).await.is_ok());
+        assert!(pl.set_gps_enabled(false).await.is_ok());
+        let off = pl.gps(false).await;
+        assert!(off.enabled.is_none() && off.fix.is_none());
     }
 
     #[test]
