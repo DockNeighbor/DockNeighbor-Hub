@@ -21,6 +21,14 @@ WORKER_URL="https://api.dockneighbor.com"
 GPS_INTERVAL=120
 MODEM_INTERVAL=600
 
+# GPS report-by-exception. The fix is still COLLECTED and the anchor drag check RUN every
+# GPS_INTERVAL; these only gate the cloud SEND to spare a metered link when parked. A fix is sent
+# anyway when it moves past GPS_DEADBAND_M metres, whenever an anchor watch is armed (always), or
+# once GPS_LIVENESS_SECS elapses (keeps the cloud's offline + away-watch fresh — keep it under the
+# vehicle's offline threshold, default 60 min). Set GPS_DEADBAND_M=0 to disable and send every tick.
+GPS_DEADBAND_M=50
+GPS_LIVENESS_SECS=1200
+
 # GPS source: auto (GL.iNet → modem AT; else gpsd if present; else NMEA serial), at, gpsd, nmea,
 # tcp (NMEA over the network — chartplotter/AIS/gpsd serving on a LAN port), or cradlepoint
 # (poll a Cradlepoint NCOS router's local HTTP API — the router is never configured to push).

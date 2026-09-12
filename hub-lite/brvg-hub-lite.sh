@@ -313,6 +313,15 @@ load_config() {
   MODEM_INTERVAL="${MODEM_INTERVAL:-600}"
   [ "$GPS_INTERVAL" -lt 30 ] && GPS_INTERVAL=30       # floors: a metered link is not a firehose
   [ "$MODEM_INTERVAL" -lt 60 ] && MODEM_INTERVAL=60
+  # Report-by-exception for GPS (scanning redesign, Phase 3). The fix is COLLECTED and the anchor
+  # drag check RUN every GPS_INTERVAL regardless; these only gate the cloud SEND, to spare a metered
+  # link when a boat is parked and unarmed. A fix is still sent whenever it moves past the deadband,
+  # whenever an anchor watch is armed (always — the safety case), or once the liveness floor elapses
+  # (so the cloud's offline detection and away-watch never go stale).
+  GPS_DEADBAND_M="${GPS_DEADBAND_M:-50}"              # metres of movement before an unarmed send; 0 disables RBE
+  GPS_LIVENESS_SECS="${GPS_LIVENESS_SECS:-1200}"      # a send at least this often (20 min < the 60-min offline default)
+  [ "$GPS_DEADBAND_M" -lt 0 ] && GPS_DEADBAND_M=0
+  [ "$GPS_LIVENESS_SECS" -lt 60 ] && GPS_LIVENESS_SECS=60
   AT_PORT="${AT_PORT:-/dev/ttyUSB2}"                  # GL-X750; X3000-class PCIe modems differ — see README
   GPS_SOURCE="${GPS_SOURCE:-auto}"                    # auto | at | gpsd | nmea
   GPS_DEVICE="${GPS_DEVICE:-}"                        # serial NMEA dongle for GPS_SOURCE=nmea
@@ -1026,20 +1035,41 @@ watch_hub() {
   esac
 }
 
+# Pure-ish: should this fix be SENT to the cloud? (Reads the last-sent globals below.) Report-by-
+# exception, Phase 3: skip a send only when the boat is unarmed, hasn't moved past the deadband, and
+# the liveness floor hasn't elapsed. NEVER gates the local drag check — the caller runs that anyway.
+#   $1 lat  $2 lon  $3 anchor sig ("0" = unarmed)
+gps_should_send() {
+  [ "$3" != "0" ] && return 0                         # armed ⇒ always send (the safety case)
+  [ -z "$GPS_LAST_LAT" ] && return 0                  # first fix of this run ⇒ establish the baseline
+  _now=$(date +%s)
+  [ $(( _now - ${GPS_LAST_SENT:-0} )) -ge "$GPS_LIVENESS_SECS" ] && return 0   # liveness floor
+  [ "$GPS_DEADBAND_M" -le 0 ] && return 0             # RBE disabled ⇒ send every tick
+  _moved=$(anchor_distance "$GPS_LAST_LAT" "$GPS_LAST_LON" "$1" "$2")
+  [ "${_moved:-0}" -ge "$GPS_DEADBAND_M" ] && return 0
+  return 1
+}
+
+# $1 = "force" to bypass the deadband (a command follow-up / report_now wants a fresh line out).
 push_gps() {
+  _force="${1:-}"
   set -- $(collect_gps)
   [ -z "$1" ] && { log "no GPS fix this tick"; return 0; }
   _glat=$1; _glon=$2; _gacc=${3:-}
-  _p="lat=$_glat&lon=$_glon"
-  [ -n "$_gacc" ] && _p="$_p&acc=$_gacc"
   # anchorsig on EVERY report (the worker replies with the config when we're stale — including
   # the stand-down); anchorwatch=1 only while armed, which is what tells the cloud sweep a local
   # watcher owns the anchor logic and it should yield.
   _asig=$(anchor_sig)
-  _p="$_p&anchorsig=$_asig"
-  [ "$_asig" != "0" ] && _p="$_p&anchorwatch=1"
-  send_event "gps.measurement" "$_p"
-  # AFTER the send: a config adopted from this very reply evaluates against this same fix.
+  if [ "$_force" = "force" ] || gps_should_send "$_glat" "$_glon" "$_asig"; then
+    _p="lat=$_glat&lon=$_glon"
+    [ -n "$_gacc" ] && _p="$_p&acc=$_gacc"
+    _p="$_p&anchorsig=$_asig"
+    [ "$_asig" != "0" ] && _p="$_p&anchorwatch=1"
+    send_event "gps.measurement" "$_p"
+    GPS_LAST_LAT=$_glat; GPS_LAST_LON=$_glon; GPS_LAST_SENT=$(date +%s)
+  fi
+  # ALWAYS, whether or not we sent: local drag detection must never depend on the network. A config
+  # adopted from a send's reply (when there was one) evaluates against this same fix.
   check_anchor "$_glat" "$_glon" "$_gacc"
 }
 
@@ -1575,7 +1605,7 @@ main() {
     if [ "$FOLLOWUP_REPORT" = "1" ]; then
       FOLLOWUP_REPORT=0
       log "command follow-up: reporting the new state"
-      push_gps
+      push_gps force   # a follow-up / report_now wants a fresh line, deadband notwithstanding
       push_modem
       _elapsed=0
     fi

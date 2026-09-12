@@ -513,6 +513,28 @@ LINKTAP_HOST="" LINKTAP_GW_ID="" LINKTAP_DEV_IDS="" BRVG_RELAY_SPOOL="$_SPOOL_T"
 check "no LinkTap config -> no-op, nothing spooled" "0" "$(wc -c < "$_SPOOL_T" | tr -d ' ')"
 rm -f "$_SPOOL_T"
 
+# --- gps_should_send (report-by-exception, Phase 3) ---
+# Chicago-ish anchor point; a point ~180 m away for the "moved" cases.
+_A_LAT=41.87811; _A_LON=-87.62980
+_FAR_LAT=41.87811; _FAR_LON=-87.62760   # ~180 m east
+GPS_DEADBAND_M=50; GPS_LIVENESS_SECS=1200
+send_verdict() { if gps_should_send "$1" "$2" "$3"; then echo send; else echo skip; fi; }
+
+GPS_LAST_LAT=""; GPS_LAST_LON=""; GPS_LAST_SENT=0
+check "gps: first fix of the run always sends" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 0)"
+
+GPS_LAST_LAT=$_A_LAT; GPS_LAST_LON=$_A_LON; GPS_LAST_SENT=$(date +%s)
+check "gps: parked, unarmed, unmoved, recent -> skip" "skip" "$(send_verdict "$_A_LAT" "$_A_LON" 0)"
+check "gps: armed ALWAYS sends even when unmoved (the safety case)" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 1734)"
+check "gps: moved past the 50 m deadband -> send" "send" "$(send_verdict "$_FAR_LAT" "$_FAR_LON" 0)"
+
+GPS_LAST_SENT=$(( $(date +%s) - 1300 ))   # older than the 1200 s liveness floor
+check "gps: liveness floor elapsed -> send even when unmoved" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 0)"
+
+GPS_LAST_SENT=$(date +%s); GPS_DEADBAND_M=0   # RBE disabled
+check "gps: deadband 0 disables RBE -> always send" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 0)"
+GPS_DEADBAND_M=50
+
 if [ "$fails" -gt 0 ]; then
   echo "$fails test(s) FAILED"
   exit 1

@@ -163,6 +163,12 @@ If the app shows no position from the router, the order to check is: does `/dev/
 
 - GPS every `GPS_INTERVAL` (default 120 s, floor 30), modem every `MODEM_INTERVAL` (default
   600 s, floor 60). One small HTTPS GET per report — this rides the customer's metered link.
+- GPS **report-by-exception**: the fix is collected and the anchor drag check run every
+  `GPS_INTERVAL`, but the cloud SEND is skipped while parked — unless the fix moved past
+  `GPS_DEADBAND_M` (default 50 m), an anchor watch is armed (always sends), or `GPS_LIVENESS_SECS`
+  (default 1200 s / 20 min) has elapsed. `GPS_DEADBAND_M=0` disables it (send every tick). Keep the
+  liveness floor under the vehicle's offline threshold (default 60 min) so a parked hub never reads
+  as offline; a drag beyond the deadband, or an armed watch, always reports at full cadence.
 - No fix → nothing sent (the cloud keeps last-known; "no fix" is diagnosed by the app's
   Health Check, not by telemetry spam). Failed sends are dropped; the next tick retries.
   Phase A is telemetry, not store-and-forward.
