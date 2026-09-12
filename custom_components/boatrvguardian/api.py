@@ -26,7 +26,10 @@ class BrvgAuthError(BrvgError):
 
 
 class BrvgPlanError(BrvgError):
-    """The vehicle's plan has no integration — Social Member or Dockside, or a downgrade since setup."""
+    """The vehicle's plan has no integration.
+
+    Social Member or Dockside, or a downgrade since setup.
+    """
 
 
 class BrvgScopeError(BrvgError):
