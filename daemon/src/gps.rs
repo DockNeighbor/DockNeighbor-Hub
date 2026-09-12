@@ -99,6 +99,28 @@ pub fn parse_cradlepoint_gps(body: &serde_json::Value) -> Option<GpsFix> {
     valid_fix(lat, lon, fix.get("accuracy").and_then(as_f64))
 }
 
+/// PURE: parse a Peplink `/api/info.location` body into a fix — mirrors the app's parsePeplinkGps.
+/// The fix lives under `response.location` (fw 8.x), or flat under `response`, `location`, or the
+/// root. Returns None for "reachable but no lock", and for a `{stat:'fail'}` envelope.
+pub fn parse_peplink_gps(body: &serde_json::Value) -> Option<GpsFix> {
+    let loc = body
+        .get("response")
+        .and_then(|r| r.get("location"))
+        .or_else(|| body.get("response"))
+        .or_else(|| body.get("location"))
+        .unwrap_or(body);
+    if !loc.is_object() {
+        return None;
+    }
+    let lat = loc.get("latitude").or_else(|| loc.get("lat")).and_then(as_f64);
+    let lon = loc
+        .get("longitude")
+        .or_else(|| loc.get("lon"))
+        .or_else(|| loc.get("lng"))
+        .and_then(as_f64);
+    valid_fix(lat, lon, loc.get("accuracy").and_then(as_f64))
+}
+
 #[derive(Deserialize)]
 struct Ignore {}
 
@@ -484,6 +506,25 @@ mod tests {
         );
         assert_eq!(cradlepoint_base("192.168.10.1", 80), "http://192.168.10.1");
         assert_eq!(cradlepoint_base("10.0.0.5", 8080), "http://10.0.0.5:8080");
+    }
+
+    // The app's gpsSources.test.ts fixtures for parsePeplinkGps, ported verbatim.
+    #[test]
+    fn peplink_parses_the_info_location_envelope() {
+        let b = json!({ "stat": "ok", "response": { "gps": true, "location": { "latitude": 37.8044, "longitude": -122.2712, "speed": 0 } } });
+        assert_eq!(parse_peplink_gps(&b), Some(GpsFix { lat: 37.8044, lon: -122.2712, acc: None }));
+    }
+
+    #[test]
+    fn peplink_tolerates_a_flat_response_and_rejects_garbage() {
+        assert_eq!(
+            parse_peplink_gps(&json!({ "response": { "latitude": 37.8, "longitude": -122.3 } })),
+            Some(GpsFix { lat: 37.8, lon: -122.3, acc: None })
+        );
+        assert_eq!(parse_peplink_gps(&json!({ "stat": "fail" })), None);
+        assert_eq!(parse_peplink_gps(&json!(null)), None);
+        // A unit with no lock (or no GPS hardware) answers a placeholder, never a lie.
+        assert_eq!(parse_peplink_gps(&json!({ "response": { "gps": false, "location": { "latitude": 0, "longitude": 0 } } })), None);
     }
 
     #[test]

@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use crate::hub_config::{self, HubConfig, MemberKey};
 use crate::linktap;
 use crate::cycle;
+use crate::routers::{vendor_supported, Driver};
 
 /// Production worker base — the Rust twin of DEFAULT_WORKER_URL (configSync.ts). Pinned for the
 /// same reason as the TS side: this process holds a credential, so it talks only to first party.
@@ -577,9 +578,9 @@ fn capabilities_of(lt: &hub_config::LinkTapConfig) -> Vec<String> {
     if lt.allowed && !lt.host.is_empty() && !lt.gw_id.is_empty() {
         caps.push("linktap".to_string());
     }
-    // Managed routers (routers.rs) need no plan gate and no configuration to be OFFERED — the app
-    // shows "Cradlepoint / Peplink" in Add Router only when a hub advertising this is reachable
-    // (owner: without a hub those vendors are not offered at all).
+    // Managed routers (routers.rs: Cradlepoint; peplink.rs: Peplink) need no plan gate and no
+    // configuration to be OFFERED — the app shows those vendors in Add Router only when a hub
+    // advertising this is reachable (owner: without a hub those vendors are not offered at all).
     caps.push("routers".to_string());
     // Sensor wiring (sensors.rs): the hub finishes a sleepy sensor's setup on the LAN.
     caps.push("sensors".to_string());
@@ -2561,10 +2562,6 @@ struct ProbeBody {
     fix: Option<crate::routers::FixOut>,
 }
 
-fn vendor_supported(v: &str) -> bool {
-    v == "cradlepoint"
-}
-
 /// Everything about a managed router, in one door. Owner/co-owner for anything that signs in with
 /// an admin credential or changes what the hub stores (`probe`, `add`, `remove`, `apn`, `gps`,
 /// `password`, `reboot`); `refresh` is a read and is control-grade.
@@ -2593,25 +2590,29 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             if host.is_empty() {
                 return err(422, "host is required");
             }
-            let ncos = crate::routers::Ncos::new(
+            let drv = match Driver::new(
                 &client,
+                &vendor,
                 &host,
                 req.port.unwrap_or(0),
                 req.username.as_deref().unwrap_or(""),
                 req.password.as_deref().unwrap_or(""),
-            );
-            let probe = match ncos.probe().await {
+            ) {
+                Ok(d) => d,
+                Err(why) => return err(422, &why),
+            };
+            let probe = match drv.probe().await {
                 Ok(p) => p,
                 Err(why) => return err(502, &why),
             };
-            let devices = ncos.wan_devices().await.ok();
-            let fix = ncos.gps_fix().await.ok().flatten();
+            let (modem, wan) = drv.status().await.unwrap_or((None, None));
+            let gps = drv.gps(true).await;
             ok_json(&ProbeBody {
                 probe,
-                modem: devices.as_ref().and_then(crate::routers::parse_modem),
-                wan: devices.as_ref().and_then(crate::routers::parse_wan),
-                gps_enabled: ncos.gps_enabled().await.ok(),
-                fix: fix.as_ref().map(crate::routers::FixOut::from),
+                modem,
+                wan,
+                gps_enabled: gps.enabled,
+                fix: gps.fix.as_ref().map(crate::routers::FixOut::from),
             })
         }
         // Upsert by id. The sign-in is PROVED against the router before anything is stored, so a
@@ -2673,19 +2674,23 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             if r.gps_enabled && r.gps_dev_id.is_empty() {
                 return err(422, "gpsDevId (the brv_gps_… record) is required when gpsEnabled");
             }
-            let ncos = crate::routers::Ncos::for_router(&client, &r);
-            let probe = match ncos.probe().await {
+            let drv = match Driver::for_router(&client, &r) {
+                Ok(d) => d,
+                Err(why) => return err(422, &why),
+            };
+            let probe = match drv.probe().await {
                 Ok(p) => p,
                 Err(why) => return err(502, &why),
             };
             if r.name.is_empty() {
                 r.name = probe.model.clone().unwrap_or_else(|| "Router".into());
             }
-            // Configure the router's end of GPS too. Best-effort: some units/carriers have no
-            // GNSS, and a router that cannot be told is still worth managing — the snapshot's
+            // Configure the router's end of GPS too (where the vendor has one — a Peplink does
+            // not, and this is a no-op for it). Best-effort: some units/carriers have no GNSS,
+            // and a router that cannot be told is still worth managing — the snapshot's
             // gpsEnabled tells the app what the router actually reports.
             if r.gps_enabled {
-                if let Err(why) = ncos.set_gps_enabled(true).await {
+                if let Err(why) = drv.set_gps_enabled(true).await {
                     crate::hlog!("routers: {} - could not switch the router's GPS on: {why}", r.host);
                 }
             }
@@ -2736,6 +2741,12 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             let Some(r) = hub_config::read_config_in(&rt.base).routers.into_iter().find(|r| r.id == id) else {
                 return err(404, "no managed router with that id");
             };
+            // A stored router of a vendor this build cannot drive (a downgrade) is refused here,
+            // once, rather than by every action below.
+            let drv = match Driver::for_router(&client, &r) {
+                Ok(d) => d,
+                Err(why) => return err(422, &why),
+            };
             match action.as_str() {
                 "refresh" => {
                     let prev = rt.router_state.read().await.get(&id).cloned();
@@ -2747,15 +2758,14 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                     ok_json(&router_status(&r, Some(&snap)))
                 }
                 "apn" => {
-                    let ncos = crate::routers::Ncos::for_router(&client, &r);
                     let result = match req.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
-                        None => ncos.apn().await.map(|(_, a)| a),
+                        None => drv.apn().await,
                         Some(mode) => {
                             let mode = mode.to_ascii_lowercase();
                             if mode != "auto" && mode != "manual" {
                                 return err(422, "mode must be auto or manual");
                             }
-                            ncos.set_apn(&crate::routers::ApnConfig { mode, apn: req.apn.clone() }).await
+                            drv.set_apn(&crate::routers::ApnConfig { mode, apn: req.apn.clone() }).await
                         }
                     };
                     match result {
@@ -2766,15 +2776,15 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                         Err(why) => err(502, &why),
                     }
                 }
-                // Switch GPS on/off at BOTH ends: the router's GNSS and this hub's reporting.
+                // Switch GPS on/off at BOTH ends: the router's GNSS (where the vendor has a
+                // switch — Driver::set_gps_enabled) and this hub's reporting.
                 "gps" => {
                     let on = req.gps_enabled.unwrap_or(true);
                     let dev = req.gps_dev_id.map(|d| d.trim().to_string()).unwrap_or(r.gps_dev_id.clone());
                     if on && dev.is_empty() {
                         return err(422, "gpsDevId (the brv_gps_… record) is required when gpsEnabled");
                     }
-                    let ncos = crate::routers::Ncos::for_router(&client, &r);
-                    if let Err(why) = ncos.set_gps_enabled(on).await {
+                    if let Err(why) = drv.set_gps_enabled(on).await {
                         return err(502, &why);
                     }
                     {
@@ -2797,8 +2807,11 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                         return err(422, "password is required");
                     };
                     let user = req.username.map(|u| u.trim().to_string()).unwrap_or(r.username.clone());
-                    let ncos = crate::routers::Ncos::new(&client, &r.host, r.port, &user, &pw);
-                    if let Err(why) = ncos.probe().await {
+                    let trial = match Driver::new(&client, &r.vendor, &r.host, r.port, &user, &pw) {
+                        Ok(d) => d,
+                        Err(why) => return err(422, &why),
+                    };
+                    if let Err(why) = trial.probe().await {
                         return err(502, &why);
                     }
                     {
@@ -2816,8 +2829,7 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                     ok_json(&serde_json::json!({ "ok": true }))
                 }
                 "reboot" => {
-                    let ncos = crate::routers::Ncos::for_router(&client, &r);
-                    match ncos.reboot().await {
+                    match drv.reboot().await {
                         Ok(()) => {
                             crate::hlog!("routers: {} - reboot requested by {}", r.host, caller.uid);
                             ok_json(&serde_json::json!({ "ok": true }))

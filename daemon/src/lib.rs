@@ -10,6 +10,7 @@ pub mod linktap_runtime;
 pub mod linktap;
 pub mod gps;
 pub mod routers;
+pub mod peplink;
 pub mod sensors;
 pub mod hub_relay;
 pub mod hub_server;
