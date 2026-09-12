@@ -603,6 +603,18 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// PURE: the refusal for a `do_routers` action this vendor cannot carry out through the hub,
+    /// or None when it can. Peplink's local API offers no APN, no reboot, and the `read`
+    /// diagnostic is an NCOS path reader.
+    pub fn unsupported_action(&self, action: &str) -> Option<String> {
+        match (self, action) {
+            (Driver::Peplink(_), "apn") => Some(unsupported("reading or setting the APN")),
+            (Driver::Peplink(_), "reboot") => Some(unsupported("rebooting")),
+            (Driver::Peplink(_), "read") => Some(unsupported("the read diagnostic")),
+            _ => None,
+        }
+    }
+
     /// Prove the sign-in and read identity.
     pub async fn probe(&self) -> Result<Probe, String> {
         match self {
@@ -829,6 +841,34 @@ mod tests {
         assert_eq!(wan_kb_delta(None, (10, 10)), None);
         assert_eq!(wan_kb_delta(Some((1024, 2048)), (2048, 4096)), Some(3));
         assert_eq!(wan_kb_delta(Some((5000, 5000)), (10, 10)), None); // rebooted modem
+    }
+
+    #[test]
+    fn vendors_dispatch_and_peplink_refuses_what_its_local_api_lacks() {
+        let client = lan_client();
+        assert!(vendor_supported("cradlepoint") && vendor_supported("peplink") && !vendor_supported("teltonika"));
+        assert!(Driver::new(&client, "teltonika", "h", 0, "", "").is_err());
+        let cp = Driver::new(&client, "cradlepoint", "h", 0, "", "").unwrap();
+        let pl = Driver::new(&client, "peplink", "h", 0, "", "").unwrap();
+        assert_eq!((cp.vendor(), pl.vendor()), ("cradlepoint", "peplink"));
+        for a in ["apn", "reboot", "read"] {
+            assert!(cp.unsupported_action(a).is_none(), "{a}");
+            assert!(pl.unsupported_action(a).unwrap().contains("not supported on a Peplink"), "{a}");
+        }
+        for a in ["refresh", "gps", "password"] {
+            assert!(pl.unsupported_action(a).is_none(), "{a}");
+        }
+    }
+
+    #[tokio::test]
+    async fn peplink_gps_switch_is_hub_side_only_and_never_calls_the_router() {
+        // Port 1 on localhost: any request would fail to connect, so Ok proves none was made.
+        let client = lan_client();
+        let pl = Driver::new(&client, "peplink", "127.0.0.1", 1, "admin", "x").unwrap();
+        assert!(pl.set_gps_enabled(true).await.is_ok());
+        assert!(pl.set_gps_enabled(false).await.is_ok());
+        let off = pl.gps(false).await;
+        assert!(off.enabled.is_none() && off.fix.is_none());
     }
 
     #[test]

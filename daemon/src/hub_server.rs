@@ -2747,6 +2747,11 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                 Ok(d) => d,
                 Err(why) => return err(422, &why),
             };
+            // What this vendor cannot do through the hub is a 422 up front, before any sign-in —
+            // the request is the problem, not the router.
+            if let Some(why) = drv.unsupported_action(&action) {
+                return err(422, &why);
+            }
             match action.as_str() {
                 "refresh" => {
                     let prev = rt.router_state.read().await.get(&id).cloned();
@@ -2842,7 +2847,9 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                 // (Wi-Fi, LAN, DHCP reservations) gets pinned to what the router actually says.
                 "read" => {
                     let path = req.path.as_deref().unwrap_or("").to_string();
-                    let ncos = crate::routers::Ncos::for_router(&client, &r);
+                    let Driver::Cradlepoint(ncos) = &drv else {
+                        unreachable!("refused above for vendors without a read diagnostic")
+                    };
                     match ncos.read_path(&path).await {
                         Ok(data) => ok_json(&serde_json::json!({ "path": path.trim(), "data": data })),
                         Err(why) if why.starts_with("read takes") || why.starts_with("that is not") || why.starts_with("a path is") => err(422, &why),
