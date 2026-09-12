@@ -293,6 +293,11 @@ pub struct Rt {
     /// Rung by do_gps when the GPS source is (re)configured, so the poll loop reads a fix from the
     /// new source at once instead of waiting out its interval.
     pub gps_wake: tokio::sync::Notify,
+    /// What the last poll of each managed router learned (routers.rs), keyed by router id. What
+    /// `/api/hub/routers` and the console show; the poll loop is the only writer.
+    pub router_state: tokio::sync::RwLock<HashMap<String, crate::routers::Snapshot>>,
+    /// Rings the router poll loop to read now — after an add/edit, or an owner's Refresh.
+    pub router_wake: tokio::sync::Notify,
     /// Command ids this PROCESS has already acted on, so a command still in the queue (waiting for
     /// its ack to be read) is not run a second time. In-memory and bounded — forgetting an id is
     /// harmless (at worst one extra up-to-date check). See handle_agent_commands.
@@ -342,6 +347,8 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         wake: tokio::sync::Notify::new(),
         linktap_wake: tokio::sync::Notify::new(),
         gps_wake: tokio::sync::Notify::new(),
+        router_state: tokio::sync::RwLock::new(HashMap::new()),
+        router_wake: tokio::sync::Notify::new(),
         handled_cmds: tokio::sync::Mutex::new(HashSet::new()),
         pending_acks: tokio::sync::Mutex::new(Vec::new()),
         pending_reports: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -365,6 +372,7 @@ pub fn router(rt: Shared) -> Router {
         .route("/api/hub/update", post(h_update))
         .route("/api/hub/linktap/valve", post(h_valve))
         .route("/api/hub/gps", post(h_gps))
+        .route("/api/hub/routers", get(h_routers_list).post(h_routers))
         .route("/api/hub/linktap/state", get(h_valve_state))
         // The GATEWAY's own push (vendor doc §4.1: full status on every change + a 2-min
         // heartbeat). ⚠️ UNAUTHENTICATED BY NECESSITY — the LinkTap gateway is a fixed-firmware
@@ -443,6 +451,54 @@ struct StatusBody {
     /// The web app version this hub serves at `/`, when it has one (web_bundle.rs).
     #[serde(skip_serializing_if = "Option::is_none")]
     web_version: Option<String>,
+    /// The routers this hub manages (routers.rs), redacted, with what the last poll learned.
+    /// Always present (empty when none) so a caller can tell "none configured" from "old daemon".
+    routers: Vec<RouterStatus>,
+}
+
+/// One managed router as the status exposes it — the config WITHOUT the password or the agent
+/// token (only whether each is set), plus the last poll's snapshot.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RouterStatus {
+    id: String,
+    vendor: String,
+    name: String,
+    host: String,
+    port: u16,
+    username: String,
+    has_password: bool,
+    /// The hub holds this router's agent token, so its telemetry reaches the cloud.
+    agent_enrolled: bool,
+    gps_enabled: bool,
+    gps_dev_id: String,
+    poll_secs: u64,
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<crate::routers::Snapshot>,
+}
+
+fn router_status(r: &hub_config::RouterConfig, state: Option<&crate::routers::Snapshot>) -> RouterStatus {
+    RouterStatus {
+        id: r.id.clone(),
+        vendor: r.vendor.clone(),
+        name: r.name.clone(),
+        host: r.host.clone(),
+        port: if r.port != 0 { r.port } else { 443 },
+        username: if r.username.is_empty() { "admin".into() } else { r.username.clone() },
+        has_password: !r.password.is_empty(),
+        agent_enrolled: !r.agent_token.is_empty(),
+        gps_enabled: r.gps_enabled,
+        gps_dev_id: r.gps_dev_id.clone(),
+        poll_secs: crate::routers::poll_secs(r),
+        enabled: r.enabled,
+        state: state.cloned(),
+    }
+}
+
+async fn routers_status(rt: &Rt, cfg: &HubConfig) -> Vec<RouterStatus> {
+    let states = rt.router_state.read().await;
+    cfg.routers.iter().map(|r| router_status(r, states.get(&r.id))).collect()
 }
 
 /// The GPS source as the status exposes it — deliberately without the password (only `hasPassword`),
@@ -477,7 +533,9 @@ fn gps_status(g: &hub_config::GpsConfig) -> Option<GpsStatus> {
 
 async fn status_body(rt: &Rt) -> StatusBody {
     let cfg = hub_config::read_config_in(&rt.base);
+    let routers = routers_status(rt, &cfg).await;
     StatusBody {
+        routers,
         config_damaged: hub_config::config_damage_in(&rt.base),
         registered: !cfg.token.is_empty(),
         hub_id: cfg.hub_id,
@@ -506,6 +564,10 @@ fn capabilities_of(lt: &hub_config::LinkTapConfig) -> Vec<String> {
     if lt.allowed && !lt.host.is_empty() && !lt.gw_id.is_empty() {
         caps.push("linktap".to_string());
     }
+    // Managed routers (routers.rs) need no plan gate and no configuration to be OFFERED — the app
+    // shows "Cradlepoint / Peplink" in Add Router only when a hub advertising this is reachable
+    // (owner: without a hub those vendors are not offered at all).
+    caps.push("routers".to_string());
     caps
 }
 
@@ -577,6 +639,8 @@ pub async fn dispatch(rt: &Rt, caller: &Caller, method: &str, path: &str, body: 
         ("POST", "/api/hub/update") => do_update(caller).await,
         ("POST", "/api/hub/linktap/valve") => do_valve(rt, caller, body).await,
         ("POST", "/api/hub/gps") => do_gps(rt, caller, body).await,
+        ("GET", "/api/hub/routers") => do_routers_list(rt).await,
+        ("POST", "/api/hub/routers") => do_routers(rt, caller, body).await,
         _ => err(404, "no such hub endpoint"),
     }
 }
@@ -1006,6 +1070,14 @@ async fn h_valve(State(rt): State<Shared>, headers: HeaderMap, body: axum::body:
 
 async fn h_gps(State(rt): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     lan_call(&rt, &headers, "POST", "/api/hub/gps", &body).await
+}
+
+async fn h_routers_list(State(rt): State<Shared>, headers: HeaderMap) -> Response {
+    lan_call(&rt, &headers, "GET", "/api/hub/routers", b"").await
+}
+
+async fn h_routers(State(rt): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    lan_call(&rt, &headers, "POST", "/api/hub/routers", &body).await
 }
 
 
@@ -1782,7 +1854,7 @@ async fn linktap_act(
             // A close that did not happen is worth hearing about immediately; the machine keeps
             // stop_issued set, so the next observation retries without a re-issue storm.
             crate::hlog!("linktap: {dev_id} STOP FAILED: {:?}", reply.error);
-            spool_report(rt, &crate::linktap_runtime::Report {
+            spool_report(rt, &crate::linktap_runtime::Report { token: None,
                 device: format!("lt_{dev_id}"),
                 event: "linktap.stop_failed".into(),
                 params: vec![("error".into(), reply.error.unwrap_or_default())],
@@ -1821,7 +1893,7 @@ async fn linktap_act(
             }
         } else {
             crate::hlog!("linktap: {dev_id} - {} FAILED: {:?}", open.why, reply.error);
-            spool_report(rt, &crate::linktap_runtime::Report {
+            spool_report(rt, &crate::linktap_runtime::Report { token: None,
                 device: format!("lt_{dev_id}"),
                 event: "linktap.reopen_failed".into(),
                 params: vec![("why".into(), open.why.into()), ("error".into(), reply.error.unwrap_or_default())],
@@ -1944,7 +2016,9 @@ const GPS_POLL_SECS: u64 = 60;
 /// queued and delivered on reconnect like any other telemetry. Errors are logged only when they
 /// CHANGE, so a boat with no lock (or a wrong password) does not fill the log once a minute.
 async fn gps_poll_loop(rt: Shared) {
-    let client = http_client();
+    // The LAN client: a Cradlepoint on 443 presents a self-signed certificate, which the cloud
+    // client rightly refuses — and did, silently, until this loop got its own (routers::lan_client).
+    let client = crate::routers::lan_client();
     let mut last_note: Option<String> = None; // dedupe the log line across identical passes
     loop {
         let g = hub_config::read_config_in(&rt.base).gps;
@@ -1962,7 +2036,7 @@ async fn gps_poll_loop(rt: Shared) {
                         ("lon".to_string(), format!("{:.6}", fix.lon)),
                     ];
                     if let Some(acc) = fix.acc { params.push(("acc".to_string(), format!("{acc:.1}"))); }
-                    spool_report(&rt, &crate::linktap_runtime::Report {
+                    spool_report(&rt, &crate::linktap_runtime::Report { token: None,
                         device: g.dev_id.clone(),
                         event: "gps.measurement".to_string(),
                         params,
@@ -2024,7 +2098,7 @@ pub async fn linktap_flood_stop_all(rt: &Rt) {
         let reply = linktap::post_command(&client, &gw, &linktap::build_stop(&gw, &id)).await;
         crate::hlog!("linktap: flood shutoff -> {id} {}", if reply.ok { "closed" } else { "FAILED" });
         if !reply.ok {
-            spool_report(rt, &crate::linktap_runtime::Report {
+            spool_report(rt, &crate::linktap_runtime::Report { token: None,
                 device: format!("lt_{id}"),
                 event: "linktap.stop_failed".into(),
                 params: vec![("error".into(), reply.error.unwrap_or_default()), ("cause".into(), "flood".into())],
@@ -2118,10 +2192,19 @@ async fn send_report_once(rt: &Rt, report: &crate::linktap_runtime::Report) -> S
     u.query_pairs_mut()
         .append_pair("vid", &cfg.vid)
         .append_pair("device", &report.device)
-        .append_pair("event", &report.event)
-        .append_pair("t", &cfg.token);
-    if !cfg.hub_id.is_empty() {
-        u.query_pairs_mut().append_pair("hub", &cfg.hub_id);
+        .append_pair("event", &report.event);
+    match &report.token {
+        // A managed router's report carries the ROUTER's token and no `hub` — to the cloud it is
+        // the router reporting, exactly as a hub-lite router does (routers.rs).
+        Some(t) => {
+            u.query_pairs_mut().append_pair("t", t);
+        }
+        None => {
+            u.query_pairs_mut().append_pair("t", &cfg.token);
+            if !cfg.hub_id.is_empty() {
+                u.query_pairs_mut().append_pair("hub", &cfg.hub_id);
+            }
+        }
     }
     for (k, v) in &report.params {
         u.query_pairs_mut().append_pair(k, v);
@@ -2214,7 +2297,7 @@ pub fn report_refusal(status: u16, device: &str) -> Option<String> {
     Some(format!("REFUSED by the cloud: HTTP {status} (device {device})"))
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -2281,6 +2364,8 @@ where
         tokio::spawn(linktap_poll_loop(rt.clone()));
         // GPS acquisition on the LAN — re-reads its own config each pass, same as the LinkTap loop.
         tokio::spawn(gps_poll_loop(rt.clone()));
+        // Managed routers (routers.rs) — the hub reads each on its cadence and reports as it.
+        tokio::spawn(router_poll_loop(rt.clone()));
         // The outbound socket to the worker: remote control, and live member-key pushes. Failing
         // to connect is not fatal — the LAN API and the polling sync carry on without it.
         tokio::spawn(crate::hub_relay::run(rt.clone()));
@@ -2379,6 +2464,428 @@ async fn do_gps(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
     // Poll the just-configured source now rather than waiting out the interval.
     rt.gps_wake.notify_one();
     ok_json(&status_body(rt).await)
+}
+
+// --- Managed routers (routers.rs) -------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoutersListBody {
+    routers: Vec<RouterStatus>,
+}
+
+/// The routers this hub manages, redacted, with each one's last-poll snapshot. Any member.
+async fn do_routers_list(rt: &Rt) -> Answer {
+    let cfg = hub_config::read_config_in(&rt.base);
+    ok_json(&RoutersListBody { routers: routers_status(rt, &cfg).await })
+}
+
+/// One body, one `action` — a single relayable path for the whole router surface (the relay
+/// allow-lists exact paths, and the hub validates the body itself).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RouterReq {
+    #[serde(default)] action: String,
+    #[serde(default)] id: String,
+    #[serde(default)] vendor: Option<String>,
+    #[serde(default)] name: Option<String>,
+    #[serde(default)] host: Option<String>,
+    #[serde(default)] port: Option<u16>,
+    /// Omitted ⇒ keep. Explicit "" ⇒ the vendor default (`admin`).
+    #[serde(default)] username: Option<String>,
+    /// Omitted or "" ⇒ keep the stored password.
+    #[serde(default)] password: Option<String>,
+    /// Omitted or "" ⇒ keep the stored token.
+    #[serde(default)] agent_token: Option<String>,
+    #[serde(default)] gps_enabled: Option<bool>,
+    #[serde(default)] gps_dev_id: Option<String>,
+    #[serde(default)] poll_secs: Option<u32>,
+    #[serde(default)] enabled: Option<bool>,
+    /// `apn` action: `auto` | `manual` (+ `apn` name). Omitted ⇒ read only.
+    #[serde(default)] mode: Option<String>,
+    #[serde(default)] apn: Option<String>,
+}
+
+/// What `probe` answers: identity plus the modem/WAN/GPS state read in the same breath, so the
+/// wizard's Test shows the owner what the hub sees before anything is saved.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeBody {
+    probe: crate::routers::Probe,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modem: Option<crate::routers::ModemStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wan: Option<crate::routers::WanStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gps_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<crate::routers::FixOut>,
+}
+
+fn vendor_supported(v: &str) -> bool {
+    v == "cradlepoint"
+}
+
+/// Everything about a managed router, in one door. Owner/co-owner for anything that signs in with
+/// an admin credential or changes what the hub stores (`probe`, `add`, `remove`, `apn`, `gps`,
+/// `password`, `reboot`); `refresh` is a read and is control-grade.
+async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
+    let req: RouterReq = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return err(422, &format!("invalid JSON body: {e}")),
+    };
+    let action = req.action.trim().to_ascii_lowercase();
+    if action == "refresh" {
+        if !may_control(&caller.role) {
+            return err(403, "reading a router needs control access or above");
+        }
+    } else if !may_administer(&caller.role) {
+        return err(403, "managing a router needs a co-owner or the owner");
+    }
+    let client = crate::routers::lan_client();
+    match action.as_str() {
+        // Sign in with what the wizard typed, save nothing, say what was found.
+        "probe" => {
+            let vendor = req.vendor.as_deref().unwrap_or("cradlepoint").trim().to_ascii_lowercase();
+            if !vendor_supported(&vendor) {
+                return err(422, &format!("this hub cannot manage a '{vendor}' router yet"));
+            }
+            let host = req.host.as_deref().unwrap_or("").trim().to_string();
+            if host.is_empty() {
+                return err(422, "host is required");
+            }
+            let ncos = crate::routers::Ncos::new(
+                &client,
+                &host,
+                req.port.unwrap_or(0),
+                req.username.as_deref().unwrap_or(""),
+                req.password.as_deref().unwrap_or(""),
+            );
+            let probe = match ncos.probe().await {
+                Ok(p) => p,
+                Err(why) => return err(502, &why),
+            };
+            let devices = ncos.wan_devices().await.ok();
+            let fix = ncos.gps_fix().await.ok().flatten();
+            ok_json(&ProbeBody {
+                probe,
+                modem: devices.as_ref().and_then(crate::routers::parse_modem),
+                wan: devices.as_ref().and_then(crate::routers::parse_wan),
+                gps_enabled: ncos.gps_enabled().await.ok(),
+                fix: fix.as_ref().map(crate::routers::FixOut::from),
+            })
+        }
+        // Upsert by id. The sign-in is PROVED against the router before anything is stored, so a
+        // typo cannot evict a working credential — and a GPS request switches the router's own
+        // GNSS on, because the owner asked the hub to configure both ends.
+        "add" => {
+            let id = req.id.trim().to_string();
+            if id.is_empty() {
+                return err(422, "id is required");
+            }
+            let existing = hub_config::read_config_in(&rt.base).routers.into_iter().find(|r| r.id == id);
+            let mut r = existing.clone().unwrap_or_default();
+            r.id = id.clone();
+            if let Some(v) = req.vendor {
+                r.vendor = v.trim().to_ascii_lowercase();
+            }
+            if r.vendor.is_empty() {
+                r.vendor = "cradlepoint".into();
+            }
+            if !vendor_supported(&r.vendor) {
+                return err(422, &format!("this hub cannot manage a '{}' router yet", r.vendor));
+            }
+            if let Some(n) = req.name {
+                r.name = n.trim().to_string();
+            }
+            if let Some(h) = req.host {
+                r.host = h.trim().to_string();
+            }
+            if let Some(p) = req.port {
+                r.port = p;
+            }
+            if let Some(u) = req.username {
+                r.username = u.trim().to_string();
+            }
+            if let Some(p) = req.password.filter(|p| !p.is_empty()) {
+                r.password = p;
+            }
+            if let Some(t) = req.agent_token.filter(|t| !t.is_empty()) {
+                r.agent_token = t;
+            }
+            if let Some(g) = req.gps_enabled {
+                r.gps_enabled = g;
+            }
+            if let Some(d) = req.gps_dev_id {
+                r.gps_dev_id = d.trim().to_string();
+            }
+            if let Some(s) = req.poll_secs {
+                r.poll_secs = s;
+            }
+            if let Some(e) = req.enabled {
+                r.enabled = e;
+            }
+            if r.host.is_empty() {
+                return err(422, "host is required");
+            }
+            if r.password.is_empty() {
+                return err(422, "the router's admin password is required");
+            }
+            if r.gps_enabled && r.gps_dev_id.is_empty() {
+                return err(422, "gpsDevId (the brv_gps_… record) is required when gpsEnabled");
+            }
+            let ncos = crate::routers::Ncos::for_router(&client, &r);
+            let probe = match ncos.probe().await {
+                Ok(p) => p,
+                Err(why) => return err(502, &why),
+            };
+            if r.name.is_empty() {
+                r.name = probe.model.clone().unwrap_or_else(|| "Router".into());
+            }
+            // Configure the router's end of GPS too. Best-effort: some units/carriers have no
+            // GNSS, and a router that cannot be told is still worth managing — the snapshot's
+            // gpsEnabled tells the app what the router actually reports.
+            if r.gps_enabled {
+                if let Err(why) = ncos.set_gps_enabled(true).await {
+                    crate::hlog!("routers: {} - could not switch the router's GPS on: {why}", r.host);
+                }
+            }
+            {
+                let _g = rt.store.lock().await;
+                let mut cfg = hub_config::read_config_in(&rt.base);
+                match cfg.routers.iter_mut().find(|x| x.id == id) {
+                    Some(slot) => *slot = r.clone(),
+                    None => cfg.routers.push(r.clone()),
+                }
+                if let Err(e) = hub_config::write_config_in(&rt.base, &cfg) {
+                    return err(500, &e);
+                }
+            }
+            crate::hlog!(
+                "routers: {} '{}' at {} {} (gps {})",
+                r.vendor, r.name, r.host,
+                if existing.is_some() { "updated" } else { "added" },
+                if r.gps_enabled { "on" } else { "off" }
+            );
+            // Seed the snapshot with the identity we just read, then read the rest now.
+            rt.router_state.write().await.entry(id.clone()).or_default().probe = Some(probe);
+            rt.router_wake.notify_one();
+            let states = rt.router_state.read().await;
+            ok_json(&router_status(&r, states.get(&id)))
+        }
+        "remove" => {
+            let id = req.id.trim().to_string();
+            {
+                let _g = rt.store.lock().await;
+                let mut cfg = hub_config::read_config_in(&rt.base);
+                let before = cfg.routers.len();
+                cfg.routers.retain(|r| r.id != id);
+                if cfg.routers.len() == before {
+                    return err(404, "no managed router with that id");
+                }
+                if let Err(e) = hub_config::write_config_in(&rt.base, &cfg) {
+                    return err(500, &e);
+                }
+            }
+            rt.router_state.write().await.remove(&id);
+            crate::hlog!("routers: {id} removed");
+            ok_json(&serde_json::json!({ "ok": true }))
+        }
+        // The per-router actions below all start by finding the router.
+        "refresh" | "apn" | "gps" | "password" | "reboot" => {
+            let id = req.id.trim().to_string();
+            let Some(r) = hub_config::read_config_in(&rt.base).routers.into_iter().find(|r| r.id == id) else {
+                return err(404, "no managed router with that id");
+            };
+            match action.as_str() {
+                "refresh" => {
+                    let prev = rt.router_state.read().await.get(&id).cloned();
+                    let snap = crate::routers::poll(&client, &r, prev.as_ref()).await;
+                    rt.router_state.write().await.insert(id.clone(), snap.clone());
+                    if snap.error.is_none() {
+                        rt.router_wake.notify_one(); // let the loop report what was just read
+                    }
+                    ok_json(&router_status(&r, Some(&snap)))
+                }
+                "apn" => {
+                    let ncos = crate::routers::Ncos::for_router(&client, &r);
+                    let result = match req.mode.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                        None => ncos.apn().await.map(|(_, a)| a),
+                        Some(mode) => {
+                            let mode = mode.to_ascii_lowercase();
+                            if mode != "auto" && mode != "manual" {
+                                return err(422, "mode must be auto or manual");
+                            }
+                            ncos.set_apn(&crate::routers::ApnConfig { mode, apn: req.apn.clone() }).await
+                        }
+                    };
+                    match result {
+                        Ok(apn) => {
+                            rt.router_state.write().await.entry(id).or_default().apn = Some(apn.clone());
+                            ok_json(&apn)
+                        }
+                        Err(why) => err(502, &why),
+                    }
+                }
+                // Switch GPS on/off at BOTH ends: the router's GNSS and this hub's reporting.
+                "gps" => {
+                    let on = req.gps_enabled.unwrap_or(true);
+                    let dev = req.gps_dev_id.map(|d| d.trim().to_string()).unwrap_or(r.gps_dev_id.clone());
+                    if on && dev.is_empty() {
+                        return err(422, "gpsDevId (the brv_gps_… record) is required when gpsEnabled");
+                    }
+                    let ncos = crate::routers::Ncos::for_router(&client, &r);
+                    if let Err(why) = ncos.set_gps_enabled(on).await {
+                        return err(502, &why);
+                    }
+                    {
+                        let _g = rt.store.lock().await;
+                        let mut cfg = hub_config::read_config_in(&rt.base);
+                        if let Some(slot) = cfg.routers.iter_mut().find(|x| x.id == id) {
+                            slot.gps_enabled = on;
+                            slot.gps_dev_id = dev;
+                        }
+                        if let Err(e) = hub_config::write_config_in(&rt.base, &cfg) {
+                            return err(500, &e);
+                        }
+                    }
+                    crate::hlog!("routers: {} - GPS switched {}", r.host, if on { "on" } else { "off" });
+                    rt.router_wake.notify_one();
+                    ok_json(&serde_json::json!({ "ok": true, "gpsEnabled": on }))
+                }
+                "password" => {
+                    let Some(pw) = req.password.filter(|p| !p.is_empty()) else {
+                        return err(422, "password is required");
+                    };
+                    let user = req.username.map(|u| u.trim().to_string()).unwrap_or(r.username.clone());
+                    let ncos = crate::routers::Ncos::new(&client, &r.host, r.port, &user, &pw);
+                    if let Err(why) = ncos.probe().await {
+                        return err(502, &why);
+                    }
+                    {
+                        let _g = rt.store.lock().await;
+                        let mut cfg = hub_config::read_config_in(&rt.base);
+                        if let Some(slot) = cfg.routers.iter_mut().find(|x| x.id == id) {
+                            slot.username = user;
+                            slot.password = pw;
+                        }
+                        if let Err(e) = hub_config::write_config_in(&rt.base, &cfg) {
+                            return err(500, &e);
+                        }
+                    }
+                    rt.router_wake.notify_one();
+                    ok_json(&serde_json::json!({ "ok": true }))
+                }
+                "reboot" => {
+                    let ncos = crate::routers::Ncos::for_router(&client, &r);
+                    match ncos.reboot().await {
+                        Ok(()) => {
+                            crate::hlog!("routers: {} - reboot requested by {}", r.host, caller.uid);
+                            ok_json(&serde_json::json!({ "ok": true }))
+                        }
+                        Err(why) => err(502, &why),
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        other => err(422, &format!("unknown action '{other}'")),
+    }
+}
+
+/// How often the router loop wakes to see whether any router is due. Each router has its own
+/// cadence (routers::poll_secs); this is only the tick.
+const ROUTER_TICK_SECS: u64 = 15;
+
+/// Read each managed router on its cadence and report — `modem.measurement` as the router (with
+/// the router's own agent token) and, when its GPS is on, `gps.measurement` as the linked gps_source
+/// device (with the hub's token, the vouched `brv_gps_*` path). Re-reads config each pass, so a
+/// router added, edited or removed from the app is picked up without a restart. Errors are logged
+/// only when they CHANGE, so an unplugged router does not fill the log every two minutes.
+async fn router_poll_loop(rt: Shared) {
+    let client = crate::routers::lan_client();
+    let mut last_error: HashMap<String, String> = HashMap::new();
+    let mut last_counters: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut last_report_ms: HashMap<String, i64> = HashMap::new();
+    loop {
+        let cfg = hub_config::read_config_in(&rt.base);
+        let now = now_ms();
+        for r in cfg.routers.iter().filter(|r| r.enabled && !r.host.is_empty()) {
+            let due_ms = (crate::routers::poll_secs(r) * 1000) as i64;
+            if last_report_ms.get(&r.id).map_or(false, |t| now - t < due_ms) {
+                continue;
+            }
+            let prev = rt.router_state.read().await.get(&r.id).cloned();
+            let snap = crate::routers::poll(&client, r, prev.as_ref()).await;
+            last_report_ms.insert(r.id.clone(), now);
+            match &snap.error {
+                Some(why) => {
+                    if last_error.get(&r.id) != Some(why) {
+                        crate::hlog!("routers: {} '{}' - {why}", r.host, r.name);
+                        last_error.insert(r.id.clone(), why.clone());
+                    }
+                }
+                None => {
+                    if last_error.remove(&r.id).is_some() {
+                        crate::hlog!("routers: {} '{}' - reachable again", r.host, r.name);
+                    }
+                    if let Some(m) = &snap.modem {
+                        let counters = m.tx_bytes.zip(m.rx_bytes);
+                        let delta = counters.and_then(|c| crate::routers::wan_kb_delta(last_counters.get(&r.id).copied(), c));
+                        if let Some(c) = counters {
+                            last_counters.insert(r.id.clone(), c);
+                        }
+                        if r.agent_token.is_empty() {
+                            // Readable in the app, but nothing reaches the cloud: say so once.
+                            if last_error.get(&r.id).map_or(true, |e| e != "no agent token") {
+                                crate::hlog!("routers: {} '{}' - no agent token; status is local only until the app enrolls it", r.host, r.name);
+                                last_error.insert(r.id.clone(), "no agent token".into());
+                            }
+                        } else {
+                            spool_report(&rt, &crate::linktap_runtime::Report {
+                                device: r.id.clone(),
+                                event: "modem.measurement".into(),
+                                params: crate::routers::modem_params(m, snap.wan.as_ref(), snap.probe.as_ref(), delta),
+                                token: Some(r.agent_token.clone()),
+                            })
+                            .await;
+                        }
+                    }
+                    if r.gps_enabled && !r.gps_dev_id.is_empty() {
+                        if let Some(fix) = &snap.fix {
+                            let mut params = vec![
+                                ("lat".to_string(), format!("{:.6}", fix.lat)),
+                                ("lon".to_string(), format!("{:.6}", fix.lon)),
+                            ];
+                            if let Some(acc) = fix.acc {
+                                params.push(("acc".to_string(), format!("{acc:.1}")));
+                            }
+                            spool_report(&rt, &crate::linktap_runtime::Report {
+                                device: r.gps_dev_id.clone(),
+                                event: "gps.measurement".into(),
+                                params,
+                                token: None,
+                            })
+                            .await;
+                        }
+                    }
+                }
+            }
+            rt.router_state.write().await.insert(r.id.clone(), snap);
+        }
+        // Forget routers that are gone, so a re-add starts fresh.
+        let ids: HashSet<String> = cfg.routers.iter().map(|r| r.id.clone()).collect();
+        last_report_ms.retain(|k, _| ids.contains(k));
+        last_counters.retain(|k, _| ids.contains(k));
+        last_error.retain(|k, _| ids.contains(k));
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(ROUTER_TICK_SECS)) => {}
+            _ = rt.router_wake.notified() => {
+                // A wake means "read now" — clear the due-times so the next pass polls everything.
+                last_report_ms.clear();
+            }
+        }
+    }
 }
 
 async fn do_valve(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
@@ -3239,7 +3746,8 @@ mod tests {
         let body: serde_json::Value = reqwest::Client::new()
             .get(format!("{origin}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(body["capabilities"], serde_json::json!(["linktap"]));
+        // `routers` is unconditional (managed routers need no plan or gateway to be OFFERED).
+        assert_eq!(body["capabilities"], serde_json::json!(["linktap", "routers"]));
 
         let base2 = temp_base("caps_denied");
         hub_config::write_config_in(&base2, &valve_cfg(false)).unwrap();
@@ -3247,7 +3755,7 @@ mod tests {
         let body2: serde_json::Value = reqwest::Client::new()
             .get(format!("{origin2}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(body2["capabilities"], serde_json::json!([]), "an unpermitted plan must not advertise valve capability");
+        assert_eq!(body2["capabilities"], serde_json::json!(["routers"]), "an unpermitted plan must not advertise valve capability");
 
         let base3 = temp_base("caps_nogw");
         hub_config::write_config_in(&base3, &seeded_cfg()).unwrap(); // allowed defaults false, no gateway
@@ -3255,7 +3763,7 @@ mod tests {
         let body3: serde_json::Value = reqwest::Client::new()
             .get(format!("{origin3}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(body3["capabilities"], serde_json::json!([]));
+        assert_eq!(body3["capabilities"], serde_json::json!(["routers"]));
     }
 
     #[tokio::test]

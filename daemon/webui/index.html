@@ -125,6 +125,12 @@
     </div>
   </div>
 
+  <div class="card" id="routersCard" hidden>
+    <h2>Managed routers</h2>
+    <div class="muted" style="margin-bottom:10px">Routers this hub signs in to, reads and configures on the vessel's behalf — added from the app (Add Router → Cradlepoint). Their sign-ins stay on the hub.</div>
+    <div id="routerList"><div class="muted">Loading…</div></div>
+  </div>
+
   <div class="card" id="logCard" hidden>
     <div class="row" style="justify-content:space-between">
       <h2 style="margin:0">Recent log</h2>
@@ -200,7 +206,29 @@
       txt("f_caps", caps.length ? caps.join(", ") : "none");
       if (s.updateAvailable) banner("warn", "Update available: "+s.updateAvailable+" (running "+s.version+"). Update from the app.");
       renderGps(s.gps);
+      renderRouters(s.routers);
     });
+  }
+
+  // ---- keyed: managed routers (read-only here; the app is the surface) -------
+  function renderRouters(list){
+    if (!key) { $("routersCard").hidden = true; return; }
+    $("routersCard").hidden = false;
+    list = list || [];
+    if (!list.length){ $("routerList").innerHTML = '<div class="muted">No managed routers yet.</div>'; return; }
+    $("routerList").innerHTML = list.map(function(r){
+      var st = r.state || {};
+      var m = st.modem || {};
+      var pill = st.error ? '<span class="pill bad">'+esc(st.error)+'</span>'
+        : st.okAtMs ? '<span class="pill ok">reachable</span>' : '<span class="pill warn">not read yet</span>';
+      var sig = m.carrier ? esc(m.carrier)+(m.mode?" · "+esc(m.mode):"")+(m.rsrp!=null?" · RSRP "+esc(String(m.rsrp))+" dBm":"") : "";
+      var gps = r.gpsEnabled ? (st.fix ? "GPS fix "+st.fix.lat.toFixed(4)+", "+st.fix.lon.toFixed(4) : "GPS on, no fix yet") : "GPS off";
+      var cloud = r.agentEnrolled ? "reporting to the cloud" : '<span class="pill warn">no agent token — status is local only</span>';
+      return '<div style="padding:8px 0; border-top:1px solid rgba(0,0,0,.06)">'
+        + '<div><strong>'+esc(r.name||r.id)+'</strong> <span class="muted">'+esc(r.vendor)+' · '+esc(r.host)+':'+esc(String(r.port))+'</span> '+pill+'</div>'
+        + '<div class="muted" style="margin-top:3px">'+(st.probe&&st.probe.model?esc(st.probe.model)+(st.probe.firmware?" fw "+esc(st.probe.firmware):"")+" · ":"")+sig+(sig?" · ":"")+esc(gps)+' · '+cloud+'</div>'
+        + '</div>';
+    }).join("");
   }
 
   // ---- keyed: GPS source config --------------------------------------------
@@ -300,7 +328,7 @@
   $("keyClear").addEventListener("click", function(){
     key = ""; try{ localStorage.removeItem(KEY_LS); }catch(e){}
     ["hubname","f_uptime","f_platform","f_vid","f_hubid","f_keys","f_caps"].forEach(function(id){ txt(id,"—"); });
-    $("valveCard").hidden = true; $("logCard").hidden = true; $("gpsCard").hidden = true; setKeyState(false,"");
+    $("valveCard").hidden = true; $("logCard").hidden = true; $("gpsCard").hidden = true; $("routersCard").hidden = true; setKeyState(false,"");
   });
   $("logRefresh").addEventListener("click", loadLogs);
   $("gpsSave").addEventListener("click", function(){
