@@ -105,6 +105,44 @@ pub struct HubConfig {
     /// the hub's one credential store (SYSTEM/0600). Never returned in full by any endpoint.
     #[serde(default)]
     pub gps: GpsConfig,
+    /// Routers this hub MANAGES (routers.rs): signs in to over the LAN, reads on a timer, reports
+    /// for (as the router device, with the router's own agent token) and configures on the owner's
+    /// behalf. A GL.iNet is never here — it IS the hub. Sign-ins live in this file for the same
+    /// reason `gps.password` does. Never returned in full by any endpoint.
+    #[serde(default)]
+    pub routers: Vec<RouterConfig>,
+}
+
+/// One managed router. Mirrors the app's network_device record (`brv_net_<mac>` id, vendor, host,
+/// port) plus what only the hub holds: the admin sign-in and the router's cloud agent token.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RouterConfig {
+    /// The app's network_device id (`brv_net_…`) — the device the router's telemetry lands on.
+    pub id: String,
+    /// `cradlepoint` today; `peplink` next.
+    pub vendor: String,
+    pub name: String,
+    pub host: String,
+    /// `0` ⇒ the vendor default (443 for Cradlepoint).
+    pub port: u16,
+    pub username: String,
+    /// Router admin password. Never returned by any endpoint.
+    pub password: String,
+    /// The router's per-device agent token (minted by the app through `/api/agent/enroll`), so the
+    /// hub reports AS the router — the cloud then sees exactly what a hub-lite router sends.
+    /// Empty ⇒ status is read for the app but nothing is reported to the cloud.
+    pub agent_token: String,
+    /// Report this router's GNSS position as `gps_dev_id` (a `brv_gps_…` gps_source record the app
+    /// created alongside the router — owner: "When a router has a GPS enabled, create a device in
+    /// the GPS section").
+    pub gps_enabled: bool,
+    pub gps_dev_id: String,
+    /// Read cadence; `0` ⇒ routers::DEFAULT_POLL_SECS, floored at routers::POLL_FLOOR_SECS.
+    pub poll_secs: u32,
+    /// A configured-but-paused router: kept, not polled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 /// The hub's GPS source: what to poll on the LAN and how to sign in. `kind` selects the driver
@@ -165,6 +203,7 @@ impl Default for HubConfig {
             linktap: LinkTapConfig::default(),
             shelly_secret: String::new(),
             gps: GpsConfig::default(),
+            routers: Vec::new(),
         }
     }
 }
@@ -453,11 +492,22 @@ mod tests {
                 username: "admin".into(), password: "routerpw".into(),
                 dev_id: "brv_gps_gkljr4kx9".into(), enabled: true, protocol: String::new(),
             },
+            routers: vec![RouterConfig {
+                id: "brv_net_003044aabbcc".into(), vendor: "cradlepoint".into(), name: "CBA850".into(),
+                host: "192.168.10.1".into(), port: 0, username: "admin".into(), password: "routerpw".into(),
+                agent_token: "agt_1".into(), gps_enabled: true, gps_dev_id: "brv_gps_gkljr4kx9".into(),
+                poll_secs: 0, enabled: true,
+            }],
         };
         let text = serde_json::to_string(&cfg).unwrap();
         assert_eq!(serde_json::from_str::<HubConfig>(&text).unwrap(), cfg);
         // The GPS source round-trips as camelCase, password included (it is the hub's to hold).
         assert!(text.contains("\"devId\":\"brv_gps_gkljr4kx9\""));
+        // A managed router keeps its sign-in AND its agent token here — and `enabled` defaults
+        // to true when an older record omits it, so an upgrade never silently pauses a router.
+        assert!(text.contains("\"agentToken\":\"agt_1\""));
+        let r: RouterConfig = serde_json::from_str(r#"{"id":"brv_net_x","host":"10.0.0.1"}"#).unwrap();
+        assert!(r.enabled && r.port == 0 && r.vendor.is_empty());
         // A file written by an older build (or hand-edited) must not fail to parse — and the
         // fields it does not know get REAL defaults: a #388-era hub.json must come up on the
         // default management port, not port 0.

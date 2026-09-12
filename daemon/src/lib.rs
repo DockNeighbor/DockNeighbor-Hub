@@ -9,6 +9,7 @@ pub mod cycle;
 pub mod linktap_runtime;
 pub mod linktap;
 pub mod gps;
+pub mod routers;
 pub mod hub_relay;
 pub mod hub_server;
 pub mod update_check;

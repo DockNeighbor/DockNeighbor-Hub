@@ -62,6 +62,10 @@ pub struct Report {
     pub device: String,
     pub event: String,
     pub params: Vec<(String, String)>,
+    /// The bearer to send this report with. `None` ⇒ the hub's own token, vouching for a device
+    /// the cloud lets a hub speak for (`lt_*`, `brv_gps_*`). A managed router (routers.rs) reports
+    /// with ITS OWN agent token instead, so the cloud sees the router itself reporting.
+    pub token: Option<String>,
 }
 
 pub struct Runtime {
@@ -280,7 +284,7 @@ impl Runtime {
                     why: "auto-restart",
                 });
             }
-            reports.push(Report {
+            reports.push(Report { token: None,
                 device: format!("lt_{id}"),
                 // `.change` so it batches — a cycle end is history, not an alarm, and the worker
                 // classifies it as telemetry by the same rule every other component uses.
@@ -383,7 +387,7 @@ impl Runtime {
         if let Some(t) = self.tracks.get_mut(&id) {
             t.last_measurement = Some(params.clone());
         }
-        reports.push(Report { device: format!("lt_{id}"), event: "linktap.measurement".into(), params });
+        reports.push(Report { token: None, device: format!("lt_{id}"), event: "linktap.measurement".into(), params });
 
         if first_time_not_metering {
             crate::hlog!("linktap: {id} does not meter flow - cycles are bounded by TIME only");
@@ -550,7 +554,7 @@ pub fn gateway_watch_step(
         }
         return (
             next,
-            Some(Report {
+            Some(Report { token: None,
                 device,
                 event: GATEWAY_ONLINE_EVENT.into(),
                 params: vec![("host".into(), gw.host.clone()), ("mins".into(), mins.to_string())],
@@ -576,7 +580,7 @@ pub fn gateway_watch_step(
     next.offline_reported = true;
     (
         next,
-        Some(Report {
+        Some(Report { token: None,
             device,
             event: GATEWAY_OFFLINE_EVENT.into(),
             params: vec![
