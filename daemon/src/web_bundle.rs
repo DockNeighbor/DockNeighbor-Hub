@@ -1,7 +1,9 @@
 //! The web app, served by the hub — "like Plex" (owner, 2026-09-12).
 //!
 //! The hub does not COMPILE the web app in. It fetches the signed bundle the App release publishes
-//! (`dockneighbor-web.tar.gz` + `.sig`, App release.yml `release-web-bundle`), verifies it against
+//! (`dockneighbor-web.tar.gz` + `.sig`, App release.yml `release-web-bundle`) from the public CDN
+//! (`downloads.dockneighbor.com/stable/<tag>/…`, the channel the desktop updater already reads —
+//! the App repository itself is private and a hub carries no GitHub token), verifies it against
 //! the desktop updater's public key embedded below, unpacks it under `<data>/web/<version>/`, and
 //! serves it at `/` (hub_server `h_web`). Fetched rather than embedded so a web change never needs a
 //! daemon release — every daemon self-update restarts the hub and pushes offline/online alerts.
@@ -22,12 +24,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// The App repo's `releases/latest` — followed for its redirect, which names the version. The same
-/// no-token, no-rate-limit trick update_check.rs uses for the daemon's own releases.
-pub const APP_LATEST_RELEASE_URL: &str =
-    "https://github.com/DockNeighbor/DockNeighbor-App/releases/latest";
-pub const APP_LATEST_DOWNLOAD_BASE: &str =
-    "https://github.com/DockNeighbor/DockNeighbor-App/releases/latest/download";
+/// The stable channel on the public CDN — the SAME manifest the desktop updater reads
+/// (tauri.conf.json `plugins.updater.endpoints`). Not GitHub: the App repository is PRIVATE, so its
+/// `releases/latest` answers 404 to anyone without a token, and a hub has no token by design. The
+/// App release workflow mirrors every release asset to `stable/<tag>/<asset>` on this bucket.
+pub const STABLE_BASE: &str = "https://downloads.dockneighbor.com/stable";
+pub const STABLE_MANIFEST_URL: &str = "https://downloads.dockneighbor.com/stable/latest.json";
 pub const BUNDLE_ASSET: &str = "dockneighbor-web.tar.gz";
 pub const SIG_ASSET: &str = "dockneighbor-web.tar.gz.sig";
 
@@ -58,12 +60,18 @@ fn marker_path(base: &Path) -> PathBuf {
     web_root(base).join("current")
 }
 
-/// `…/releases/tag/v1.0.104` → `1.0.104`. Only the plain `v` family: the App repo tags releases
-/// that way, and anything else (a `daemon-v` tag would be the wrong repo entirely) returns None.
-pub fn app_version_from_release_url(url: &str) -> Option<String> {
-    let tag = url.rsplit("/tag/").next().filter(|t| *t != url)?;
-    let ver = tag.strip_prefix('v')?;
+/// The version the stable manifest names (`{"version":"1.0.104",…}` — the updater manifest). None
+/// for anything that is not a plain `major.minor.patch`, so a damaged or foreign manifest can never
+/// become a directory name.
+pub fn version_from_manifest(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let ver = v.get("version")?.as_str()?.trim();
     crate::update_check::parse_version(ver).map(|_| ver.to_string())
+}
+
+/// Where a release's assets live on the CDN: `stable/v<version>/<asset>`.
+pub fn asset_url(version: &str, asset: &str) -> String {
+    format!("{STABLE_BASE}/v{version}/{asset}")
 }
 
 /// `tauri signer sign` writes the minisign signature file BASE64-ENCODED (that is what the updater
@@ -220,16 +228,19 @@ pub async fn refresh(
     current: Option<&str>,
 ) -> Result<Option<WebBundle>, String> {
     let res = client
-        .get(APP_LATEST_RELEASE_URL)
+        .get(STABLE_MANIFEST_URL)
         .send()
         .await
-        .map_err(|e| format!("releases/latest: {e}"))?;
-    let latest = app_version_from_release_url(res.url().as_str()).ok_or_else(|| {
-        format!(
-            "releases/latest did not resolve to a v* tag ({})",
-            res.url()
-        )
-    })?;
+        .map_err(|e| format!("stable/latest.json: {e}"))?;
+    if !res.status().is_success() {
+        return Err(format!("stable/latest.json -> HTTP {}", res.status()));
+    }
+    let manifest = res
+        .text()
+        .await
+        .map_err(|e| format!("stable/latest.json: {e}"))?;
+    let latest = version_from_manifest(&manifest)
+        .ok_or_else(|| "stable/latest.json names no usable version".to_string())?;
     if current == Some(latest.as_str()) {
         return Ok(None);
     }
@@ -239,13 +250,13 @@ pub async fn refresh(
         return Ok(load_current(base));
     }
     let sig_res = client
-        .get(format!("{APP_LATEST_DOWNLOAD_BASE}/{SIG_ASSET}"))
+        .get(asset_url(&latest, SIG_ASSET))
         .send()
         .await
         .map_err(|e| format!("{SIG_ASSET}: {e}"))?;
     if !sig_res.status().is_success() {
         return Err(format!(
-            "the latest app release ({latest}) has no signed web bundle ({SIG_ASSET} -> HTTP {})",
+            "app release {latest} has no signed web bundle on the CDN ({SIG_ASSET} -> HTTP {})",
             sig_res.status()
         ));
     }
@@ -254,7 +265,7 @@ pub async fn refresh(
         .await
         .map_err(|e| format!("{SIG_ASSET}: {e}"))?;
     let bundle_res = client
-        .get(format!("{APP_LATEST_DOWNLOAD_BASE}/{BUNDLE_ASSET}"))
+        .get(asset_url(&latest, BUNDLE_ASSET))
         .send()
         .await
         .map_err(|e| format!("{BUNDLE_ASSET}: {e}"))?;
@@ -311,25 +322,26 @@ mod tests {
     }
 
     #[test]
-    fn app_release_url_names_the_version_only_for_v_tags() {
+    fn the_stable_manifest_names_the_version_and_only_a_real_one() {
+        // The updater manifest the CDN serves (tauri updater shape); only `version` matters here.
+        let m =
+            r#"{"version":"1.0.104","notes":"","pub_date":"2026-09-12T05:04:05Z","platforms":{}}"#;
+        assert_eq!(version_from_manifest(m).as_deref(), Some("1.0.104"));
         assert_eq!(
-            app_version_from_release_url(
-                "https://github.com/DockNeighbor/DockNeighbor-App/releases/tag/v1.0.104"
-            )
-            .as_deref(),
-            Some("1.0.104")
+            version_from_manifest(r#"{"version":"v1.0.104"}"#),
+            None,
+            "a tag is not a version"
         );
         assert_eq!(
-            app_version_from_release_url("https://github.com/x/y/releases/tag/daemon-v0.3.37"),
-            None
+            version_from_manifest(r#"{"version":"../etc"}"#),
+            None,
+            "never a directory name"
         );
+        assert_eq!(version_from_manifest(r#"{"notes":"x"}"#), None);
+        assert_eq!(version_from_manifest("not json"), None);
         assert_eq!(
-            app_version_from_release_url("https://github.com/x/y/releases/latest"),
-            None
-        );
-        assert_eq!(
-            app_version_from_release_url("https://github.com/x/y/releases/tag/vnext"),
-            None
+            asset_url("1.0.104", BUNDLE_ASSET),
+            "https://downloads.dockneighbor.com/stable/v1.0.104/dockneighbor-web.tar.gz"
         );
     }
 
