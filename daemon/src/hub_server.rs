@@ -453,6 +453,8 @@ struct GpsStatus {
     kind: String,
     host: String,
     port: u16,
+    /// `nmea` only; `tcp` when unset.
+    protocol: String,
     username: String,
     dev_id: String,
     enabled: bool,
@@ -464,7 +466,8 @@ fn gps_status(g: &hub_config::GpsConfig) -> Option<GpsStatus> {
     Some(GpsStatus {
         kind: g.kind.clone(),
         host: g.host.clone(),
-        port: if g.port == 0 { 443 } else { g.port },
+        port: if g.port != 0 { g.port } else if g.kind == "nmea" { crate::gps::NMEA_DEFAULT_PORT } else { 443 },
+        protocol: if g.protocol.is_empty() { "tcp".into() } else { g.protocol.clone() },
         username: g.username.clone(),
         dev_id: g.dev_id.clone(),
         enabled: g.enabled,
@@ -1948,6 +1951,7 @@ async fn gps_poll_loop(rt: Shared) {
         if !g.host.is_empty() && g.enabled && !g.dev_id.is_empty() {
             let result = match g.kind.as_str() {
                 "cradlepoint" => crate::gps::poll_cradlepoint(&client, &g.host, g.port, &g.username, &g.password).await,
+                "nmea" => crate::gps::poll_nmea(&g.host, g.port, &g.protocol).await,
                 other => Err(format!("no driver for GPS source kind '{other}'")),
             };
             match result {
@@ -2336,6 +2340,8 @@ struct GpsReq {
     #[serde(default)] password: Option<String>,
     #[serde(default)] dev_id: String,
     #[serde(default)] enabled: Option<bool>,
+    /// `nmea` only: `tcp` | `udp`. Omitted ⇒ keep.
+    #[serde(default)] protocol: Option<String>,
 }
 
 /// Configure the LAN GPS source the hub polls (owner/co-owner). The hub is the acquirer now, so the
@@ -2363,6 +2369,9 @@ async fn do_gps(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
         }
         cfg.gps.dev_id = req.dev_id.trim().to_string();
         cfg.gps.enabled = req.enabled.unwrap_or(true);
+        if let Some(p) = req.protocol {
+            cfg.gps.protocol = p.trim().to_ascii_lowercase();
+        }
         if let Err(e) = hub_config::write_config_in(&rt.base, &cfg) {
             return err(500, &e);
         }
