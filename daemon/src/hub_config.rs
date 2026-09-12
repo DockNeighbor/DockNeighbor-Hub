@@ -115,7 +115,7 @@ pub struct HubConfig {
 
 /// One managed router. Mirrors the app's network_device record (`brv_net_<mac>` id, vendor, host,
 /// port) plus what only the hub holds: the admin sign-in and the router's cloud agent token.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RouterConfig {
     /// The app's network_device id (`brv_net_…`) — the device the router's telemetry lands on.
@@ -143,6 +143,22 @@ pub struct RouterConfig {
     /// A configured-but-paused router: kept, not polled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+}
+
+/// 🔴 ENABLED BY DEFAULT — and this cannot be `#[derive(Default)]`. The serde `default_true` above
+/// covers a record READ from disk that omits the field; a derived `Default` still yields `false`,
+/// and `do_routers`' add path builds a NEW router from `Default` — so on 2026-09-12 the first
+/// Cradlepoint added through the app landed on CENTRAL with `enabled: false`, probed fine, and was
+/// then silently skipped by the poll loop forever. A router the owner just added is a router the
+/// owner wants read.
+impl Default for RouterConfig {
+    fn default() -> Self {
+        RouterConfig {
+            id: String::new(), vendor: String::new(), name: String::new(), host: String::new(),
+            port: 0, username: String::new(), password: String::new(), agent_token: String::new(),
+            gps_enabled: false, gps_dev_id: String::new(), poll_secs: 0, enabled: true,
+        }
+    }
 }
 
 /// The hub's GPS source: what to poll on the LAN and how to sign in. `kind` selects the driver
@@ -508,6 +524,8 @@ mod tests {
         assert!(text.contains("\"agentToken\":\"agt_1\""));
         let r: RouterConfig = serde_json::from_str(r#"{"id":"brv_net_x","host":"10.0.0.1"}"#).unwrap();
         assert!(r.enabled && r.port == 0 && r.vendor.is_empty());
+        // ...and a router built from Default (the add path) is enabled too — it was not, once.
+        assert!(RouterConfig::default().enabled);
         // A file written by an older build (or hand-edited) must not fail to parse — and the
         // fields it does not know get REAL defaults: a #388-era hub.json must come up on the
         // default management port, not port 0.
