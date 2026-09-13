@@ -15,13 +15,15 @@
 # AUTH, route by route, the daemon's split with one difference that is not a choice:
 #   * OPEN — ping (liveness + version), identity/bootstrap (first run only), shelly (its own
 #     secret), linktap/push (the gateway, by peer address). The same routes the daemon leaves open.
-#   * THE MANAGEMENT KEY for everything else, as `Authorization: Bearer`. The daemon checks a
-#     per-member `x-brvg-key` and resolves a role; a hub-lite has ONE key per router and one
-#     privilege level (hubLiteKey.ts), and uhttpd hands a CGI no custom X-* headers at all
-#     (bench GL-X750, 2026-08-21 — see hub-lite-mgmt.sh). Same secret, same header as the mgmt door.
+#   * A MEMBER KEY for everything else, as `Authorization: Bearer` — the caller's OWN per-user key,
+#     the one the daemon checks as `x-brvg-key`, resolved to that member's live role (D3, see
+#     `authorize`). uhttpd hands a CGI no custom X-* headers at all (bench GL-X750, 2026-08-21 — see
+#     hub-lite-mgmt.sh), hence Authorization. The router's own MGMT_KEY is still accepted, as owner.
 #
-# ⚠️ THE KEY COMPARISON IS A PLAIN STRING TEST, like the mgmt door's. POSIX sh has no constant-time
-# compare; the daemon's ct_eq has no shell equivalent that is not itself leakier than `=`.
+# ⚠️ KEYS ARE COMPARED AS DIGESTS, NEVER AS KEYS. POSIX sh has no constant-time compare, so the
+# presented key is hashed first and only SHA-256 digests are compared. A timing difference then leaks
+# how many leading hex digits of two DIGESTS agree, and steering that needs SHA-256 preimages — the
+# standard hash-then-compare construction, and the router never holds member keys to compare anyway.
 #
 # ⚠️ EVERY Status LINE CARRIES ITS REASON PHRASE. uhttpd ignores a bare `Status: 401` and sends the
 # body as 200 OK (bench-verified, hub-lite-mgmt.sh) — so the first cut of this file answered every
@@ -34,6 +36,8 @@ LT_STATE_DIR="${BRVG_LT_STATE_DIR:-${LT_STATE_DIR:-/tmp/brvg-linktap}}"
 STARTED_FILE="${BRVG_HUB_LITE_STARTED:-/tmp/brvg-hub-lite.started}"
 UPDATE_FILE="${BRVG_HUB_LITE_UPDATE:-/tmp/brvg-hub-lite.update}"
 RELOAD_FILE="${BRVG_HUB_LITE_RELOAD:-/tmp/brvg-hub-lite.reload}"
+KEYS_FILE="${BRVG_MEMBER_KEYS:-/etc/brvg-hub-lite.keys}"
+KEYS_STALE="${BRVG_MEMBER_KEYS_STALE:-/tmp/brvg-hub-lite.keys-stale}"
 export LT_STATE_DIR
 
 # The first-run window, from service start: the daemon's adopt::ADOPTION_WINDOW.
@@ -97,17 +101,75 @@ load_lib() {
 #   configure  — change settings (config, gps)                     (may_configure)
 #   administer — replace the credential or the software (token, clear, update) (may_administer)
 #
-# TODAY every role is satisfied by the router's single MGMT_KEY, because that is the only key a
-# hub-lite holds. Owner decision D3 (2026-09-13) is per-member role keys like the daemon's
-# member_keys, so control-access crew can open valves while monitor cannot; that change belongs
-# HERE and nowhere else — no route checks a key itself. Keep it that way.
+# WHO IS ASKING (owner decision D3, 2026-09-13: "crew with control access should be able to open the
+# valve. others should not"). Two kinds of key are accepted, both as `Authorization: Bearer`:
+#   * A MEMBER KEY — the caller's own per-user key (worker GET /api/hub/key, the same key a daemon
+#     hub checks). The collector keeps the vessel's set in KEYS_FILE as `<sha256> <role>` lines
+#     (brvg-hub-lite.sh fetch_member_keys); the role is the member's LIVE role at the last sync.
+#   * MGMT_KEY — the router's single key, treated as `owner` so every app and install that predates
+#     0.15.1 keeps working. ROLLOUT ONLY: retire it once every router runs 0.15.1+ and no shipped app
+#     still presents it (the app's hubLiteKey()). Retiring it means deleting the MGMT_KEY lines below.
+# Nothing else in this file checks a key. Keep it that way.
+
+# PURE: hub_server.rs may_*, verbatim. `monitor` is any member at all, as on the daemon (a key that
+# authenticates may read); monitor_quiet is a monitor who is not paged.
+role_may() {
+  case "$2" in
+    monitor)    case "$1" in owner|coowner|admin|control|monitor|monitor_quiet) return 0 ;; esac ;;
+    control)    case "$1" in owner|coowner|admin|control) return 0 ;; esac ;;
+    configure)  case "$1" in owner|coowner|admin) return 0 ;; esac ;;
+    administer) case "$1" in owner|coowner) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+# The role for a presented key, or nothing. Every line of the set is scanned (no early exit), and
+# only digests are compared — see the header.
+presented_role() {
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    # No digest tool: the member set cannot be checked at all, so only MGMT_KEY can authenticate,
+    # by the plain test 0.15.0 used. Deny-by-default for everyone else.
+    [ -n "${MGMT_KEY:-}" ] && [ "$1" = "$MGMT_KEY" ] && echo owner
+    return 0
+  fi
+  _ph=$(printf '%s' "$1" | sha256sum | cut -c1-64)
+  _pr=""
+  [ -r "$KEYS_FILE" ] && _pr=$(awk -v h="$_ph" 'NR > 1 && NF == 2 && $1 == h { r = $2 } END { print r }' "$KEYS_FILE" 2>/dev/null)
+  if [ -z "$_pr" ] && [ -n "${MGMT_KEY:-}" ]; then
+    [ "$_ph" = "$(printf '%s' "$MGMT_KEY" | sha256sum | cut -c1-64)" ] && _pr=owner
+  fi
+  printf '%s' "$_pr"
+}
+
 authorize() {
-  [ -n "${MGMT_KEY:-}" ] || fail 503 "this hub-lite has no management key yet"
   case "$1" in
     monitor|control|configure|administer) : ;;
     *) fail 500 "unknown access level" ;;
   esac
-  [ "${HTTP_AUTHORIZATION:-}" = "Bearer $MGMT_KEY" ] || fail 401 "a management key is required"
+  if [ -z "${MGMT_KEY:-}" ] && [ ! -s "$KEYS_FILE" ]; then
+    fail 503 "this hub-lite has no management keys yet"
+  fi
+  _pk=""
+  case "${HTTP_AUTHORIZATION:-}" in "Bearer "*) _pk="${HTTP_AUTHORIZATION#Bearer }" ;; esac
+  case "$_pk" in ''|*[!A-Za-z0-9_-]*) fail 401 "a management key is required" ;; esac
+  [ "${#_pk}" -le 256 ] || fail 401 "a management key is required"
+  ROLE=$(presented_role "$_pk")
+  if [ -z "$ROLE" ]; then
+    # A key shaped like a real one that this router does not know: most likely a member who joined or
+    # rotated since the last sync. Ask the collector to sync early (it rate-limits); the app's own
+    # retry will then succeed rather than waiting out a whole report interval.
+    case "$_pk" in
+      ????????????????????????????????????????????????????????????????) : > "$KEYS_STALE" 2>/dev/null ;;
+    esac
+    fail 401 "this hub-lite does not recognise that key yet"
+  fi
+  role_may "$ROLE" "$1" && return 0
+  case "$1" in
+    control)    fail 403 "operating the hub's devices needs control access or above" ;;
+    configure)  fail 403 "changing the hub's settings needs an admin, co-owner or owner" ;;
+    administer) fail 403 "rotating or removing the hub needs a co-owner or the owner" ;;
+    *)          fail 403 "this key may not read this hub" ;;
+  esac
 }
 
 read_body() {
@@ -190,7 +252,9 @@ gps_json() {
 status_json() {
   _reg=false; registered && _reg=true
   _armed=false; [ -n "${SHELLY_SECRET:-}" ] && _armed=true
-  _keys=0; [ -n "${MGMT_KEY:-}" ] && _keys=1
+  # How many keys this door accepts: the synced member set, plus the router's MGMT_KEY.
+  _keys=$(awk 'NR > 1 && NF == 2' "$KEYS_FILE" 2>/dev/null | wc -l | tr -cd '0-9'); _keys=${_keys:-0}
+  [ -n "${MGMT_KEY:-}" ] && _keys=$(( _keys + 1 ))
   _plat=linux; [ -f /etc/openwrt_release ] && _plat=openwrt
   _extra=""
   [ -n "$CONF_DAMAGED" ] && _extra="$_extra,\"configDamaged\":\"$(esc "$CONF_DAMAGED")\""
@@ -437,6 +501,8 @@ case "$method:$verb" in
     load_lib
     conf_set VID "" DEVICE_TOKEN "" VEHICLE_KEY "" MGMT_KEY "" SHELLY_SECRET "" LINKTAP_ALLOWED 0 HUB_NAME "" \
       || fail 500 "this router cannot write its own configuration"
+    # The member set belongs to the vessel being forgotten; the next vessel's collector syncs its own.
+    rm -f "$KEYS_FILE" 2>/dev/null
     : > "$RELOAD_FILE" 2>/dev/null
     printf 'Status: %s\r\n\r\n' "$(reason 204)"
     exit 0

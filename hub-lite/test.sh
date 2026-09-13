@@ -885,6 +885,7 @@ api() {
     HTTP_AUTHORIZATION="Bearer $KEY" BRVG_HUB_LITE_CONF="$T/conf" BRVG_HUB_LITE_BIN="$HL_DIR/brvg-hub-lite.sh" \
     BRVG_LT_STATE_DIR="$T/lt" BRVG_RELAY_SPOOL="$T/spool" BRVG_HUB_LITE_STARTED="$T/started" \
     BRVG_HUB_LITE_RELOAD="$T/reload" BRVG_HUB_LITE_UPDATE="$T/update" BRVG_REPORT_CGI="$HL_DIR/hub-lite-cgi.sh" \
+    BRVG_MEMBER_KEYS="$T/keys" BRVG_MEMBER_KEYS_STALE="$T/keys-stale" \
     REMOTE_ADDR="${REMOTE:-192.168.8.20}" "$@" sh "$HL_DIR/hub-lite-api.sh" 2>/dev/null
 }
 status_of() { printf '%s' "$1" | sed -n 's/^Status: \([0-9]*\).*/\1/p' | head -1; }
@@ -1314,6 +1315,111 @@ check "nap: sliced to 5 s while a valve could be woken" "5" "$(LT_NAP_SLICE=5 ne
 check "nap: overdue work loops straight round (1 s, never 0 or negative)" "1" "$(LT_NAP_SLICE="" next_nap 100 50)"
 ( CONF="$T/si.conf"; printf 'KEEP=1\nGPS_INTERVAL=120\n' > "$CONF"; set_intervals 300 600 >/dev/null 2>&1 )
 check "set_intervals: writes \$CONF (not a hard-coded /etc path) and keeps other keys" "KEEP=1 GPS_INTERVAL=\"300\" MODEM_INTERVAL=\"600\"" "$(tr '\n' ' ' < "$T/si.conf" | sed 's/ $//')"
+
+
+echo ""
+echo "# --- 0.15.1: per-member role keys (D3) ---------------------------------------------------"
+# Real-shaped per-user keys (64 hex, as the worker's generateHubKey mints) and the worker's answer:
+# digest + live role, sorted, with a signature over exactly the lines a router stores.
+K_OWN=1111111111111111111111111111111111111111111111111111111111111111
+K_CTL=2222222222222222222222222222222222222222222222222222222222222222
+K_MON=3333333333333333333333333333333333333333333333333333333333333333
+K_CTL2=4444444444444444444444444444444444444444444444444444444444444444
+dg() { printf '%s' "$1" | sha256sum | cut -c1-64; }
+# $@ = "key role" pairs → the worker's JSON for that set.
+member_json() {
+  _ml=$(for _pair in "$@"; do set -- $_pair; printf '%s %s\n' "$(dg "$1")" "$2"; done | sort)
+  _msig=$(printf '%s\n' "$_ml" | sha256sum | cut -c1-64)
+  [ -z "$_ml" ] && _msig=$(printf '' | sha256sum | cut -c1-64)
+  _mk=$(printf '%s\n' "$_ml" | awk 'NF == 2 { printf "%s{\"h\":\"%s\",\"role\":\"%s\"}", (n++ ? "," : ""), $1, $2 }')
+  printf '{"status":"ok","sig":"%s","keys":[%s]}' "$_msig" "$_mk"
+}
+# One collector sync against a stubbed worker. MK_CODE / MK_BODY are the answer; the curl args are logged.
+sync_keys() {
+  (
+    MEMBER_KEYS_FILE="$T/keys"; VID=v_test; DEVICE_ID=brv_net_test; DEVICE_TOKEN=tok_SECRET_0123456789
+    WORKER_URL=https://api.example.test
+    curl() { _o=""; _p=""; for _a in "$@"; do [ "$_p" = "-o" ] && _o="$_a"; _p="$_a"; done
+             printf '%s\n' "$*" >> "$T/mk.log"; printf '%s' "$MK_BODY" > "$_o"; printf '%s' "$MK_CODE"; }
+    fetch_member_keys 2>/dev/null
+  )
+}
+SET1=$(member_json "$K_OWN owner" "$K_CTL control" "$K_MON monitor")
+: > "$T/mk.log"; rm -f "$T/keys"
+MK_CODE=200 MK_BODY="$SET1" sync_keys; _rc=$?
+check "keys: the first sync stores the set" "0" "$_rc"
+check "keys: as a signature line plus one digest+role per member" "4" "$(wc -l < "$T/keys" | tr -cd '0-9')"
+check "keys: the file holds DIGESTS, never a key" "0" "$(grep -c "$K_CTL" "$T/keys")"
+check "keys: the control member's digest carries the control role" "1" "$(grep -c "^$(dg "$K_CTL") control$" "$T/keys")"
+check "keys: root-only (0600), not the conf's audience" "-rw-------" "$(ls -l "$T/keys" | cut -c1-10)"
+check "keys: asked with the router's own device token on the member-keys route" "1" "$(grep -c 'api/agent/member-keys?vid=v_test&device=brv_net_test&t=tok_SECRET' "$T/mk.log")"
+check "keys: the first ask has no If-None-Match" "0" "$(grep -c 'If-None-Match' "$T/mk.log")"
+cp "$T/keys" "$T/keys.before"; : > "$T/mk.log"
+MK_CODE=304 MK_BODY="" sync_keys
+check "keys: the next poll presents the stored signature" "1" "$(grep -c "If-None-Match: \"$(sed -n 's/^sig //p' "$T/keys")\"" "$T/mk.log")"
+check "keys: a 304 leaves the set untouched (no flash write)" "same" "$(cmp -s "$T/keys" "$T/keys.before" && echo same || echo changed)"
+MK_CODE=200 MK_BODY=$(printf '%s' "$SET1" | sed 's/"sig":"./"sig":"0/') sync_keys; _rc=$?
+check "keys: a set that does not hash to its signature is refused and the old set kept" "1 same" "$_rc $(cmp -s "$T/keys" "$T/keys.before" && echo same || echo changed)"
+MK_CODE=200 MK_BODY=$(printf '%s' "$SET1" | sed 's/,"keys":.*$/,"keys":[{"h":"/') sync_keys
+check "keys: a truncated answer is refused and the old set kept" "same" "$(cmp -s "$T/keys" "$T/keys.before" && echo same || echo changed)"
+MK_CODE=401 MK_BODY='{"status":"unauthorized"}' sync_keys
+check "keys: a refused sync keeps the cached set (offline crew still get in, as on the daemon)" "same" "$(cmp -s "$T/keys" "$T/keys.before" && echo same || echo changed)"
+check "keys: parser keeps monitor_quiet and drops an unknown role" "$(dg "$K_MON") monitor_quiet" \
+  "$(printf '{"sig":"x","keys":[{"h":"%s","role":"monitor_quiet"},{"h":"%s","role":"root"}]}' "$(dg "$K_MON")" "$(dg "$K_CTL")" | parse_member_keys)"
+
+# The door. A router with NO MGMT_KEY at all proves the member set stands on its own.
+sed '/^MGMT_KEY=/d' "$T/conf" > "$T/conf.members"
+mapi() { _mk_key="$1"; shift; api "$@" HTTP_AUTHORIZATION="Bearer $_mk_key" BRVG_HUB_LITE_CONF="$T/conf.members"; }
+rm -f "$T/lt/$DEV" "$T/keys-stale"
+r=$(mapi "$K_MON" GET /status "")
+check "role: a MONITOR key may read status" "200" "$(status_of "$r")"
+check "role: status counts the synced member keys" "1" "$(body_of "$r" | grep -c '"keysSynced":3')"
+r=$(mapi "$K_MON" POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\"durationSecs\":600}")
+check "role: a MONITOR key is REFUSED an open (403)" "403" "$(status_of "$r")"
+check "role: and the valve was not touched" "no" "$([ -f "$T/lt/$DEV" ] && echo yes || echo no)"
+r=$(mapi "$K_MON" POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"close\"}")
+check "role: a MONITOR key is refused a close too — every control verb is control-grade" "403" "$(status_of "$r")"
+r=$(mapi "$K_CTL" POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\"durationSecs\":600}")
+check "role: a CONTROL key may OPEN the valve" "200" "$(status_of "$r")"
+check "role: and the run is recorded as the hub's" "normal hub" "$(. "$T/lt/$DEV"; echo "$mode $prov")"
+r=$(mapi "$K_CTL" POST /config '{"name":"Mine"}')
+check "role: a CONTROL key may not change settings (configure is admin+)" "403" "$(status_of "$r")"
+r=$(mapi "$K_CTL" POST /clear "")
+check "role: a CONTROL key may not clear the hub (administer is co-owner+)" "403" "$(status_of "$r")"
+check "role: a refusal never rewrote the conf" "1" "$(grep -c '^VID="v_test"' "$T/conf.members")"
+r=$(mapi "$K_OWN" GET /logs "")
+check "role: an OWNER key passes control" "200" "$(status_of "$r")"
+r=$(mapi "$K_CTL2" GET /status "")
+check "role: an unknown key is 401" "401" "$(status_of "$r")"
+check "role: and asks the collector to sync early (a member who just joined)" "yes" "$([ -f "$T/keys-stale" ] && echo yes || echo no)"
+rm -f "$T/keys-stale"
+r=$(mapi "short_key_123456" GET /status "")
+check "role: a key not shaped like a member key does not ring the sync" "401 no" "$(status_of "$r") $([ -f "$T/keys-stale" ] && echo yes || echo no)"
+
+# REMOVED: the worker's next set omits the control member; ROTATED: the monitor's key is replaced.
+MK_CODE=200 MK_BODY=$(member_json "$K_OWN owner" "$K_CTL2 monitor") sync_keys
+r=$(mapi "$K_CTL" POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"close\"}")
+check "revoke: a REMOVED member's key is refused on the next sync" "401" "$(status_of "$r")"
+r=$(mapi "$K_MON" GET /status "")
+check "rotate: the monitor's OLD key stops working" "401" "$(status_of "$r")"
+r=$(mapi "$K_CTL2" GET /status "")
+check "rotate: the ROTATED key is picked up" "200" "$(status_of "$r")"
+r=$(mapi "$K_CTL2" POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"close\"}")
+check "rotate: and carries its role, not the old key's (monitor still cannot close)" "403" "$(status_of "$r")"
+
+# MGMT_KEY is still owner-grade during rollout, alongside the member set.
+r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"close\"}")
+check "rollout: the router's MGMT_KEY still drives the valve" "200" "$(status_of "$r")"
+r=$(api GET /status "" HTTP_AUTHORIZATION="Bearer $K_OWN")
+check "rollout: a member key works on a router that ALSO has a MGMT_KEY" "200" "$(status_of "$r")"
+r=$(api GET /status "")
+check "rollout: keysSynced counts the member set plus the MGMT_KEY" "1" "$(body_of "$r" | grep -c '"keysSynced":3')"
+rm -f "$T/keys"
+r=$(mapi "$K_OWN" GET /status "")
+check "keys: with neither a set nor a MGMT_KEY the door is 503, not open" "503" "$(status_of "$r")"
+cp "$T/keys.before" "$T/keys"; cp "$T/conf" "$T/conf.clear"
+api POST /clear "" BRVG_HUB_LITE_CONF="$T/conf.clear" >/dev/null
+check "clear: forgetting the vessel forgets its member set" "no" "$([ -f "$T/keys" ] && echo yes || echo no)"
 
 [ -n "${KEEP_T:-}" ] && echo "T=$T" || rm -rf "$T"
 
