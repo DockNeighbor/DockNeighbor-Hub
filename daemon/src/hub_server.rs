@@ -487,19 +487,24 @@ struct RouterStatus {
     gps_dev_id: String,
     poll_secs: u64,
     enabled: bool,
+    /// What the hub can do for this vendor (routers::capabilities) — the app gates its panel on
+    /// this, never on the vendor name.
+    capabilities: &'static [&'static str],
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<crate::routers::Snapshot>,
 }
 
 fn router_status(r: &hub_config::RouterConfig, state: Option<&crate::routers::Snapshot>) -> RouterStatus {
+    let signs_in = crate::routers::needs_password(&r.vendor);
     RouterStatus {
         id: r.id.clone(),
         vendor: r.vendor.clone(),
         name: r.name.clone(),
         host: r.host.clone(),
-        port: if r.port != 0 { r.port } else { 443 },
-        username: if r.username.is_empty() { "admin".into() } else { r.username.clone() },
+        port: if r.port != 0 { r.port } else { crate::routers::default_port(&r.vendor) },
+        username: if !signs_in { String::new() } else if r.username.is_empty() { "admin".into() } else { r.username.clone() },
         has_password: !r.password.is_empty(),
+        capabilities: crate::routers::capabilities(&r.vendor),
         agent_enrolled: !r.agent_token.is_empty(),
         gps_enabled: r.gps_enabled,
         gps_dev_id: r.gps_dev_id.clone(),
@@ -2575,9 +2580,12 @@ struct ProbeBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     wan: Option<crate::routers::WanStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    dish: Option<crate::starlink::DishStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     gps_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fix: Option<crate::routers::FixOut>,
+    capabilities: &'static [&'static str],
 }
 
 /// Everything about a managed router, in one door. Owner/co-owner for anything that signs in with
@@ -2623,14 +2631,16 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                 Ok(p) => p,
                 Err(why) => return err(502, &why),
             };
-            let (modem, wan) = drv.status().await.unwrap_or((None, None));
+            let status = drv.status().await.unwrap_or_default();
             let gps = drv.gps(true).await;
             ok_json(&ProbeBody {
                 probe,
-                modem,
-                wan,
+                modem: status.modem,
+                wan: status.wan,
+                dish: status.dish,
                 gps_enabled: gps.enabled,
                 fix: gps.fix.as_ref().map(crate::routers::FixOut::from),
+                capabilities: crate::routers::capabilities(&vendor),
             })
         }
         // Upsert by id. The sign-in is PROVED against the router before anything is stored, so a
@@ -2686,8 +2696,14 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             if r.host.is_empty() {
                 return err(422, "host is required");
             }
-            if r.password.is_empty() {
-                return err(422, "the router's admin password is required");
+            // A dish has no sign-in (routers::needs_password) — and must not keep a stale one.
+            if crate::routers::needs_password(&r.vendor) {
+                if r.password.is_empty() {
+                    return err(422, "the router's admin password is required");
+                }
+            } else {
+                r.username.clear();
+                r.password.clear();
             }
             if r.gps_enabled && r.gps_dev_id.is_empty() {
                 return err(422, "gpsDevId (the brv_gps_… record) is required when gpsEnabled");
@@ -3103,12 +3119,14 @@ async fn router_poll_loop(rt: Shared) {
                     if last_error.remove(&r.id).is_some() {
                         crate::hlog!("routers: {} '{}' - reachable again", r.host, r.name);
                     }
-                    if let Some(m) = &snap.modem {
-                        let counters = m.tx_bytes.zip(m.rx_bytes);
-                        let delta = counters.and_then(|c| crate::routers::wan_kb_delta(last_counters.get(&r.id).copied(), c));
-                        if let Some(c) = counters {
-                            last_counters.insert(r.id.clone(), c);
-                        }
+                    // Plan-burn deltas exist only where a modem reports lifetime counters.
+                    let counters = snap.modem.as_ref().and_then(|m| m.tx_bytes.zip(m.rx_bytes));
+                    let delta = counters.and_then(|c| crate::routers::wan_kb_delta(last_counters.get(&r.id).copied(), c));
+                    if let Some(c) = counters {
+                        last_counters.insert(r.id.clone(), c);
+                    }
+                    // A modem's params or a dish's — routers::report_params decides, the loop does not.
+                    if let Some(params) = crate::routers::report_params(&snap, delta) {
                         if r.agent_token.is_empty() {
                             // Readable in the app, but nothing reaches the cloud: say so once.
                             if last_error.get(&r.id).map_or(true, |e| e != "no agent token") {
@@ -3119,7 +3137,7 @@ async fn router_poll_loop(rt: Shared) {
                             spool_report(&rt, &crate::linktap_runtime::Report {
                                 device: r.id.clone(),
                                 event: "modem.measurement".into(),
-                                params: crate::routers::modem_params(m, snap.wan.as_ref(), snap.probe.as_ref(), delta),
+                                params,
                                 token: Some(r.agent_token.clone()),
                             })
                             .await;

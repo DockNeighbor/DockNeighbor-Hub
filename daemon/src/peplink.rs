@@ -86,7 +86,7 @@ pub fn parse_probe(body: &Value) -> Option<Probe> {
     if model.is_none() && firmware.is_none() && mac.is_none() {
         return None;
     }
-    Some(Probe { model, firmware, mac })
+    Some(Probe { model, firmware, mac, serial: str_of(r.get("serialNumber")) })
 }
 
 /// The WAN map: every object value except `order` (the display ordering array).
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn probe_reads_model_and_firmware() {
         let p = parse_probe(&json!({ "stat": "ok", "response": { "productName": "Balance One", "firmwareVersion": "8.5.2", "mac": "00:11:22:33:44:55" } })).unwrap();
-        assert_eq!(p, Probe { model: Some("Balance One".into()), firmware: Some("8.5.2".into()), mac: Some("00:11:22:33:44:55".into()) });
+        assert_eq!(p, Probe { model: Some("Balance One".into()), firmware: Some("8.5.2".into()), mac: Some("00:11:22:33:44:55".into()), serial: None });
         let alt = parse_probe(&json!({ "response": { "model": "MAX Transit", "firmware": "8.4.0" } })).unwrap();
         assert_eq!((alt.model.as_deref(), alt.firmware.as_deref()), (Some("MAX Transit"), Some("8.4.0")));
         assert!(parse_probe(&json!({ "response": {} })).is_none());
@@ -425,7 +425,7 @@ mod tests {
             "cellular": { "simStatus": "ready", "carrier": "T-Mobile", "dataTechnology": "LTE", "signal": { "rsrp": -95, "sinr": 9 } } } } });
         let m = parse_modem(&body).unwrap();
         let w = parse_wan(&body);
-        let p = Probe { model: Some("MAX Transit".into()), firmware: Some("8.5.2".into()), mac: None };
+        let p = Probe { model: Some("MAX Transit".into()), firmware: Some("8.5.2".into()), mac: None, serial: None };
         let params = crate::routers::modem_params(&m, w.as_ref(), Some(&p), None);
         let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("up"), Some("1"));

@@ -64,6 +64,13 @@ uuid = { version = "1", features = ["v4"] }
 # hub can listen on 10110/2000/... while a chartplotter program on the same PC (TimeZero, OpenCPN)
 # already holds the port. Already in the tree via tokio; `all` exposes set_reuse_port.
 socket2 = { version = "0.6", features = ["all"] }
+# The Starlink dish speaks gRPC on the LAN (starlink.rs): prost's derive declares the dozen
+# messages the hub reads (no protoc, no generated code), h2 carries one unary call per read —
+# reqwest is built without HTTP/2 and gRPC needs the trailers it would not expose anyway.
+prost = "0.13"
+h2 = "0.4"
+http = "1"
+bytes = "1"
 
 # The desktop tray stack — Windows AND macOS (owner 2026-08-20: "add a taskbar icon line on
 # windows to mac"). LINUX is deliberately excluded: the daemon runs there (containers) but has no
