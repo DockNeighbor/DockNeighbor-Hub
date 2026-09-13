@@ -29,9 +29,9 @@ worker on a timer, so the vehicle reports without the app being onsite.
   app has one hub client (owner ruling 2026-08-31: *"the hub-lite should move to 8722, keep one
   contract"*). Since 0.15.0 it answers the daemon's routes: `ping`, `status`, `logs`, `config`,
   `gps`, `token`, `clear`, `update`, `identity` + `bootstrap` (first run), `shelly`,
-  `linktap/state`, `linktap/valve` and `linktap/push`. Keyed routes take the router's `MGMT_KEY` as
-  `Authorization: Bearer`, through ONE function (`authorize`) so per-member role keys (owner
-  decision D3) change one place.
+  `linktap/state`, `linktap/valve` and `linktap/push`. Keyed routes take the caller's own
+  per-member key (or, during rollout, the router's `MGMT_KEY`) as `Authorization: Bearer`,
+  through ONE function (`authorize`) that applies the daemon's role gates (0.15.1, D3).
 - **LinkTap parity with the daemon** (0.15.0): the full `linktap.measurement` (battery, signal, RF,
   fault flags, flow, the run's mode/duration/cap/remaining time and who started it), the
   **washdown handover** ~20 s before expiry and the **resume** after it, wake-on-command, the
@@ -260,17 +260,34 @@ independently deny-by-default, so serving them costs a listener and nothing else
 still needs is `uhttpd` present (**not stock** on GL.iNet firmware — the `.ipk` carries it as a
 `Depends:`).
 
-**Auth** is the router's own management key (`MGMT_KEY` in the config), presented as `x-brvg-key`.
+**Auth (before 0.15.1, still accepted)** is the router's own management key (`MGMT_KEY` in the config).
 The hub-lite fetches it from `/api/agent/mgmt-key` with the device token it already has, so a box
 enrolled before 0.14.0 picks its key up on the next modem tick with nothing to re-install. With no
 key on the box the door is **shut**, not open: a hub-lite that has never reached the worker cannot
 tell a member from a stranger on the marina Wi-Fi.
 
-⚠️ **A hub-lite does NOT get the vehicle's per-member key set** the way a full hub does
-(`/api/hub/keys` refuses a router's token on purpose). That set is every member's LAN management
-access and belongs on a host that can resolve roles; this is a router in a locker. One key, one
-router, one privilege level — and the worker gates issuing it at the same boundary as
-`/api/agent/command`.
+**Role keys (0.15.1, owner decision D3).** *"crew with control access should be able to open the
+valve. others should not"*. On the modem tick the collector also polls
+`GET /api/agent/member-keys?vid&device&t` (its device token) and stores the vessel's member set in
+`/etc/brvg-hub-lite.keys` (0600). The file is `sig <signature>` followed by one `<sha256 of key> <role>` line
+per member. It holds **digests, never keys**, so the old objection to giving a router every member's
+credential does not apply. The worker sends the set's signature as an ETag; the poll presents it in
+`If-None-Match` and a 304 costs no body and no flash write. A set whose lines do not hash to its
+signature is refused, and the cached set is kept. `authorize` hashes the presented key, looks up the
+role and applies `hub_server.rs` `may_*`:
+
+| role | read (`status`, `linktap/state`) | control (`linktap/valve`, `logs`) | configure (`config`, `gps`) | administer (`token`, `clear`, `update`) |
+|---|---|---|---|---|
+| owner, coowner | ✓ | ✓ | ✓ | ✓ |
+| admin | ✓ | ✓ | ✓ | — |
+| control | ✓ | ✓ | — | — |
+| monitor, monitor_quiet | ✓ | — | — | — |
+
+The key is the same per-user key the app fetches from `/api/hub/key` for a daemon hub. A removed
+member or a rotated key drops out of the next sync. An unknown 64-hex key asks the collector to sync
+early (at most once a minute), so a crew member who has just joined is recognised within one nap
+slice. `MGMT_KEY` is still accepted as **owner** during rollout. Retire it once every router runs
+0.15.1+ and no shipped app still presents it; the legacy 8181 `mgmt` door takes only `MGMT_KEY`.
 
 **Not a tunnel**, for the same reason the cloud queue is not one: `command` takes a verb off the
 allowlist `run_commands` already owns (so the two doors can never diverge about what a hub-lite

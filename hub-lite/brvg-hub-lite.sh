@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.15.0"
+HUB_LITE_VERSION="0.15.1"
 HUB_LITE_BACKUP="/etc/brvg-hub-lite.prev"
 
 # The LAST telemetry this hub-lite composed, as JSON, for the LAN management door to serve
@@ -49,6 +49,16 @@ HUB_LITE_FOLLOWUP="${BRVG_HUB_LITE_FOLLOWUP:-/tmp/brvg-hub-lite.followup}"
 # /bootstrap). The collector sources its conf once at start, so a CGI that rewrote it must ask the
 # running loop to read it again, or the new heartbeat or GPS source would wait for a restart.
 HUB_LITE_RELOAD="${BRVG_HUB_LITE_RELOAD:-/tmp/brvg-hub-lite.reload}"
+
+# The vessel's member-key set (D3), as `sig <signature>` then one `<sha256 of key> <role>` line per
+# member. ROOT-ONLY and on flash, so a reboot with no WAN still knows the crew — but it holds DIGESTS,
+# never keys, so even a leak of this file opens nothing. Rewritten only when the set changes (304
+# otherwise), so a stable crew costs no flash writes at all.
+MEMBER_KEYS_FILE="${BRVG_MEMBER_KEYS:-/etc/brvg-hub-lite.keys}"
+# Touched by the /api/hub door when a key it does not know was presented: a member who just joined or
+# rotated is seen within one nap slice instead of one MODEM_INTERVAL. The loop rate-limits the fetch,
+# so a LAN client hammering bad keys costs one small request a minute, not one per attempt.
+MEMBER_KEYS_STALE="${BRVG_MEMBER_KEYS_STALE:-/tmp/brvg-hub-lite.keys-stale}"
 
 # Epoch the service was last STARTED (written by init.d start_service, and by the collector when
 # absent). Two readers: `uptimeSecs` on /api/hub/status, and the first-run window /api/hub/bootstrap
@@ -808,9 +818,8 @@ write_state() {
 # fetch it with the device token we already have, so a box enrolled before this feature existed
 # picks its key up on the next tick with nothing to re-install and no re-enrollment.
 #
-# ⚠️ A hub-lite deliberately does NOT get the vehicle's per-member key set the way a full hub does.
-# That set is every member's LAN management access and belongs on a host that can resolve roles;
-# this is a router in a locker. One key, one router, one privilege level.
+# Since 0.15.1 (D3) this key is the OWNER-GRADE ROLLOUT FALLBACK: crew are recognised by their own
+# per-user keys, synced below as digests (fetch_member_keys). Retire it once no app presents it.
 fetch_mgmt_key() {
   [ -n "${MGMT_KEY:-}" ] && return 0
   [ -n "${DEVICE_TOKEN:-}" ] || return 1        # the legacy VEHICLE_KEY path cannot ask for one
@@ -830,6 +839,68 @@ fetch_mgmt_key() {
     mv "$_tmp" "$CONF"
   fi
   log "management key stored — the app can now reach this hub-lite directly on the LAN"
+  return 0
+}
+
+# --- LAN management door: the member key set (D3) --------------------------------------------------
+# Owner, 2026-09-13: "crew with control access should be able to open the valve. others should not".
+# One router key cannot say that, so the router also holds the vessel's member set — the SAME
+# per-user keys the daemon checks (worker `resolveMemberKeys`), received as SHA-256 DIGESTS plus the
+# live role from GET /api/agent/member-keys. hub-lite-api.sh `authorize` hashes what a caller presents
+# and looks the digest up. A removed member or a rotated key vanishes from the next set.
+
+# PURE: the worker's JSON → validated `<digest> <role>` lines. Split on `}` rather than parsed; an
+# entry that is not exactly a 64-hex digest and a known role is dropped, which can only deny.
+parse_member_keys() {
+  tr -d ' \n\r' | sed -n 's/.*"keys":\[\(.*\)\].*/\1/p' | tr '}' '\n' \
+    | sed -nE 's/.*"h":"([0-9a-f]{64})".*"role":"(owner|coowner|admin|control|monitor|monitor_quiet)".*/\1 \2/p'
+}
+
+# PURE: the signature the worker sent, or nothing.
+parse_member_keys_sig() { tr -d ' \n\r' | sed -nE 's/.*"sig":"([0-9a-f]{64})".*/\1/p'; }
+
+sha256_hex() { sha256sum | cut -c1-64; }
+
+fetch_member_keys() {
+  [ -n "${DEVICE_TOKEN:-}" ] || return 1          # the legacy VEHICLE_KEY path cannot ask
+  # Without sha256sum the door cannot check a digest, so there is nothing worth fetching; MGMT_KEY
+  # keeps working on its own.
+  command -v sha256sum >/dev/null 2>&1 || return 1
+  _mk_have=$(sed -n '1s/^sig \([0-9a-f]\{64\}\)$/\1/p' "$MEMBER_KEYS_FILE" 2>/dev/null)
+  _mk_url="${WORKER_URL}/api/agent/member-keys?vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}"
+  _mk_body="/tmp/brvg-hub-lite.member-keys.$$"
+  if [ -n "$_mk_have" ]; then
+    _mk_code=$(curl -sS --max-time 10 -o "$_mk_body" -w '%{http_code}' -H "If-None-Match: \"$_mk_have\"" "$_mk_url" 2>/dev/null)
+  else
+    _mk_code=$(curl -sS --max-time 10 -o "$_mk_body" -w '%{http_code}' "$_mk_url" 2>/dev/null)
+  fi
+  case "$_mk_code" in
+    304) rm -f "$_mk_body"; return 0 ;;
+    200) : ;;
+    *) rm -f "$_mk_body"; return 1 ;;             # keep the cached set, as the daemon does offline
+  esac
+  _mk_sig=$(parse_member_keys_sig < "$_mk_body")
+  _mk_lines=$(parse_member_keys < "$_mk_body")
+  rm -f "$_mk_body"
+  # 🔴 THE LINES MUST HASH TO THE SIGNATURE. It is the worker's digest of exactly these lines, so a
+  # truncated body or a parser that dropped an entry is caught here and the old set kept, rather than
+  # silently locking a member out (or, worse, keeping a removed one because a newer set was misread).
+  [ -n "$_mk_sig" ] || { log "member keys: the answer carried no signature - keeping the cached set"; return 1; }
+  if [ -n "$_mk_lines" ]; then
+    _mk_calc=$(printf '%s\n' "$_mk_lines" | sha256_hex)
+  else
+    _mk_calc=$(printf '' | sha256_hex)
+  fi
+  [ "$_mk_calc" = "$_mk_sig" ] || { log "member keys: the set did not match its signature - keeping the cached set"; return 1; }
+  _mk_tmp="${MEMBER_KEYS_FILE}.$$"
+  (
+    umask 077
+    { printf 'sig %s\n' "$_mk_sig"; [ -n "$_mk_lines" ] && printf '%s\n' "$_mk_lines"; } > "$_mk_tmp"
+  ) || { rm -f "$_mk_tmp"; return 1; }
+  chmod 600 "$_mk_tmp" 2>/dev/null
+  mv "$_mk_tmp" "$MEMBER_KEYS_FILE" || { rm -f "$_mk_tmp"; return 1; }
+  _mk_n=0; [ -n "$_mk_lines" ] && _mk_n=$(printf '%s\n' "$_mk_lines" | wc -l | tr -cd '0-9')
+  log "member keys updated (${_mk_n} members) - crew can reach this hub-lite by role"
   return 0
 }
 
@@ -2301,6 +2372,9 @@ main() {
       # collects one the moment the uplink comes back. NOT gated on HUB_LITE_ENABLED: that flag is
       # the RELAY TIER, and the management door is not part of it.
       fetch_mgmt_key
+      # The member set rides the same tick; a 304 is a few hundred bytes (D3).
+      fetch_member_keys
+      _next_keys=$(( $(date +%s) + 60 ))
       # 🔴 NOT GATED ON HUB_LITE_ENABLED ANY MORE. LinkTap telemetry, cycle ends, flood-close
       # records AND the plan gate + valve profiles all travel through this drain; gating it on the
       # relay tier meant a router with the tier off never reported a valve, never learned its
@@ -2316,6 +2390,12 @@ main() {
         drain_relay
         _next_retry=$(( $(date +%s) + 30 ))
       fi
+    fi
+    # The door saw a key it did not know: maybe a member who joined or rotated since the last tick.
+    if [ -f "$MEMBER_KEYS_STALE" ] && [ "$(date +%s)" -ge "${_next_keys:-0}" ]; then
+      rm -f "$MEMBER_KEYS_STALE"
+      fetch_member_keys
+      _next_keys=$(( $(date +%s) + 60 ))
     fi
     spool_cap "$RELAY_SPOOL"
     if [ "$(date +%s)" -ge "$_next_update" ]; then
