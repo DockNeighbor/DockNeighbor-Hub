@@ -275,6 +275,8 @@ pub struct Rt {
     /// The web app this hub serves at `/` (web_bundle.rs) — None until a signed bundle has been
     /// fetched from the App release. Swapped whole when a newer one is installed.
     pub web: tokio::sync::RwLock<Option<crate::web_bundle::WebBundle>>,
+    /// Mirror of `hub_config::web_ui_disabled`, read on every `/` request without touching the file.
+    pub web_ui_disabled: std::sync::atomic::AtomicBool,
     /// Epoch ms of the last local event worth reporting (a valve/gateway report or a forwarded
     /// sensor event). The heartbeat picks its cadence from how stale this is — recent ⇒ ACTIVE/
     /// NORMAL, long-idle ⇒ QUIET (report-by-exception, Phase 2). Boot counts as activity so a fresh
@@ -356,10 +358,14 @@ pub type Shared = Arc<Rt>;
 
 pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
     let keys = hub_config::read_config_in(&base).member_keys;
-    let web = crate::web_bundle::load_current(&base);
+    let web_ui_disabled = hub_config::read_config_in(&base).web_ui_disabled;
+    // A turned-off local web app is not loaded at all: nothing served, nothing announced (the relay
+    // hello and the status body both read `web`).
+    let web = if web_ui_disabled { None } else { crate::web_bundle::load_current(&base) };
     Arc::new(Rt {
         base,
         web: tokio::sync::RwLock::new(web),
+        web_ui_disabled: std::sync::atomic::AtomicBool::new(web_ui_disabled),
         keys: tokio::sync::RwLock::new(keys),
         store: tokio::sync::Mutex::new(()),
         started: Instant::now(),
@@ -481,6 +487,8 @@ struct StatusBody {
     /// The web app version this hub serves at `/`, when it has one (web_bundle.rs).
     #[serde(skip_serializing_if = "Option::is_none")]
     web_version: Option<String>,
+    /// The owner's switch for the local web app (hub_config::web_ui_disabled, inverted for the wire).
+    web_ui_enabled: bool,
     /// The routers this hub manages (routers.rs), redacted, with what the last poll learned.
     /// Always present (empty when none) so a caller can tell "none configured" from "old daemon".
     routers: Vec<RouterStatus>,
@@ -593,6 +601,7 @@ async fn status_body(rt: &Rt) -> StatusBody {
         update_available: rt.update_available.read().await.clone(),
         gps: gps_status(&cfg.gps),
         web_version: rt.web.read().await.as_ref().map(|w| w.version.clone()),
+        web_ui_enabled: !cfg.web_ui_disabled,
     }
 }
 
@@ -612,6 +621,8 @@ fn capabilities_of(lt: &hub_config::LinkTapConfig) -> Vec<String> {
     caps.push("sensors".to_string());
     // NMEA-over-IP discovery (nmea_discover.rs): Add GPS can ask the hub to find the boat's feed.
     caps.push("gps_discover".to_string());
+    // The owner can turn the local web app off (hub_config::web_ui_disabled) — the app shows the switch.
+    caps.push("web_ui_toggle".to_string());
     caps
 }
 
@@ -627,6 +638,8 @@ struct ConfigReq {
     /// role gate on it. An EMPTY string disarms the ingest deliberately — it is how a rotated or
     /// mistakenly-set secret is taken back, and the status body reports the resulting state.
     shelly_secret: Option<String>,
+    /// Owner switch for the local web app at `/` (hub_config::web_ui_disabled). Absent ⇒ unchanged.
+    web_ui_enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -731,6 +744,9 @@ async fn do_config(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
         if let Some(e) = req.enabled {
             cfg.enabled = e;
         }
+        if let Some(on) = req.web_ui_enabled {
+            cfg.web_ui_disabled = !on;
+        }
         if let Some(sec) = req.shelly_secret {
             // Trimmed, because it arrives from a copy/paste field in the app and a trailing
             // newline would silently break every constant-time comparison against it.
@@ -740,8 +756,38 @@ async fn do_config(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             return err(500, &e);
         }
     }
+    if let Some(on) = req.web_ui_enabled {
+        apply_web_ui_switch(rt, on).await;
+    }
     ok_json(&status_body(rt).await)
 }
+
+/// Turn the local web app on or off NOW, not at the next restart: drop the bundle from service (so
+/// `/`, the status body and the next relay hello all stop mentioning it), or load what is already on
+/// disk and let the update loop fetch a newer one.
+async fn apply_web_ui_switch(rt: &Rt, on: bool) {
+    let was_off = rt.web_ui_disabled.swap(!on, std::sync::atomic::Ordering::SeqCst);
+    if on {
+        if was_off {
+            *rt.web.write().await = crate::web_bundle::load_current(&rt.base);
+            crate::hlog!("hub: local web app turned ON by the owner");
+        }
+    } else {
+        *rt.web.write().await = None;
+        if !was_off {
+            crate::hlog!("hub: local web app turned OFF by the owner - / is no longer served");
+        }
+    }
+}
+
+/// What `/` answers while the owner has the local web app turned off.
+const WEB_UI_OFF_HTML: &str = concat!(
+    "<!doctype html><meta charset=utf-8><title>DockNeighbor Hub</title>",
+    "<body style=\"font-family:system-ui;margin:3rem;max-width:40rem\">",
+    "<h1>DockNeighbor Hub</h1>",
+    "<p>The local web app is turned off on this hub. Use the DockNeighbor app, or turn it back on in ",
+    "the hub's settings.</p>",
+);
 
 /// Token handover after the app rotates the enrollment (re-enroll replaces the token server-side;
 /// the new one has to reach the hub or its heartbeats start bouncing).
@@ -904,6 +950,9 @@ const NO_WEB_BUNDLE_HTML: &str = concat!(
 /// application code, the same bytes app.dockneighbor.com serves; the API it talks to is still
 /// key-gated route by route. Path traversal is refused in web_bundle::resolve.
 async fn h_web(State(rt): State<Shared>, uri: axum::http::Uri) -> Response {
+    if rt.web_ui_disabled.load(std::sync::atomic::Ordering::SeqCst) {
+        return (StatusCode::NOT_FOUND, Html(WEB_UI_OFF_HTML)).into_response();
+    }
     let Some(bundle) = rt.web.read().await.clone() else {
         return Html(NO_WEB_BUNDLE_HTML).into_response();
     };
@@ -1607,7 +1656,8 @@ async fn update_check_loop(rt: Shared) {
         }
         // The WEB APP rides the same cadence (web_bundle.rs). Its own client: a bundle is a few MB
         // and a Starlink afternoon is not a 20 s affair. A failure keeps the bundle in service.
-        {
+        // Skipped entirely while the owner has the local web app turned off — no download at all.
+        if !rt.web_ui_disabled.load(std::sync::atomic::Ordering::SeqCst) {
             let current = rt.web.read().await.as_ref().map(|w| w.version.clone());
             match crate::web_bundle::refresh(&web_client(), &rt.base, current.as_deref()).await {
                 Ok(Some(b)) => {
@@ -4160,6 +4210,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_owner_can_turn_the_local_web_app_off_and_on() {
+        let base = temp_base("web_ui_switch");
+        hub_config::write_config_in(&base, &valve_cfg(true)).unwrap();
+        crate::web_bundle::install(&base, "1.0.104", &tiny_web_bundle()).unwrap();
+        let (origin, rt) = spawn_server(base.clone(), vec![key("owner"), key("monitor")]).await;
+        let c = reqwest::Client::new();
+        assert_eq!(c.get(format!("{origin}/")).send().await.unwrap().status(), 200, "served by default");
+
+        // A monitor may not change it.
+        let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("monitor").key)
+            .header("content-type", "application/json").body(r#"{"webUiEnabled":false}"#).send().await.unwrap();
+        assert_eq!(r.status(), 403);
+
+        let st: serde_json::Value = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("owner").key)
+            .header("content-type", "application/json").body(r#"{"webUiEnabled":false}"#).send().await.unwrap().json().await.unwrap();
+        assert_eq!(st["webUiEnabled"], false);
+        assert!(st.get("webVersion").is_none(), "a turned-off app is not announced");
+        let off = c.get(format!("{origin}/")).send().await.unwrap();
+        assert_eq!(off.status(), 404);
+        assert!(off.text().await.unwrap().contains("turned off"));
+        // The console and the API stay up — they are how the apps manage the hub.
+        assert_eq!(c.get(format!("{origin}/console")).send().await.unwrap().status(), 200);
+        assert!(hub_config::read_config_in(&base).web_ui_disabled, "persisted");
+        assert!(rt.web.read().await.is_none());
+
+        let st: serde_json::Value = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("owner").key)
+            .header("content-type", "application/json").body(r#"{"webUiEnabled":true}"#).send().await.unwrap().json().await.unwrap();
+        assert_eq!(st["webUiEnabled"], true);
+        assert_eq!(st["webVersion"], "1.0.104", "back in service from what is already on disk");
+        assert_eq!(c.get(format!("{origin}/")).send().await.unwrap().status(), 200);
+    }
+
+    #[tokio::test]
     async fn capabilities_advertise_linktap_only_when_configured_AND_permitted() {
         // The two conditions are ANDed so neither can be forgotten: a configured gateway on an
         // unpermitted plan must not advertise, and a permitted plan with no gateway must not either.
@@ -4170,7 +4253,7 @@ mod tests {
             .get(format!("{origin}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
         // `routers` is unconditional (managed routers need no plan or gateway to be OFFERED).
-        assert_eq!(body["capabilities"], serde_json::json!(["linktap", "routers", "sensors", "gps_discover"]));
+        assert_eq!(body["capabilities"], serde_json::json!(["linktap", "routers", "sensors", "gps_discover", "web_ui_toggle"]));
 
         let base2 = temp_base("caps_denied");
         hub_config::write_config_in(&base2, &valve_cfg(false)).unwrap();
@@ -4178,7 +4261,7 @@ mod tests {
         let body2: serde_json::Value = reqwest::Client::new()
             .get(format!("{origin2}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(body2["capabilities"], serde_json::json!(["routers", "sensors", "gps_discover"]), "an unpermitted plan must not advertise valve capability");
+        assert_eq!(body2["capabilities"], serde_json::json!(["routers", "sensors", "gps_discover", "web_ui_toggle"]), "an unpermitted plan must not advertise valve capability");
 
         let base3 = temp_base("caps_nogw");
         hub_config::write_config_in(&base3, &seeded_cfg()).unwrap(); // allowed defaults false, no gateway
@@ -4186,7 +4269,7 @@ mod tests {
         let body3: serde_json::Value = reqwest::Client::new()
             .get(format!("{origin3}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(body3["capabilities"], serde_json::json!(["routers", "sensors", "gps_discover"]));
+        assert_eq!(body3["capabilities"], serde_json::json!(["routers", "sensors", "gps_discover", "web_ui_toggle"]));
     }
 
     #[tokio::test]

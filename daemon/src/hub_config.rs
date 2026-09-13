@@ -98,6 +98,14 @@ pub struct HubConfig {
     /// to lock down. Never returned by any endpoint.
     #[serde(default)]
     pub shelly_secret: String,
+    /// Owner switch: turn OFF the local copy of the web app this hub serves at `/` (web_bundle.rs)
+    /// — for an install on a network the owner does not trust, or a small box where serving and
+    /// downloading a few MB of app is not wanted. Named as a DISABLE so an absent field (every
+    /// hub.json written before 0.3.48) keeps today's behaviour: served. When set, the hub neither
+    /// serves nor downloads the bundle and stops announcing it to the cloud; the key-gated API and
+    /// the built-in /console stay up, because they are how the apps manage the hub.
+    #[serde(default)]
+    pub web_ui_disabled: bool,
     /// A GPS/location source on the LAN (a cellular router's GPS, a NMEA feed) the hub POLLS and
     /// reports as `gps.measurement`. Empty host ⇒ no source configured. The hub is the acquirer,
     /// not the app: a browser cannot reach a LAN router over HTTPS, and only the hub is always
@@ -222,6 +230,7 @@ impl Default for HubConfig {
             member_keys: Vec::new(),
             linktap: LinkTapConfig::default(),
             shelly_secret: String::new(),
+            web_ui_disabled: false,
             gps: GpsConfig::default(),
             routers: Vec::new(),
             sensor_jobs: Vec::new(),
@@ -497,6 +506,12 @@ mod tests {
     }
 
     #[test]
+    fn a_hub_json_written_before_the_web_switch_keeps_serving_the_web_app() {
+        let old: HubConfig = serde_json::from_str(r#"{"hub_id":"hub_1","vid":"v1","name":"Central","enabled":true}"#).unwrap();
+        assert!(!old.web_ui_disabled, "absent field must mean the local web app stays ON");
+    }
+
+    #[test]
     fn config_round_trips_and_absent_fields_default() {
         let cfg = HubConfig {
             hub_id: "hub_1".into(), vid: "v1".into(), name: "Central".into(),
@@ -508,6 +523,7 @@ mod tests {
                 dev_ids: vec!["aaaabbbbccccdddd".into()], allowed: true,
             },
             shelly_secret: "wh-secret".into(),
+            web_ui_disabled: true,
             gps: GpsConfig {
                 kind: "cradlepoint".into(), host: "192.168.10.1".into(), port: 443,
                 username: "admin".into(), password: "routerpw".into(),
