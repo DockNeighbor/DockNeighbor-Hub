@@ -9,6 +9,14 @@
 // action on a moving vehicle and inherits the valve's safety posture (docs/DESIGN-DEVICES.md), not
 // a settings toggle to ship beside a status card.
 //
+// GPS, and why the owner's dish refuses it. `get_location` answers PERMISSION_DENIED "Disabled due
+// to policy" on MVP's Starlink Mini (2026-09-13). That is not a switch the owner missed: Starlink
+// removed position from the local API on 2026-05-20 for standard plans, restored it in July 2026
+// for Priority plans only, and the Mini/V4 never show the old "Starlink Location" toggle
+// (pds.codes/posts/starlink-removing-gps-from-local-api). The driver still asks — a Priority plan
+// or a future firmware may answer — and reports the refusal as GPS off at the dish with the
+// reason, so the owner picks another position source rather than hunting for a setting.
+//
 // The interface. A dish answers gRPC on 192.168.100.1:9200 with no sign-in: one service,
 // `SpaceX.API.Device.Device/Handle`, one `Request` oneof in, one `Response` oneof out. It is
 // ⚠️ UNDOCUMENTED and SpaceX changes it without notice — the same risk class as the vendor clouds
@@ -447,12 +455,12 @@ fn grpc_message(h: &http::HeaderMap) -> String {
 }
 
 /// PURE: a non-OK gRPC status → what the owner can act on. 7 (PERMISSION_DENIED) is the one that
-/// matters: `get_location` answers "Disabled due to policy" (bench 2026-09-13) until location
-/// access is switched on in the Starlink app, and saying that is the difference between a fixable
-/// setting and a mystery.
+/// matters: `get_location` answers "Disabled due to policy" (bench 2026-09-13), which is Starlink's
+/// plan policy, not a setting — saying so is the difference between "pick another position source"
+/// and a hunt for a switch that is not there (see the header).
 pub fn grpc_error(code: i32, message: &str) -> String {
     match code {
-        7 => "the dish refused the request — in the Starlink app, switch on Advanced → Debug data → “Allow access on local network”".into(),
+        7 => "the dish will not share its position — Starlink switched off local GPS access in May 2026 (Priority plans got it back in July; the Mini and V4 have no setting for it). Use another position source for this vessel".into(),
         12 => "the dish does not know that request — its firmware has moved; this hub needs updating".into(),
         14 => "the dish is not available right now — it may be rebooting".into(),
         _ if message.is_empty() => format!("the dish answered gRPC status {code}"),
@@ -695,7 +703,8 @@ pub(crate) mod tests {
 
     #[test]
     fn grpc_refusals_say_what_the_owner_can_do() {
-        assert!(grpc_error(7, "Failed to get location: Disabled due to policy").contains("Allow access on local network"));
+        let denied = grpc_error(7, "Failed to get location: Disabled due to policy");
+        assert!(denied.contains("Starlink switched off local GPS access") && denied.contains("another position source"), "{denied}");
         assert!(grpc_error(14, "").contains("rebooting"));
         assert_eq!(grpc_error(3, "bad arg"), "the dish answered: bad arg (gRPC 3)");
         assert_eq!(grpc_error(3, ""), "the dish answered gRPC status 3");
@@ -707,8 +716,9 @@ pub(crate) mod tests {
     }
 
     /// A mock dish: an h2 server that decodes the Request and answers the way the real one does —
-    /// status and reboot succeed; location is PERMISSION_DENIED in the trailers (the factory
-    /// setting, bench 2026-09-13: "Disabled due to policy") until the test flips `allow_location`.
+    /// status and reboot succeed; location is PERMISSION_DENIED in the trailers (Starlink's policy
+    /// on MVP's Mini, bench 2026-09-13: "Disabled due to policy") unless the test flips
+    /// `allow_location` — a Priority-plan dish.
     pub(crate) async fn mock_dish(allow_location: bool) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -769,7 +779,7 @@ pub(crate) mod tests {
         assert_eq!(p.model.as_deref(), Some("Starlink mini1_panda_proto1"));
         dish.reboot().await.unwrap();
         let why = dish.location().await.unwrap_err();
-        assert!(why.contains("Allow access on local network"), "{why}");
+        assert!(why.contains("another position source"), "{why}");
 
         let port = mock_dish(true).await;
         let dish = Starlink::new("127.0.0.1", port);

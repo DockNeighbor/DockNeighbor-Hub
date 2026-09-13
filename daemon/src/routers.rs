@@ -786,8 +786,8 @@ impl<'a> Driver<'a> {
                     Err(_) => GpsRead::default(),
                 }
             }
-            // The dish's switch lives in the Starlink app ("Allow access on local network"), and
-            // the only way to read it is to ask for the position: a refusal is `enabled: false`.
+            // There is no switch to read — Starlink's plan policy decides (starlink.rs header) —
+            // and the only way to learn it is to ask for the position: a refusal is `enabled: false`.
             Driver::Starlink(s) => {
                 if !want_fix {
                     return GpsRead::default();
@@ -803,8 +803,8 @@ impl<'a> Driver<'a> {
     /// Switch the device's own GNSS. A Peplink has no such switch in its local API — GPS is on the
     /// model or it is not — so for it this is the hub-side setting alone, and succeeds without a
     /// request (the owner's intent is recorded; the poll reports fixes when the router has them).
-    /// A Starlink's switch is in the Starlink app, not on the LAN: switching ON here asks the dish
-    /// once so a refusal names that switch (the owner can act on it); OFF is hub-side only.
+    /// A Starlink has no switch at all — its plan policy decides (starlink.rs header): switching ON
+    /// here asks the dish once so a refusal carries the reason; OFF is hub-side only.
     pub async fn set_gps_enabled(&self, on: bool) -> Result<(), String> {
         match self {
             Driver::Cradlepoint(n) => n.set_gps_enabled(on).await,
@@ -1078,7 +1078,7 @@ mod tests {
         // The GPS switch: ON asks the dish and surfaces its refusal; OFF is hub-side only.
         let client = lan_client();
         let drv = Driver::for_router(&client, &cfg).unwrap();
-        assert!(drv.set_gps_enabled(true).await.unwrap_err().contains("Allow access on local network"));
+        assert!(drv.set_gps_enabled(true).await.unwrap_err().contains("another position source"));
         assert!(drv.set_gps_enabled(false).await.is_ok());
         // Nothing to report when a read learned neither a modem nor a dish.
         assert!(report_params(&Snapshot::default(), None).is_none());
