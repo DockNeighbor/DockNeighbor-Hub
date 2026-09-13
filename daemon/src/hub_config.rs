@@ -124,14 +124,14 @@ pub struct HubConfig {
 pub struct RouterConfig {
     /// The app's network_device id (`brv_net_…`) — the device the router's telemetry lands on.
     pub id: String,
-    /// `cradlepoint` or `peplink` (routers::vendor_supported).
+    /// `cradlepoint`, `peplink` or `starlink` (routers::vendor_supported).
     pub vendor: String,
     pub name: String,
     pub host: String,
-    /// `0` ⇒ the vendor default (443 for both).
+    /// `0` ⇒ the vendor default (routers::default_port: 443 for the routers, 9200 for a dish).
     pub port: u16,
     pub username: String,
-    /// Router admin password. Never returned by any endpoint.
+    /// Router admin password. Never returned by any endpoint. Empty for a Starlink, which has none.
     pub password: String,
     /// The router's per-device agent token (minted by the app through `/api/agent/enroll`), so the
     /// hub reports AS the router — the cloud then sees exactly what a hub-lite router sends.

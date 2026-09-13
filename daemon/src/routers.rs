@@ -12,9 +12,11 @@
 // Vendor 1 is Cradlepoint NCOS, in this file. Every parser mirrors the app's drivers/cradlepoint.ts,
 // which was pinned to payloads captured from the bench CBA850 (fw 7.0.50) on 2026-08-17 — the two
 // must agree on every shape, so the fixtures below are the same captures. Vendor 2 is Peplink
-// (peplink.rs; owner: "Cradlepoint first, Peplink right after"). `Driver` below is the one door the
-// poll loop and hub_server go through, so the shared shapes here — Snapshot, modem_params — are
-// filled identically whichever vendor answered.
+// (peplink.rs; owner: "Cradlepoint first, Peplink right after"). Vendor 3 is Starlink
+// (starlink.rs) — not a router but the uplink itself, read over the dish's local gRPC with no
+// sign-in, and reported through the same door so the cloud sees one more `modem.measurement`
+// source. `Driver` below is the one door the poll loop and hub_server go through, so the shared
+// shapes here — Snapshot, report_params — are filled identically whichever vendor answered.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -22,6 +24,7 @@ use serde_json::Value;
 use crate::gps::{cradlepoint_base, parse_cradlepoint_gps, GpsFix};
 use crate::hub_config::RouterConfig;
 use crate::peplink::Peplink;
+use crate::starlink::{DishStatus, Starlink};
 
 /// How often a router is read when the owner set nothing. Two minutes: signal and data use move
 /// slowly, and a router's API is not free to hit.
@@ -59,6 +62,10 @@ pub struct Probe {
     pub firmware: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// A vendor serial / device id, for gear that has one and no MAC to offer (a Starlink's
+    /// `ut01…` id) — the app derives a STABLE device id from it the way it does from a MAC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
@@ -92,7 +99,7 @@ pub struct ModemStatus {
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WanStatus {
-    /// `lte` | `wired` | `repeater` | `none`.
+    /// `lte` | `wired` | `repeater` | `starlink` | `none`.
     pub wan: String,
     pub up: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +132,10 @@ pub struct Snapshot {
     pub modem: Option<ModemStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wan: Option<WanStatus>,
+    /// A Starlink's own report (obstruction, outage, latency, alerts) — set only for that vendor,
+    /// for which `modem` is never set: a dish has no SIM and no signal in dBm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dish: Option<DishStatus>,
     /// Whether GNSS is switched on in the router's own settings (NCOS System → GPS).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gps_enabled: Option<bool>,
@@ -260,7 +271,7 @@ pub fn parse_probe(product: &Value, fw: Option<&Value>) -> Option<Probe> {
     if model.is_none() && firmware.is_none() {
         return None;
     }
-    Some(Probe { model, firmware, mac })
+    Some(Probe { model, firmware, mac, serial: None })
 }
 
 /// `/api/status/wan/devices` → the entries `(uid, entry)` that are objects.
@@ -428,6 +439,50 @@ pub fn modem_params(
     p
 }
 
+/// The `modem.measurement` params for a Starlink — the same event and the same vendor-blind names
+/// where they apply (`up`, `wan`, `model`, `fw`, `av`), plus the dish's own fields. No `sim`, no
+/// `rsrp`, no `dataMb`: a dish has none, and inventing zeros would read as a broken modem. Usage
+/// is not metered here either — a Starlink plan is not the cellular plan the KB deltas feed.
+pub fn dish_params(d: &DishStatus, wan: &WanStatus, probe: Option<&Probe>) -> Vec<(String, String)> {
+    let mut p: Vec<(String, String)> = vec![("up".into(), if wan.up { "1" } else { "0" }.into()), ("wan".into(), wan.wan.clone())];
+    let mut push = |k: &str, v: Option<String>| {
+        if let Some(v) = v {
+            p.push((k.to_string(), v));
+        }
+    };
+    let num = |v: Option<f64>| v.map(|n| if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n:.1}") });
+    push("model", probe.and_then(|p| p.model.clone()));
+    push("fw", probe.and_then(|p| p.firmware.clone()));
+    push("av", Some(format!("hub-{}", env!("CARGO_PKG_VERSION"))));
+    push("uptime", d.uptime_s.map(|s| s.to_string()));
+    push("outage", d.outage.clone());
+    push("obstruction", num(d.obstruction_pct));
+    push("obstructed", d.obstructed.map(|b| if b { "1" } else { "0" }.into()));
+    push("latency", num(d.latency_ms));
+    push("loss", num(d.loss_pct));
+    push("downMbps", num(d.down_mbps));
+    push("upMbps", num(d.up_mbps));
+    push("signal", num(d.signal_pct));
+    push("sats", d.gps_sats.map(|n| n.to_string()));
+    if !d.alerts.is_empty() {
+        push("alerts", Some(d.alerts.join(", ")));
+    }
+    p
+}
+
+/// What the poll loop reports for a snapshot, whichever vendor filled it: a modem's params, a
+/// dish's params, or nothing (a read that learned neither reports nothing — never an empty
+/// measurement that would look like a router with no modem).
+pub fn report_params(snap: &Snapshot, wan_kb_delta: Option<u64>) -> Option<Vec<(String, String)>> {
+    if let Some(m) = &snap.modem {
+        return Some(modem_params(m, snap.wan.as_ref(), snap.probe.as_ref(), wan_kb_delta));
+    }
+    if let (Some(d), Some(w)) = (&snap.dish, &snap.wan) {
+        return Some(dish_params(d, w, snap.probe.as_ref()));
+    }
+    None
+}
+
 /// PURE: the plan-burn delta between two lifetime counters, in KB. None when there is no earlier
 /// sample or the counter went BACKWARDS (a reboot or modem reset zeroes it — reporting the whole
 /// new total as a delta would charge the plan for bytes it never used).
@@ -591,16 +646,50 @@ pub struct GpsRead {
     pub fix: Option<GpsFix>,
 }
 
-/// One signed-in router of whichever vendor. hub_server and `poll` speak only to this, so adding a
+/// One read of a device's status side — what `poll` and `probe` fill the Snapshot from. A router
+/// fills `modem`/`wan`; a Starlink fills `dish`/`wan`.
+#[derive(Debug, Default)]
+pub struct StatusRead {
+    pub modem: Option<ModemStatus>,
+    pub wan: Option<WanStatus>,
+    pub dish: Option<DishStatus>,
+}
+
+/// One signed-in device of whichever vendor. hub_server and `poll` speak only to this, so adding a
 /// vendor is one module plus one arm per method — never a branch in the loop or the actions.
 pub enum Driver<'a> {
     Cradlepoint(Ncos<'a>),
     Peplink(Peplink<'a>),
+    Starlink(Starlink),
 }
 
 /// The vendors this hub manages — what `probe`/`add` accept, and what the app offers.
 pub fn vendor_supported(v: &str) -> bool {
-    matches!(v, "cradlepoint" | "peplink")
+    matches!(v, "cradlepoint" | "peplink" | "starlink")
+}
+
+/// PURE: does this vendor sign in at all? A dish answers its LAN with no credential, so `add`
+/// must not demand one and the app shows no sign-in fields.
+pub fn needs_password(vendor: &str) -> bool {
+    vendor != "starlink"
+}
+
+/// PURE: the port a config's `0` means for this vendor.
+pub fn default_port(vendor: &str) -> u16 {
+    if vendor == "starlink" { crate::starlink::DEFAULT_PORT } else { 443 }
+}
+
+/// PURE: what the hub can do for this vendor — the app gates its panel on this rather than on the
+/// vendor name (the driver-abstraction rule). `modem`/`dish` say which status block the snapshot
+/// carries; `gpsSwitch` that the device's own GNSS can be switched from here; `apn`, `reboot`,
+/// `read` are the actions; `signin` that a username/password exists to rotate.
+pub fn capabilities(vendor: &str) -> &'static [&'static str] {
+    match vendor {
+        "cradlepoint" => &["modem", "wan", "gps", "gpsSwitch", "apn", "reboot", "read", "signin"],
+        "peplink" => &["modem", "wan", "gps", "signin"],
+        "starlink" => &["dish", "wan", "gps", "reboot"],
+        _ => &[],
+    }
 }
 
 impl<'a> Driver<'a> {
@@ -608,6 +697,7 @@ impl<'a> Driver<'a> {
         match vendor {
             "cradlepoint" => Ok(Driver::Cradlepoint(Ncos::new(client, host, port, user, pass))),
             "peplink" => Ok(Driver::Peplink(Peplink::new(client, host, port, user, pass))),
+            "starlink" => Ok(Driver::Starlink(Starlink::new(host, port))),
             other => Err(format!("this hub cannot manage a '{other}' router yet")),
         }
     }
@@ -620,39 +710,58 @@ impl<'a> Driver<'a> {
         match self {
             Driver::Cradlepoint(_) => "cradlepoint",
             Driver::Peplink(_) => "peplink",
+            Driver::Starlink(_) => "starlink",
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Driver::Cradlepoint(_) => "Cradlepoint",
+            Driver::Peplink(_) => "Peplink",
+            Driver::Starlink(_) => "Starlink",
         }
     }
 
     /// PURE: the refusal for a `do_routers` action this vendor cannot carry out through the hub,
     /// or None when it can. Peplink's local API offers no APN, no reboot, and the `read`
-    /// diagnostic is an NCOS path reader.
+    /// diagnostic is an NCOS path reader; a Starlink has no APN, no sign-in to rotate, and no
+    /// path reader either.
     pub fn unsupported_action(&self, action: &str) -> Option<String> {
-        match (self, action) {
-            (Driver::Peplink(_), "apn") => Some(unsupported("reading or setting the APN")),
-            (Driver::Peplink(_), "reboot") => Some(unsupported("rebooting")),
-            (Driver::Peplink(_), "read") => Some(unsupported("the read diagnostic")),
-            _ => None,
-        }
+        let what = match (self, action) {
+            (Driver::Peplink(_), "apn") => "reading or setting the APN",
+            (Driver::Peplink(_), "reboot") => "rebooting",
+            (Driver::Peplink(_), "read") => "the read diagnostic",
+            (Driver::Starlink(_), "apn") => "an APN — a dish has none;",
+            (Driver::Starlink(_), "read") => "the read diagnostic",
+            (Driver::Starlink(_), "password") => "a sign-in — a dish answers its LAN with no password;",
+            _ => return None,
+        };
+        Some(unsupported(self.label(), what))
     }
 
-    /// Prove the sign-in and read identity.
+    /// Prove the sign-in (where there is one) and read identity.
     pub async fn probe(&self) -> Result<Probe, String> {
         match self {
             Driver::Cradlepoint(n) => n.probe().await,
             Driver::Peplink(p) => p.probe().await,
+            Driver::Starlink(s) => s.probe().await,
         }
     }
 
-    /// The modem and WAN state — one request on both vendors.
-    pub async fn status(&self) -> Result<(Option<ModemStatus>, Option<WanStatus>), String> {
+    /// The status side — one request on every vendor.
+    pub async fn status(&self) -> Result<StatusRead, String> {
         match self {
             Driver::Cradlepoint(n) => {
                 let d = n.wan_devices().await?;
-                Ok((parse_modem(&d), parse_wan(&d)))
+                Ok(StatusRead { modem: parse_modem(&d), wan: parse_wan(&d), dish: None })
             }
             Driver::Peplink(p) => {
                 let d = p.wan_connection().await?;
-                Ok((crate::peplink::parse_modem(&d), crate::peplink::parse_wan(&d)))
+                Ok(StatusRead { modem: crate::peplink::parse_modem(&d), wan: crate::peplink::parse_wan(&d), dish: None })
+            }
+            Driver::Starlink(s) => {
+                let d = crate::starlink::parse_status(&s.status().await?);
+                Ok(StatusRead { modem: None, wan: Some(crate::starlink::wan_of(&d)), dish: Some(d) })
             }
         }
     }
@@ -677,46 +786,67 @@ impl<'a> Driver<'a> {
                     Err(_) => GpsRead::default(),
                 }
             }
+            // The dish's switch lives in the Starlink app ("Allow access on local network"), and
+            // the only way to read it is to ask for the position: a refusal is `enabled: false`.
+            Driver::Starlink(s) => {
+                if !want_fix {
+                    return GpsRead::default();
+                }
+                match s.location().await {
+                    Ok(fix) => GpsRead { enabled: Some(true), fix },
+                    Err(_) => GpsRead { enabled: Some(false), fix: None },
+                }
+            }
         }
     }
 
-    /// Switch the router's own GNSS. A Peplink has no such switch in its local API — GPS is on the
+    /// Switch the device's own GNSS. A Peplink has no such switch in its local API — GPS is on the
     /// model or it is not — so for it this is the hub-side setting alone, and succeeds without a
     /// request (the owner's intent is recorded; the poll reports fixes when the router has them).
+    /// A Starlink's switch is in the Starlink app, not on the LAN: switching ON here asks the dish
+    /// once so a refusal names that switch (the owner can act on it); OFF is hub-side only.
     pub async fn set_gps_enabled(&self, on: bool) -> Result<(), String> {
         match self {
             Driver::Cradlepoint(n) => n.set_gps_enabled(on).await,
             Driver::Peplink(_) => Ok(()),
+            Driver::Starlink(s) => {
+                if on {
+                    s.location().await.map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
     pub async fn apn(&self) -> Result<ApnConfig, String> {
         match self {
             Driver::Cradlepoint(n) => n.apn().await.map(|(_, a)| a),
-            Driver::Peplink(_) => Err(unsupported("reading the APN")),
+            _ => Err(unsupported(self.label(), "reading the APN")),
         }
     }
 
     pub async fn set_apn(&self, cfg: &ApnConfig) -> Result<ApnConfig, String> {
         match self {
             Driver::Cradlepoint(n) => n.set_apn(cfg).await,
-            Driver::Peplink(_) => Err(unsupported("setting the APN")),
+            _ => Err(unsupported(self.label(), "setting the APN")),
         }
     }
 
     pub async fn reboot(&self) -> Result<(), String> {
         match self {
             Driver::Cradlepoint(n) => n.reboot().await,
-            Driver::Peplink(_) => Err(unsupported("rebooting")),
+            Driver::Peplink(_) => Err(unsupported(self.label(), "rebooting")),
+            Driver::Starlink(s) => s.reboot().await,
         }
     }
 }
 
-fn unsupported(what: &str) -> String {
-    format!("{what} is not supported on a Peplink through the hub yet — use the router's own admin pages")
+fn unsupported(vendor: &str, what: &str) -> String {
+    format!("{what} is not supported on a {vendor} through the hub — use the device's own app or admin pages")
 }
 
-/// One full read of a router — the poll loop's unit of work and the `refresh` action.
+/// One full read of a device — the poll loop's unit of work and the `refresh` action.
 pub async fn poll(client: &reqwest::Client, cfg: &RouterConfig, prev: Option<&Snapshot>) -> Snapshot {
     let now = crate::hub_server::now_ms();
     let mut snap = prev.cloned().unwrap_or_default();
@@ -728,15 +858,16 @@ pub async fn poll(client: &reqwest::Client, cfg: &RouterConfig, prev: Option<&Sn
             return snap;
         }
     };
-    let (modem, wan) = match drv.status().await {
+    let status = match drv.status().await {
         Ok(s) => s,
         Err(why) => {
             snap.error = Some(why);
             return snap;
         }
     };
-    snap.modem = modem;
-    snap.wan = wan;
+    snap.modem = status.modem;
+    snap.wan = status.wan;
+    snap.dish = status.dish;
     if snap.probe.is_none() {
         snap.probe = drv.probe().await.ok();
     }
@@ -867,7 +998,7 @@ mod tests {
     fn measurement_params_match_hub_lite_names() {
         let m = parse_modem(&bench_devices()).unwrap();
         let w = parse_wan(&bench_devices());
-        let p = Probe { model: Some("CBA850".into()), firmware: Some("7.0.50".into()), mac: None };
+        let p = Probe { model: Some("CBA850".into()), firmware: Some("7.0.50".into()), mac: None, serial: None };
         let params = modem_params(&m, w.as_ref(), Some(&p), Some(512));
         let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("up"), Some("1"));
@@ -890,13 +1021,14 @@ mod tests {
     }
 
     #[test]
-    fn vendors_dispatch_and_peplink_refuses_what_its_local_api_lacks() {
+    fn vendors_dispatch_and_each_refuses_what_its_api_lacks() {
         let client = lan_client();
-        assert!(vendor_supported("cradlepoint") && vendor_supported("peplink") && !vendor_supported("teltonika"));
+        assert!(vendor_supported("cradlepoint") && vendor_supported("peplink") && vendor_supported("starlink") && !vendor_supported("teltonika"));
         assert!(Driver::new(&client, "teltonika", "h", 0, "", "").is_err());
         let cp = Driver::new(&client, "cradlepoint", "h", 0, "", "").unwrap();
         let pl = Driver::new(&client, "peplink", "h", 0, "", "").unwrap();
-        assert_eq!((cp.vendor(), pl.vendor()), ("cradlepoint", "peplink"));
+        let sl = Driver::new(&client, "starlink", "", 0, "", "").unwrap();
+        assert_eq!((cp.vendor(), pl.vendor(), sl.vendor()), ("cradlepoint", "peplink", "starlink"));
         for a in ["apn", "reboot", "read"] {
             assert!(cp.unsupported_action(a).is_none(), "{a}");
             assert!(pl.unsupported_action(a).unwrap().contains("not supported on a Peplink"), "{a}");
@@ -904,6 +1036,52 @@ mod tests {
         for a in ["refresh", "gps", "password"] {
             assert!(pl.unsupported_action(a).is_none(), "{a}");
         }
+        for a in ["apn", "read", "password"] {
+            assert!(sl.unsupported_action(a).unwrap().contains("not supported on a Starlink"), "{a}");
+        }
+        for a in ["refresh", "gps", "reboot"] {
+            assert!(sl.unsupported_action(a).is_none(), "{a}");
+        }
+        // The pure vendor facts the app and hub_server gate on.
+        assert!(needs_password("cradlepoint") && needs_password("peplink") && !needs_password("starlink"));
+        assert_eq!((default_port("cradlepoint"), default_port("peplink"), default_port("starlink")), (443, 443, 9200));
+        assert!(capabilities("starlink").contains(&"dish") && !capabilities("starlink").contains(&"modem") && !capabilities("starlink").contains(&"signin"));
+        assert!(capabilities("cradlepoint").contains(&"apn") && !capabilities("peplink").contains(&"apn"));
+        assert!(capabilities("teltonika").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_starlink_polls_through_the_same_door_and_reports_dish_params() {
+        let port = crate::starlink::tests::mock_dish(false).await;
+        let cfg = RouterConfig { vendor: "starlink".into(), host: "127.0.0.1".into(), port, gps_enabled: true, ..Default::default() };
+        let snap = poll(&lan_client(), &cfg, None).await;
+        assert_eq!(snap.error, None);
+        assert!(snap.modem.is_none());
+        let d = snap.dish.as_ref().expect("dish");
+        assert_eq!(d.obstruction_pct, Some(0.2));
+        assert_eq!(snap.wan.as_ref().map(|w| (w.wan.as_str(), w.up)), Some(("starlink", true)));
+        assert_eq!(snap.probe.as_ref().and_then(|p| p.serial.as_deref()), Some("ut4088918f-05f0691c-19b97ab8"));
+        // Location refused by the dish's policy: reported as GPS off at the dish, not as a failed poll.
+        assert_eq!((snap.gps_enabled, snap.fix.is_none()), (Some(false), true));
+        let params = report_params(&snap, None).unwrap();
+        let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("up"), Some("1"));
+        assert_eq!(get("wan"), Some("starlink"));
+        assert_eq!(get("model"), Some("Starlink mini1_panda_proto1"));
+        assert_eq!(get("uptime"), Some("91907"));
+        assert_eq!(get("obstruction"), Some("0.2"));
+        assert_eq!(get("latency"), Some("29.3"));
+        assert_eq!(get("signal"), Some("100"));
+        assert_eq!(get("sats"), Some("25"));
+        assert_eq!(get("alerts"), Some("lower signal than predicted"));
+        assert_eq!((get("sim"), get("rsrp"), get("dataMb"), get("outage")), (None, None, None, None));
+        // The GPS switch: ON asks the dish and surfaces its refusal; OFF is hub-side only.
+        let client = lan_client();
+        let drv = Driver::for_router(&client, &cfg).unwrap();
+        assert!(drv.set_gps_enabled(true).await.unwrap_err().contains("Allow access on local network"));
+        assert!(drv.set_gps_enabled(false).await.is_ok());
+        // Nothing to report when a read learned neither a modem nor a dish.
+        assert!(report_params(&Snapshot::default(), None).is_none());
     }
 
     #[tokio::test]
