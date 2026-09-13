@@ -261,8 +261,18 @@ pub(crate) fn complete_lines(text: &str) -> &str {
 pub async fn poll_nmea(host: &str, port: u16, protocol: &str) -> Result<GpsFix, String> {
     let port = if port == 0 { NMEA_DEFAULT_PORT } else { port };
     if protocol.eq_ignore_ascii_case("udp") {
-        let sock = bind_udp_shared(port)
-            .map_err(|e| format!("cannot listen on UDP port {port} ({e})"))?;
+        // 🔴 EXCLUSIVE, deliberately — unlike discovery (owner, 2026-09-12). A UNICAST NMEA datagram is
+        // delivered to only ONE socket on a shared port, so a hub polling every minute on a shared bind
+        // could take sentences away from the navigation program (TimeZero, OpenCPN) on the same PC. The
+        // one-off discovery listen shares (8 s, owner-initiated); this standing poll never does. If
+        // another program holds the port, the poll says so instead of competing with it.
+        let sock = tokio::net::UdpSocket::bind(("0.0.0.0", port))
+            .await
+            .map_err(|e| if e.kind() == std::io::ErrorKind::AddrInUse {
+                format!("UDP port {port} is in use by another program on this computer (a chart plotter?) — the hub will not share a navigation feed's port; send the feed to a different port for the hub")
+            } else {
+                format!("cannot listen on UDP port {port} ({e})")
+            })?;
         poll_nmea_udp_on(sock).await
     } else {
         poll_nmea_tcp(host, port).await
@@ -275,9 +285,10 @@ pub async fn poll_nmea(host: &str, port: u16, protocol: &str) -> Result<GpsFix, 
 /// `SO_REUSEADDR` (+ `SO_REUSEPORT` on unix) lets both sockets hold it. Binding the wildcard address
 /// receives broadcast datagrams too, which is how most Wi-Fi NMEA gateways send.
 ///
-/// Caveat for the PR record: broadcast and multicast datagrams reach EVERY socket on the port, but a
-/// UNICAST datagram is delivered to only one of them, so while the hub listens it can take some of
-/// a unicast feed's sentences away from the other program. The listen windows are short (8 s).
+/// USED BY DISCOVERY ONLY. Broadcast and multicast datagrams reach EVERY socket on the port, but a
+/// UNICAST datagram is delivered to only one of them, so while the hub listens it can take some of a
+/// unicast feed's sentences away from the other program. That is acceptable for the owner-initiated
+/// 8 s discovery listen and NOT for the standing poll, which binds exclusively (see poll_nmea).
 /// Whether the other program's own bind allows sharing is its choice: on macOS/Linux it must have
 /// set SO_REUSEPORT too, else this bind still fails and the caller reports it.
 pub fn bind_udp_shared(port: u16) -> std::io::Result<tokio::net::UdpSocket> {
