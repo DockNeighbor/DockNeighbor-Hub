@@ -25,19 +25,35 @@ worker on a timer, so the vehicle reports without the app being onsite.
   cutoff is the only volume enforcement there is.
 - A **LAN management door** (`hub-lite-mgmt.sh`, `?action=`) for status, lockdown and an
   allowlisted command set.
-- The **`/api/hub/*` door** (`hub-lite-api.sh`) — `ping`, `status`, `linktap/state` — on port
-  **8722**, the daemon's own contract, so the app has one hub client (owner ruling 2026-08-31:
-  *"the hub-lite should move to 8722, keep one contract"*).
+- The **`/api/hub/*` door** (`hub-lite-api.sh`) on port **8722**, the daemon's own contract, so the
+  app has one hub client (owner ruling 2026-08-31: *"the hub-lite should move to 8722, keep one
+  contract"*). Since 0.15.0 it answers the daemon's routes: `ping`, `status`, `logs`, `config`,
+  `gps`, `token`, `clear`, `update`, `identity` + `bootstrap` (first run), `shelly`,
+  `linktap/state`, `linktap/valve` and `linktap/push`. Keyed routes take the router's `MGMT_KEY` as
+  `Authorization: Bearer`, through ONE function (`authorize`) so per-member role keys (owner
+  decision D3) change one place.
+- **LinkTap parity with the daemon** (0.15.0): the full `linktap.measurement` (battery, signal, RF,
+  fault flags, flow, the run's mode/duration/cap/remaining time and who started it), the
+  **washdown handover** ~20 s before expiry and the **resume** after it, wake-on-command, the
+  gateway offline/online watch, the gateway push route, `linktap.stop_failed`/`reopen_failed`, and
+  the **plan gate**: only a cloud-permitted plan (`LINKTAP_ALLOWED`, from the batch reply) may OPEN
+  a valve. Closing — flood, cutoff or manual — is never gated.
+- The **daily usage ledger** (washdown excluded).
+- A **bounded relay spool** (300 lines, oldest readings shed before alarms), drained whether or not
+  the relay tier is on, with a 30 s retry while a failed batch or an undelivered alarm waits.
+- **Update visibility**: the signed feed's newer version, as `updateAvailable` and `update=`.
 
 **Deliberately NOT here** (a full hub, or the app, does these)
-- The washdown→Normal **handover** — the daemon reprograms the valve ~20s before a washdown
-  expires so the water never stops. A hub-lite closes and reopens on its next tick instead, which
-  is a visible gap in flow rather than a seamless swap. *Slower, not a different shape.*
-- The daily usage ledger.
 - The relay socket — a persistent WebSocket from busybox ash is not worth the overlay.
-- Long-polling `/api/hub/linktap/state`: `wait` is accepted and ignored. Holding a request would
-  hold a uhttpd worker AND a shell process on a box with 416 KB of free overlay. **A hub-lite is
-  allowed to be slower; it is not allowed to be a different shape.**
+- Long-polling `/api/hub/linktap/state`: `wait` is accepted and ignored. uhttpd runs 3 CGIs at once
+  by default, and holding one per app would starve the webhook receiver, which is the flood
+  report's door. **A hub-lite is allowed to be slower; it is not allowed to be a different shape.**
+- Managed routers, sensor wiring, NMEA discovery and a local web page (daemon routes a hub-lite does
+  not advertise and does not answer).
+
+**Shipped comment-stripped.** `package/build-ipk.sh` strips whole-line comments and blank lines from
+the payload (`package/strip-comments.sh`); the source keeps them. `test.sh` runs the whole suite
+against the stripped copies too.
 
 Owner doctrine (2026-08-19): *"hub lite should do anything a hub can do as long as it is not
 CPU/memory restrictive."* When adding to this list, say which side of that line the change sits on.

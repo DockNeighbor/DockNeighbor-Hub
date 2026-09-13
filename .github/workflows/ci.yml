@@ -53,7 +53,7 @@ jobs:
         # RECEIVER — the script that turns a Shelly's flood report into a local valve close. The
         # blind spot the note above describes had claimed another one. hub-lite-api.sh is new in
         # the same commit and went straight in, rather than waiting to be noticed later.
-        run: shellcheck --severity=error --shell=sh hub-lite/brvg-hub-lite.sh hub-lite/hub-lite-mgmt.sh hub-lite/hub-lite-cgi.sh hub-lite/hub-lite-api.sh hub-lite/setup-usb-gps.sh hub-lite/test.sh hub-lite/package/build-ipk.sh hub-lite/package/build-feed.sh hub-lite/package/feed-setup.sh hub-lite/hub/install.sh daemon/linux/install.sh daemon/macos/postinstall
+        run: shellcheck --severity=error --shell=sh hub-lite/brvg-hub-lite.sh hub-lite/hub-lite-mgmt.sh hub-lite/hub-lite-cgi.sh hub-lite/hub-lite-api.sh hub-lite/setup-usb-gps.sh hub-lite/test.sh hub-lite/package/build-ipk.sh hub-lite/package/build-feed.sh hub-lite/package/feed-setup.sh hub-lite/package/strip-comments.sh hub-lite/hub/install.sh daemon/linux/install.sh daemon/macos/postinstall
       - name: Build hub-lite package
         run: sh hub-lite/package/build-ipk.sh
       # The feed index is the signed artifact: prove the index describes the package just built,

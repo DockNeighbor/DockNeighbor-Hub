@@ -5,8 +5,13 @@ set -u
 
 BRVG_HUB_LITE_TEST=1
 export BRVG_HUB_LITE_TEST
+# The scripts under test. Normally this directory; the comment-stripped PACKAGED copies when the
+# stripped run at the bottom of this file re-invokes it (BRVG_HUB_LITE_DIR), so the suite proves the
+# bytes that ship, not only the bytes in git.
+HL_DIR="${BRVG_HUB_LITE_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+HL_SRC="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
-. "$(dirname "$0")/brvg-hub-lite.sh"
+. "$HL_DIR/brvg-hub-lite.sh"
 
 fails=0
 check() {
@@ -535,11 +540,8 @@ GPS_LAST_SENT=$(date +%s); GPS_DEADBAND_M=0   # RBE disabled
 check "gps: deadband 0 disables RBE -> always send" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 0)"
 GPS_DEADBAND_M=50
 
-if [ "$fails" -gt 0 ]; then
-  echo "$fails test(s) FAILED"
-  exit 1
-fi
-echo "all hub-lite parser tests passed"
+# (The pass/fail summary used to sit HERE, part-way down the file — so every check below it could
+# fail and the script still exited 0. It is at the bottom now.)
 
 # --- LinkTap cycle semantics on hub-lite (parity port) -------------------------------------------
 # These fixtures MIRROR hub/test/cycle.test.ts case for case — the one-contract rule. A case added
@@ -549,7 +551,7 @@ echo "all hub-lite parser tests passed"
 out=$(printf '{"cmd":3,"dev_stat":[{"is_watering":1,"volume":0.63,"remain_duration":79940}]}' | lt_parse_status gal)
 check "lt parse: watering, gal→L conversion (0.63 gal = 2.385 L)" "1 2.385 79940 0.000" "$out"
 out=$(printf '{"is_watering":0,"volume":15886307.00}' | lt_parse_status gal)
-check "lt parse: the idle garbage latch reads as no volume" "0 0.000  0.000" "$out"
+check "lt parse: the idle garbage latch reads as no volume (absent remain is '-', never an empty field)" "0 0.000 - 0.000" "$out"
 out=$(printf '<html><body><!--#RET-->{"is_watering":"1","volume":2,"remain_duration":60}</body></html>' | lt_parse_status L)
 check "lt parse: HTML wrap + string flag + litre unit" "1 2.000 60 0.000" "$out"
 
@@ -725,50 +727,9 @@ rm -rf "$_SD2"
 # A hub-lite now answers the SAME paths as the Rust daemon, so the app has one hub client rather
 # than a second ?action= dialect. These pin the contract, because a shape mismatch here is not a
 # hub-lite bug — it is the app silently treating a live hub as absent.
-_api() {  # $1 = PATH_INFO, $2 = conf file (optional)
-  PATH_INFO="$1" BRVG_HUB_LITE_CONF="${2:-/nonexistent-conf}" BRVG_HUB_LITE_BIN=/nonexistent-bin \
-    BRVG_LT_STATE_DIR="$_apidir" sh "$(dirname "$0")/hub-lite-api.sh" 2>/dev/null
-}
-_apidir=$(mktemp -d 2>/dev/null || echo /tmp/brvg-api-test.$$)
-mkdir -p "$_apidir"
-_apiconf="$_apidir/conf"
-cat > "$_apiconf" <<'CONF'
-VEHICLE_ID=v_test
-VEHICLE_KEY=k
-LINKTAP_HOST=192.168.8.50
-LINKTAP_GW_ID=GW02
-LINKTAP_DEV_IDS=aaaabbbbccccdddd
-CONF
-
-out=$(_api /ping | grep -c '"ok":true')
-check "api: ping answers ok without a config or a key" "1" "$out"
-
-out=$(_api /ping | grep -c '"lite":true')
-check "api: ping ADMITS it is a lite hub — a client must not assume full capability" "1" "$out"
-
-out=$(_api /status "$_apiconf" | grep -c '"capabilities":\["linktap"\]')
-check "api: status advertises linktap when a gateway is configured" "1" "$out"
-
-out=$(_api /status | grep -c '"capabilities":\[\]')
-check "api: and advertises NOTHING when no gateway is configured" "1" "$out"
-
-out=$(_api /linktap/state "$_apiconf" | grep -c '"devId":"aaaabbbbccccdddd"')
-check "api: linktap/state names the configured valve" "1" "$out"
-
-# Field names must match the daemon's measurement, or mapHubValveReading needs a special case.
-out=$(_api /linktap/state "$_apiconf" | grep -c '"watering":"0"')
-check "api: a valve with no state file reads CLOSED, never absent" "1" "$out"
-
-printf 'state=watering volL=12.5 remain=600\n' > "$_apidir/brvg-lt-aaaabbbbccccdddd.state"
-out=$(_api /linktap/state "$_apiconf" | grep -c '"watering":"1"')
-check "api: a watering valve is reported watering" "1" "$out"
-out=$(_api /linktap/state "$_apiconf" | grep -c '"vol_l":"12.5"')
-check "api: volume uses the daemon's field name and litres" "1" "$out"
-
-out=$(_api /nope | grep -c '"error"')
-check "api: an unknown verb is a 404 shape, not a silent 200" "1" "$out"
-
-rm -rf "$_apidir"
+# (The 0.14.x api cases lived here, against a hand-made conf with `VEHICLE_ID=` and a state-file
+# format nothing writes — which is how four broken routes passed. They are rewritten against the REAL
+# conf keys and the REAL state below, in the 0.15.0 section.)
 
 # ── Washdown on hub-lite (owner: "washdown after") ──────────────────────────────────────────────
 #
@@ -842,7 +803,7 @@ rm -rf "$_lsdir"
 # customfeeds line is present exactly once however many times it runs, and an unrelated feed line
 # already in the file survives.
 _fsroot=$(mktemp -d)
-sed "s#/etc/opkg#$_fsroot/etc/opkg#g" hub-lite/package/feed-setup.sh > "$_fsroot/fs.sh"
+sed "s#/etc/opkg#$_fsroot/etc/opkg#g" "$HL_DIR/package/feed-setup.sh" > "$_fsroot/fs.sh"
 sh "$_fsroot/fs.sh" >/dev/null 2>&1
 sh "$_fsroot/fs.sh" >/dev/null 2>&1   # twice — the interesting case is idempotency
 printf 'src/gz openwrt_core https://downloads.openwrt.org/x\n' >> "$_fsroot/etc/opkg/customfeeds.conf"
@@ -850,9 +811,536 @@ sh "$_fsroot/fs.sh" >/dev/null 2>&1
 check "feed-setup: exactly one brvg feed line after three runs" "1" "$(grep -c 'brvg_hublite' "$_fsroot/etc/opkg/customfeeds.conf")"
 check "feed-setup: an unrelated feed line is preserved" "1" "$(grep -c 'openwrt_core' "$_fsroot/etc/opkg/customfeeds.conf")"
 check "feed-setup: the trust anchor is named by the committed key's fingerprint" "yes" "$([ -f "$_fsroot/etc/opkg/keys/b0ff2bec314c57d3" ] && echo yes || echo no)"
-check "feed-setup: the installed key is byte-identical to the committed public key" "same" "$(cmp -s "$_fsroot/etc/opkg/keys/b0ff2bec314c57d3" hub-lite/package/brvg-feed.pub && echo same || echo differ)"
+check "feed-setup: the installed key is byte-identical to the committed public key" "same" "$(cmp -s "$_fsroot/etc/opkg/keys/b0ff2bec314c57d3" "$HL_SRC/package/brvg-feed.pub" && echo same || echo differ)"
 # The fingerprint in feed-setup.sh MUST match the committed key — a mismatch means opkg looks up a
 # key file that verification will never find. Recompute it from the key blob the way usign does is
 # out of scope for a pure-shell test, so assert the two constants agree with each other instead.
-check "feed-setup: its fingerprint constant matches the key filename it writes" "b0ff2bec314c57d3" "$(sed -n 's/^KEY_FINGERPRINT="\([^"]*\)".*/\1/p' hub-lite/package/feed-setup.sh)"
+check "feed-setup: its fingerprint constant matches the key filename it writes" "b0ff2bec314c57d3" "$(sed -n 's/^KEY_FINGERPRINT="\([^"]*\)".*/\1/p' "$HL_DIR/package/feed-setup.sh")"
 rm -rf "$_fsroot"
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# 0.15.0 — daemon parity, slices 1-3 (hub-lite-parity.md). Everything below uses the REAL conf keys
+# and the REAL state the collector writes.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+T=$(mktemp -d)
+mkdir -p "$T/bin" "$T/lt"
+# A PATH shim for the CGIs, which run as separate processes and so cannot see a shell function. It
+# logs every call and answers like a GL-X750's gateway, the worker, logread and `ip` would.
+cat > "$T/bin/curl" <<'SHIM'
+#!/bin/sh
+body=""; prev=""; out=""; fmt=""
+for a in "$@"; do
+  case "$prev" in -d) body="$a" ;; -o) out="$a" ;; -w) fmt="$a" ;; esac
+  prev="$a"
+done
+eval "url=\${$#}"
+printf '%s %s\n' "$url" "$body" >> "$SHIM_LOG"
+rc=$(cat "$SHIM_RC" 2>/dev/null || echo 0)
+[ "$rc" = "0" ] || exit "$rc"
+case "$body" in
+  *'"cmd":16'*) reply='{"vol_unit":"L"}' ;;
+  *'"cmd":3'*) reply=$(cat "$SHIM_CMD3" 2>/dev/null) ;;
+  *) reply='{"ret":0}' ;;
+esac
+if [ -n "$out" ]; then printf '%s' "$reply" > "$out"; else printf '%s' "$reply"; fi
+[ -n "$fmt" ] && printf '200'
+exit 0
+SHIM
+cat > "$T/bin/logread" <<'SHIM'
+#!/bin/sh
+echo "Sat Sep 13 brvg-hub-lite: management key stored"
+echo "Sat Sep 13 brvg-hub-lite: send failed url=https://w/api/agent?vid=v&t=tok_SECRET_0123456789&x=1"
+echo "Sat Sep 13 brvg-hub-lite: key is 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+echo "Sat Sep 13 dnsmasq: unrelated"
+SHIM
+cat > "$T/bin/ip" <<'SHIM'
+#!/bin/sh
+echo "    inet 192.168.8.1/24 brd 192.168.8.255 scope global br-lan"
+SHIM
+chmod +x "$T/bin/curl" "$T/bin/logread" "$T/bin/ip"
+SHIM_LOG="$T/curl.log"; SHIM_RC="$T/curl.rc"; SHIM_CMD3="$T/cmd3"
+export SHIM_LOG SHIM_RC SHIM_CMD3
+
+KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+DEV=aaaabbbbccccdddd
+write_conf() {
+  cat > "$T/conf" <<CONF
+VID="v_test"
+DEVICE_ID="brv_net_test"
+DEVICE_TOKEN="tok_SECRET_0123456789"
+WORKER_URL="https://api.example.test"
+MGMT_KEY=$KEY
+LINKTAP_HOST=192.168.8.50
+LINKTAP_GW_ID=GW02
+LINKTAP_DEV_IDS=$DEV
+LINKTAP_ALLOWED=1
+LINKTAP_NORMAL_VOL_L=378
+CONF
+}
+write_conf
+# One CGI call. $1 method, $2 PATH_INFO, $3 body, then extra VAR=value environment.
+api() {
+  _m="$1"; _p="$2"; _b="$3"; shift 3
+  printf '%s' "$_b" | env PATH="$T/bin:$PATH" REQUEST_METHOD="$_m" PATH_INFO="$_p" CONTENT_LENGTH="${#_b}" \
+    HTTP_AUTHORIZATION="Bearer $KEY" BRVG_HUB_LITE_CONF="$T/conf" BRVG_HUB_LITE_BIN="$HL_DIR/brvg-hub-lite.sh" \
+    BRVG_LT_STATE_DIR="$T/lt" BRVG_RELAY_SPOOL="$T/spool" BRVG_HUB_LITE_STARTED="$T/started" \
+    BRVG_HUB_LITE_RELOAD="$T/reload" BRVG_HUB_LITE_UPDATE="$T/update" BRVG_REPORT_CGI="$HL_DIR/hub-lite-cgi.sh" \
+    REMOTE_ADDR="${REMOTE:-192.168.8.20}" "$@" sh "$HL_DIR/hub-lite-api.sh" 2>/dev/null
+}
+status_of() { printf '%s' "$1" | sed -n 's/^Status: \([0-9]*\).*/\1/p' | head -1; }
+body_of() { printf '%s' "$1" | tr -d '\r' | sed '1,/^$/d'; }
+date +%s > "$T/started"
+
+echo ""
+echo "# --- slice 1: the door is real and safe --------------------------------------------------"
+r=$(api GET /ping "")
+check "ping: version is read from HUB_LITE_VERSION (B3), not '0'" "1" "$(body_of "$r" | grep -c "\"version\":\"$HUB_LITE_VERSION\"")"
+check "ping: registered reads VID + the token (B2), not VEHICLE_ID" "1" "$(body_of "$r" | grep -c '"registered":true')"
+check "ping: still admits it is a lite hub" "1" "$(body_of "$r" | grep -c '"lite":true')"
+check "ping: a claimed router is never adoptable" "1" "$(body_of "$r" | grep -c '"adoptable":false')"
+r=$(api GET /status "")
+check "status: requires nothing but the router's MGMT_KEY (B1) and answers" "200" "$(status_of "$r")"
+check "status: vid comes from VID (B2)" "1" "$(body_of "$r" | grep -c '"vid":"v_test"')"
+check "status: hubId is DEVICE_ID" "1" "$(body_of "$r" | grep -c '"hubId":"brv_net_test"')"
+check "status: linktap claimed with the plan's permission and a gateway" "1" "$(body_of "$r" | grep -c '"capabilities":\["linktap"')"
+check "status: the daemon's always-present arrays are present" "1" "$(body_of "$r" | grep -c '"routers":\[\],"sensors":\[\]')"
+check "status: no secret ingest armed without SHELLY_SECRET" "1" "$(body_of "$r" | grep -c '"shellyIngestArmed":false')"
+check "status: a GL-MT300N-V2 with no modem port does not claim modem_at" "0" "$(body_of "$r" | grep -c 'modem_at')"
+check "status: anchor_local (D5) is claimed — the collector always runs it" "1" "$(body_of "$r" | grep -c '"anchor_local"')"
+r=$(api GET /status "" HTTP_AUTHORIZATION="Bearer wrong")
+check "status: a wrong key is 401" "401" "$(status_of "$r")"
+check "status: and the Status line carries its reason phrase (uhttpd ignores a bare code)" "1" "$(printf '%s' "$r" | grep -c '^Status: 401 Unauthorized')"
+sed '/^MGMT_KEY=/d' "$T/conf" > "$T/conf.nokey"
+r=$(api GET /linktap/state "" BRVG_HUB_LITE_CONF="$T/conf.nokey")
+check "state: 503 while the router has no MGMT_KEY yet" "503" "$(status_of "$r")"
+r=$(api GET /linktap/state "" HTTP_AUTHORIZATION="")
+check "state: 401 without a Bearer (valve state is not public on the LAN — B6)" "401" "$(status_of "$r")"
+r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"close\"}" HTTP_AUTHORIZATION="")
+check "valve: 401 without a Bearer" "401" "$(status_of "$r")"
+r=$(api POST /nope "")
+check "api: an unknown verb is a real 404" "404" "$(status_of "$r")"
+
+# 🔴 B5, THE WATER-SAFETY ONE. A washdown opened through the door must be seen by the poll as the SAME
+# run: never adopted, never volume-cut, however much water the meter reports.
+: > "$SHIM_LOG"
+r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\"mode\":\"washdown\",\"durationSecs\":7200,\"resumeNormal\":true}")
+check "B5: the washdown open is accepted" "200" "$(status_of "$r")"
+check "B5: the run record lands in the collector's state dir, not /tmp/<dev>" "yes" "$([ -f "$T/lt/$DEV" ] && echo yes || echo no)"
+check "B5: it records THIS run — washdown, time-only, ours, told to resume" "washdown 0 hub 1" \
+  "$(. "$T/lt/$DEV"; echo "$mode $cap $prov $resume")"
+check "B5: a washdown start carries NO volume_limit to the gateway" "0" "$(grep '"cmd":6' "$SHIM_LOG" | grep -c volume_limit)"
+check "B5: the door rang the poll loop" "yes" "$([ -f "$T/lt/wake" ] && echo yes || echo no)"
+(
+  LT_STATE_DIR="$T/lt"; BRVG_RELAY_SPOOL="$T/spool"; CONF="$T/conf"
+  # shellcheck disable=SC1090
+  . "$T/conf"
+  PATH="$T/bin:$PATH"
+  unset -f curl 2>/dev/null
+  printf '{"dev_stat":[{"dev_id":"%s","is_watering":1,"volume":500,"remain_duration":7000,"speed":20}]}' "$DEV" > "$SHIM_CMD3"
+  : > "$SHIM_LOG"
+  linktap_tick
+  echo "cut=$(grep -c '"cmd":7' "$SHIM_LOG")" > "$T/b5"
+  . "$T/lt/$DEV"
+  echo "run=$mode/$prov/$cap/$stop" >> "$T/b5"
+)
+check "B5: 500 L past a 378 L profile cap — the poll issues NO stop on the washdown" "cut=0" "$(sed -n 1p "$T/b5")"
+check "B5: and the run is still the washdown we opened, not an adopted Normal Run" "run=washdown/hub/0/" "$(sed -n 2p "$T/b5")"
+check "B5: the measurement names it as ours" "1" "$(grep -c "prov=hub" "$T/lt/meas.$DEV")"
+
+# The sibling hole: a Normal Run opened WITHOUT volumeCapL used to be tracked as cap 0 — no cutoff.
+rm -f "$T/lt/$DEV"
+r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\"durationSecs\":3600}")
+check "normal open without volumeCapL tracks the PROFILE cap, never 0" "normal 378 hub" "$(. "$T/lt/$DEV"; echo "$mode $cap $prov")"
+(
+  LT_STATE_DIR="$T/lt"; BRVG_RELAY_SPOOL="$T/spool"; CONF="$T/conf"; . "$T/conf"; PATH="$T/bin:$PATH"
+  printf '{"is_watering":1,"volume":400}' > "$SHIM_CMD3"; : > "$SHIM_LOG"
+  linktap_tick
+  echo "$(grep -c '"cmd":7' "$SHIM_LOG") $(. "$T/lt/$DEV"; echo "$stop")" > "$T/cut"
+)
+check "normal open: the software cutoff then fires at the cap" "1 volume_cap" "$(cat "$T/cut")"
+
+# The plan gate: opens need the cloud's permission; closes never do.
+sed 's/^LINKTAP_ALLOWED=1/LINKTAP_ALLOWED=0/' "$T/conf" > "$T/conf.noplan"
+r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\"durationSecs\":60,\"volumeCapL\":10}" BRVG_HUB_LITE_CONF="$T/conf.noplan")
+check "plan gate: an open on an unpermitted plan is 402" "402" "$(status_of "$r")"
+r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"close\"}" BRVG_HUB_LITE_CONF="$T/conf.noplan")
+check "plan gate: a CLOSE is never refused for the plan" "200" "$(status_of "$r")"
+check "close: marks the running cycle stop=manual, keeping its identity" "manual normal" "$(. "$T/lt/$DEV"; echo "$stop $mode")"
+r=$(api GET /status "" BRVG_HUB_LITE_CONF="$T/conf.noplan")
+check "plan gate: no linktap capability without permission" "0" "$(body_of "$r" | grep -c '"linktap"')"
+r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\"mode\":\"washdown\",\"durationSecs\":60,\"volumeCapL\":10}")
+check "valve: washdown + volumeCapL is refused, like the daemon" "422" "$(status_of "$r")"
+r=$(api POST /linktap/valve '{"devId":"ffffeeeeddddcccc","action":"close"}')
+check "valve: an unconfigured valve is 404" "404" "$(status_of "$r")"
+r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\"}")
+check "valve: an open with no duration is 422" "422" "$(status_of "$r")"
+
+r=$(api GET /linktap/state "")
+check "state: serves the collector's real measurement" "1" "$(body_of "$r" | grep -c "\"devId\":\"$DEV\",\"watering\":\"1\"")"
+check "state: rev is the collector's revision counter" "1" "$(body_of "$r" | grep -c '"rev":[1-9]')"
+rm -f "$T/lt/meas.$DEV"
+r=$(api GET /linktap/state "")
+check "state: a valve with no measurement yet is OMITTED, not invented as closed" "1" "$(body_of "$r" | grep -c '"valves":\[\]')"
+
+echo ""
+echo "# --- slice 1: spool bound, drain decoupled, classification --------------------------------"
+printf '1\ts1\ttemp.measurement\tv=1\n2\ts2\tflood.alarm\t\n3\ts1\ttemp.measurement\tv=2\n4\tb1\tbutton.push\t\n5\ts1\ttemp.measurement\tv=3\n' > "$T/sp"
+spool_cap "$T/sp" 3
+check "spool cap: bounded to the limit" "3" "$(wc -l < "$T/sp" | tr -d ' ')"
+check "spool cap: the OLDEST READINGS go first; alarms survive" "flood.alarm button.push temp.measurement" "$(cut -f3 "$T/sp" | tr '\n' ' ' | sed 's/ $//')"
+check "spool cap: the newest reading is the one kept" "v=3" "$(grep temp "$T/sp" | cut -f4)"
+printf '1\ta\tflood.alarm\t\n2\tb\tleak.alarm\t\n3\tc\tsmoke.alarm\t\n' > "$T/sp"
+spool_cap "$T/sp" 2
+check "spool cap: with nothing but alarms, the oldest alarm goes" "leak.alarm smoke.alarm" "$(cut -f3 "$T/sp" | tr '\n' ' ' | sed 's/ $//')"
+check "classify: 200 sent" "sent" "$(classify_http 200)"
+check "classify: 503 retry" "retry" "$(classify_http 503)"
+check "classify: 429 retry" "retry" "$(classify_http 429)"
+check "classify: no HTTP answer at all is a retry" "retry" "$(classify_http 000)"
+check "classify: 401 is a refusal resending cannot fix" "refused" "$(classify_http 401)"
+
+# drain_relay with a stubbed worker: a refusal drops, an outage keeps, a success applies the gate.
+(
+  RELAY_SPOOL="$T/rs"; RELAY_SEQ_FILE="$T/rs.seq"; RELAY_STATE_DIR="$T/rs.state"; RELAY_BOOT_FILE="$T/rs.boot"
+  CONF="$T/conf.drain"; cp "$T/conf" "$CONF"; LT_STATE_DIR="$T/lt"
+  VID=v; DEVICE_ID=d; DEVICE_TOKEN=tok; WORKER_URL=https://w; LINKTAP_ALLOWED=0
+  curl() { _o=""; _p=""; for _a in "$@"; do [ "$_p" = "-o" ] && _o="$_a"; _p="$_a"; done
+           printf '%s' "$DRAIN_BODY" > "$_o"; printf '%s' "$DRAIN_CODE"; }
+  printf '1\tlt_x\tlinktap.measurement\twatering=0\n' > "$RELAY_SPOOL"
+  DRAIN_CODE=503; DRAIN_BODY=''; drain_relay
+  echo "503:$([ -s "$RELAY_SPOOL.sending" ] && echo kept || echo gone)" > "$T/drain"
+  DRAIN_CODE=401; drain_relay
+  echo "401:$([ -s "$RELAY_SPOOL.sending" ] && echo kept || echo gone)" >> "$T/drain"
+  printf '1\tlt_x\tlinktap.measurement\twatering=0\n' > "$RELAY_SPOOL"
+  DRAIN_CODE=200; DRAIN_BODY='{"status":"ok","linktap":{"allowed":true,"profiles":{"aaaabbbbccccdddd":{"volumeCapL":50}}}}'
+  drain_relay
+  echo "200:$([ -s "$RELAY_SPOOL.sending" ] && echo kept || echo gone):$LINKTAP_ALLOWED:$(grep -c '^LINKTAP_ALLOWED="1"' "$CONF"):$(cat "$LT_STATE_DIR/profile.aaaabbbbccccdddd")" >> "$T/drain"
+)
+check "drain: an outage (503) keeps the batch for retry" "503:kept" "$(sed -n 1p "$T/drain")"
+check "drain: a refusal (401) drops it instead of wedging the spool forever" "401:gone" "$(sed -n 2p "$T/drain")"
+check "drain: success clears it, adopts the plan gate and persists it, and applies the REAL-shape profiles" \
+  "200:gone:1:1:P_VOL=50" "$(sed -n 3p "$T/drain")"
+
+REAL='{"status":"ok","stored":1,"linktap":{"allowed":true,"profiles":{"aaaabbbbccccdddd":{"durationSecs":7200,"volumeCapL":250.5,"autoRestart":true}}}}'
+check "profiles: the worker's REAL order (allowed first) parses — it never did" \
+  "aaaabbbbccccdddd 7200 250.5 1" "$(printf '%s' "$REAL" | lt_parse_profiles)"
+check "allowed: true" "1" "$(printf '%s' "$REAL" | lt_parse_allowed)"
+check "allowed: false" "0" "$(printf '{"linktap":{"allowed":false}}' | lt_parse_allowed)"
+check "allowed: a reply with no blob says NOTHING (never a revocation)" "" "$(printf '{"status":"ok"}' | lt_parse_allowed)"
+check "allowed: an 'allowed' nested in a profile is not the vehicle's permission" "0" \
+  "$(printf '{"linktap":{"profiles":{"a":{"allowed":true}},"allowed":false}}' | lt_parse_allowed)"
+check "allowed: profiles first, allowed after, still found" "1" \
+  "$(printf '{"linktap":{"profiles":{"a":{"volumeCapL":1}},"allowed":true}}' | lt_parse_allowed)"
+
+# The receiver's own ceiling and secret handling.
+cgi() {
+  env PATH="$T/bin:$PATH" QUERY_STRING="$1" BRVG_HUB_LITE_CONF="$2" BRVG_RELAY_SPOOL="$T/cgispool" \
+    BRVG_HUB_LITE_BIN="$HL_DIR/brvg-hub-lite.sh" sh "$HL_DIR/hub-lite-cgi.sh" >/dev/null 2>&1
+}
+: > "$T/cgispool"
+cp "$T/conf" "$T/conf.sec"; echo 'SHELLY_SECRET="s3cr3t"' >> "$T/conf.sec"
+cgi "device=s1&event=temp.measurement&k=s3cr3t&vid=v_test&tC=20" "$T/conf.sec"
+check "receiver: k and vid are routing, never spooled as telemetry" "tC=20" "$(cut -f4 "$T/cgispool")"
+: > "$T/cgispool"
+cgi "device=s1&event=temp.measurement&k=wrong&tC=20" "$T/conf.sec"
+check "receiver: a PRESENTED wrong secret is refused" "0" "$(wc -c < "$T/cgispool" | tr -d ' ')"
+cgi "device=s1&event=temp.measurement&tC=20" "$T/conf.sec"
+check "receiver: an un-keyed relay-contract report is still accepted (relay sensors carry no k)" "1" "$(wc -l < "$T/cgispool" | tr -d ' ')"
+i=0; while [ $i -lt 600 ]; do printf '1\ts\tx.measurement\t\n' >> "$T/cgispool"; i=$((i + 1)); done
+cgi "device=s1&event=temp.measurement&tC=21" "$T/conf.sec"
+check "receiver: past the hard ceiling a READING is dropped" "0" "$(grep -c 'tC=21' "$T/cgispool")"
+echo 7 > "$SHIM_RC"   # the direct send fails, so the alarm is spooled
+cgi "device=s1&event=flood.cable_unplugged" "$T/conf.sec"
+echo 0 > "$SHIM_RC"
+check "receiver: an alarm-class line is never dropped by the ceiling" "1" "$(grep -c 'cable_unplugged' "$T/cgispool")"
+
+echo ""
+echo "# --- slice 2: LinkTap parity (ported from daemon cycle.rs / linktap_runtime.rs tests) -------"
+flood_case "SENSOR FAULT: flood.cable_unplugged must NOT close" "flood.cable_unplugged" no
+flood_case "sensor fault: flood.cable_disconnected" "flood.cable_disconnected" no
+flood_case "sensor fault: flood.fault" "flood.fault" no
+flood_case "sensor fault: flood.error" "flood.error" no
+flood_case "sensor fault: flood.low_battery" "flood.low_battery" no
+flood_case "sensor fault: flood.mute" "flood.mute" no
+flood_case "sensor fault: flood.unmute" "flood.unmute" no
+flood_case "sensor fault: leak.sensor_offline" "leak.sensor_offline" no
+flood_case "real Shelly: flood" "flood" yes
+flood_case "real Shelly: Flood Detected" "Flood Detected" yes
+flood_case "real Shelly: shelly.flood" "shelly.flood" yes
+flood_case "real Shelly: water_leak" "water_leak" yes
+flood_case "real Shelly: smoke.alarm" "smoke.alarm" yes
+flood_case "gateway offline never closes the valve it cannot reach" "linktap.gateway.offline" no
+flood_case "gateway online never closes a valve" "linktap.gateway.online" no
+
+NOW=1787140800
+hand() { if lt_should_hand_over "$@"; then echo yes; else echo no; fi; }
+check "handover: 200 s left is not the time" "no" "$(hand washdown 1 hub "" 0 200 $NOW 300 $((NOW + 100)))"
+check "handover: inside the 20 s lead, valve still open" "yes" "$(hand washdown 1 hub "" 0 15 $NOW 300 $((NOW + 285)))"
+check "handover: exactly once" "no" "$(hand washdown 1 hub "" 0 8 $NOW 300 $((NOW + 292)) 20 | sed 's/.*/no/'; )"
+check "handover: already issued never re-issues" "no" "$(hand washdown 1 hub "" 1 8 $NOW 300 $((NOW + 292)))"
+check "handover: a washdown being STOPPED (flood) never hands over" "no" "$(hand washdown 1 hub flood_shutoff 0 15 $NOW 300 $((NOW + 285)))"
+check "handover: not asked to resume, not done" "no" "$(hand washdown 0 hub "" 0 15 $NOW 300 $((NOW + 285)))"
+check "handover: an ADOPTED run carries no intent of ours" "no" "$(hand washdown 1 adopted "" 0 15 $NOW 300 $((NOW + 285)))"
+check "handover: a Normal Run never hands over" "no" "$(hand normal 1 hub "" 0 15 $NOW 300 $((NOW + 285)))"
+check "handover: no remain from the gateway falls back to our own clock" "yes" "$(hand washdown 1 hub "" 0 - $NOW 300 $((NOW + 285)))"
+res() { if lt_should_resume "$@"; then echo yes; else echo no; fi; }
+check "resume: a washdown told to resume reopens on its timer" "yes" "$(res washdown timer 1)"
+for _r in flood_shutoff manual volume_cap unknown; do
+  check "resume: $_r must NOT reopen the valve" "no" "$(res washdown "$_r" 1)"
+done
+check "resume: not asked for, not done" "no" "$(res washdown timer 0)"
+check "resume: a Normal Run cannot carry the intent" "no" "$(res normal timer 1)"
+
+mkdir -p "$T/ph"
+(
+  LT_STATE_DIR="$T/ph"
+  echo "idle:$(lt_poll_hint $NOW)" > "$T/hint"
+  lt_write_state "$T/ph/$DEV" watering $NOW "" washdown 300 0 hub 1 0
+  echo "180:$(lt_poll_hint $((NOW + 100)))" >> "$T/hint"
+  echo "5:$(lt_poll_hint $((NOW + 299)))" >> "$T/hint"
+  lt_write_state "$T/ph/$DEV" watering $NOW "" washdown 300 0 hub 0 0
+  echo "plain:$(lt_poll_hint $((NOW + 100)))" >> "$T/hint"
+)
+check "poll hint: an idle valve asks for nothing" "idle:" "$(sed -n 1p "$T/hint")"
+check "poll hint: 300 s run, 100 s in, 20 s lead -> look again in 180 s" "180:180" "$(sed -n 2p "$T/hint")"
+check "poll hint: never busier than every 5 s" "5:5" "$(sed -n 3p "$T/hint")"
+check "poll hint: a washdown with no resume is not time-critical" "plain:" "$(sed -n 4p "$T/hint")"
+
+MIN=60
+check "gw watch: the first good poll is not news" "0 0 none 0" "$(lt_gw_watch_step "" 0 1 0)"
+check "gw watch: a flap inside the window says nothing" "0 0 none 0" "$(lt_gw_watch_step 0 0 0 20)"
+check "gw watch: a recovery nobody was told about stays silent" "40 0 none 0" "$(lt_gw_watch_step 0 0 1 40)"
+check "gw watch: 29 min silent is still a flap" "0 0 none 0" "$(lt_gw_watch_step 0 0 0 $((29 * MIN)))"
+check "gw watch: 31 min silent reports offline ONCE with the duration" "0 1 offline 31" "$(lt_gw_watch_step 0 0 0 $((31 * MIN)))"
+check "gw watch: and never again for the same episode" "0 1 none 0" "$(lt_gw_watch_step 0 1 0 $((45 * MIN)))"
+check "gw watch: a reported outage reports its recovery" "3600 0 online 60" "$(lt_gw_watch_step 0 1 1 $((60 * MIN)))"
+check "gw watch: booting next to a dead gateway starts the clock at the first poll" "1 0 none 0" "$(lt_gw_watch_step "" 0 0 1)"
+check "gw watch: the grace window is the owner's thirty minutes" "1800" "$LT_GATEWAY_GRACE_SECS"
+
+check "push: dev_stat shape" "$DEV" "$(printf '{"gw_id":"G","dev_stat":[{"dev_id":"%s","is_watering":1}]}' "$DEV" | lt_parse_push)"
+check "push: bare shape, long ids normalise to 16" "$DEV" "$(printf '{"dev_id":"%s0042","is_watering":0}' "$DEV" | lt_parse_push)"
+check "push: junk yields nothing" "" "$(printf 'not json' | lt_parse_push)"
+check "push: empty object yields nothing" "" "$(printf '{}' | lt_parse_push)"
+
+out=$(printf '{"is_watering":1,"vol":3.2,"speed":5.5,"battery":93,"signal":69,"is_rf_linked":true}' | lt_parse_fields)
+check "fields: battery, signal and rf — what the app read off the gateway" "&meters=0&battery=93&signal=69&rf=1" "$out"
+out=$(printf '{"is_watering":0,"volume":1,"is_broken":true,"is_leak":false,"is_clog":true,"is_cutoff":false}' | lt_parse_fields)
+check "fields: the fault flags the app raises alarms from" "&meters=1&broken=1&leak=0&clog=1&cutoff=0" "$out"
+out=$(printf '{"is_watering":0}' | lt_parse_fields)
+check "fields: a gateway that omits them does not get invented zeros" "&meters=0" "$out"
+check "fields: is_flm_plugin is authoritative" "&meters=1" "$(printf '{"is_flm_plugin":true}' | lt_parse_fields)"
+
+out=$(lt_measurement_params 1 3.2 "" 5.5 "" 1 normal 86400 1135.6 212 hub)
+check "measurement: a hub run reports ITS targets and who started it" \
+  "watering=1&vol_l=3.20&flow_lpm=5.50&mode=normal&dur_s=86400&cap_l=1135.60&remain_s=212&prov=hub" "$out"
+out=$(lt_measurement_params 1 1 "" 5.5 "" 1 washdown 7200 0 - hub)
+check "measurement: a washdown is bounded by TIME only (cap_l 0.00), no remain when unknown" \
+  "watering=1&vol_l=1.00&flow_lpm=5.50&mode=washdown&dur_s=7200&cap_l=0.00&prov=hub" "$out"
+out=$(lt_measurement_params 0 0 "" 0 "&day=2026-09-13&day_vol_l=4.00" 0 normal 1 1 - hub)
+check "measurement: an idle valve reports no targets and no flow at all" "watering=0&vol_l=0.00&day=2026-09-13&day_vol_l=4.00" "$out"
+check "measurement: watering with no flow reading reports 0.00, not silence" "watering=1&vol_l=2.00&flow_lpm=0.00" \
+  "$(lt_measurement_params 1 2 "" 0 "" 0 normal 1 1 - hub)"
+
+check "start body: a washdown omits volume_limit (daemon build_start)" '{"cmd":6,"gw_id":"GW02","dev_id":"aaaabbbbccccdddd","duration":7200}' \
+  "$(lt_start_body GW02 aaaabbbbccccdddd 7200 "")"
+
+# The machine end to end, through linktap_tick and a stubbed gateway.
+tick() {  # $1 cmd3 reply, $2 plan permission (default 1); one tick in a subshell against $T/lt2
+  # (The permission is an ARGUMENT, not `VAR=x tick`: a POSIX shell may keep an assignment that
+  # prefixes a function call, and it did — leaking into every later tick and the stripped re-run.)
+  printf '%s' "$1" > "$SHIM_CMD3"; : > "$SHIM_LOG"
+  ( LT_STATE_DIR="$T/lt2"; BRVG_RELAY_SPOOL="$T/spool2"; CONF="$T/conf"; . "$T/conf"; PATH="$T/bin:$PATH"
+    LINKTAP_ALLOWED="${2:-1}"; linktap_tick )
+}
+mkdir -p "$T/lt2"; : > "$T/spool2"
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 1 )) "" normal 86400 1135.6 hub 0 0
+tick '{"is_watering":1,"volume":3.2,"remain_duration":212,"speed":5.5}'
+check "tick: a run the hub opened is its own, not adopted" "hub 86400" "$(. "$T/lt2/$DEV"; echo "$prov $dur")"
+rm -f "$T/lt2/$DEV"
+tick '{"is_watering":1,"volume":3.2,"remain_duration":212}'
+check "tick: an already-running valve IS adopted, bounded by what the gateway says" "adopted 212 378" "$(. "$T/lt2/$DEV"; echo "$prov $dur $cap")"
+check "tick: and its measurement says adopted" "1" "$(grep -c 'prov=adopted&*' "$T/lt2/meas.$DEV")"
+
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 285 )) "" washdown 300 0 hub 1 0
+tick '{"is_watering":1,"volume":8,"remain_duration":15}'
+check "tick: the washdown HANDS OVER inside its lead window — cmd 6 on the open valve" "1" "$(grep -c '"cmd":6' "$SHIM_LOG")"
+check "tick: ...into the valve's PROFILE Normal Run" "1" "$(grep '"cmd":6' "$SHIM_LOG" | grep -c '"duration":86400')"
+check "tick: ...recorded as ours, so the next poll does not adopt it" "normal hub 0" "$(. "$T/lt2/$DEV"; echo "$mode $prov $handover")"
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 285 )) "" washdown 300 0 hub 1 0
+tick '{"is_watering":1,"volume":8,"remain_duration":15}' 0
+check "tick: the handover is an OPEN, so it is plan-gated" "0" "$(grep -c '"cmd":6' "$SHIM_LOG")"
+check "tick: and says so" "1" "$(grep -c 'linktap.reopen_failed.*plan_not_permitted' "$T/spool2")"
+
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 300 )) "" washdown 300 0 hub 1 1
+tick '{"is_watering":0,"volume":9}'
+check "tick: a washdown told to resume that ran out on its timer reopens" "1" "$(grep -c '"cmd":6' "$SHIM_LOG")"
+check "tick: the cycle end carries its mode, like the daemon's" "1" "$(grep -c 'linktap.cycle.change.*mode=washdown&reason=timer' "$T/spool2")"
+
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 60 )) "" washdown 300 0 hub 1 0
+( LT_STATE_DIR="$T/lt2"; BRVG_RELAY_SPOOL="$T/spool2"; . "$T/conf"; PATH="$T/bin:$PATH"; linktap_flood_close )
+check "flood close: marks the run it stops as flood_shutoff" "flood_shutoff" "$(. "$T/lt2/$DEV"; echo "$stop")"
+tick '{"is_watering":0,"volume":3}'
+check "tick: a washdown STOPPED BY A FLOOD never reopens the valve" "0" "$(grep -c '"cmd":6' "$SHIM_LOG")"
+check "tick: and its end classifies as flood_shutoff, not unknown" "1" "$(grep -c 'reason=flood_shutoff' "$T/spool2")"
+
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 60 )) "" normal 86400 10 hub 0 0
+printf '{"is_watering":1,"volume":20}' > "$SHIM_CMD3"; : > "$SHIM_LOG"
+( LT_STATE_DIR="$T/lt2"; BRVG_RELAY_SPOOL="$T/spool2"; . "$T/conf"; PATH="$T/bin:$PATH"; LINKTAP_ALLOWED=1
+  curl() { case "$*" in *'"cmd":7'*) return 7 ;; *) command curl "$@" ;; esac; }
+  linktap_tick )
+check "tick: a cutoff STOP that fails is un-marked, so the next poll cuts again (never left uncapped)" "" "$(. "$T/lt2/$DEV"; echo "$stop")"
+check "tick: and the failure is reported" "1" "$(grep -c 'linktap.stop_failed&*.*gateway_unreachable$' "$T/spool2")"
+rm -f "$T/lt2/$DEV"
+echo 7 > "$SHIM_RC"
+tick '{}'
+check "tick: an unreachable gateway starts the reachability clock" "yes" "$([ -s "$T/lt2/gw.watch" ] && echo yes || echo no)"
+echo 0 > "$SHIM_RC"
+( LT_STATE_DIR="$T/lt2"; BRVG_RELAY_SPOOL="$T/spool2"; . "$T/conf"; PATH="$T/bin:$PATH"; echo 22 > "$SHIM_RC"
+  printf '1 0\n' > "$T/lt2/gw.watch"; rm -f "$T/lt2/$DEV"; linktap_flood_close; echo 0 > "$SHIM_RC" )
+check "flood close: a close the gateway did not take spools stop_failed with cause=flood" "1" "$(grep -c 'linktap.stop_failed.*cause=flood' "$T/spool2")"
+
+# The gateway push route: rings the loop for a watched valve, from the gateway's address only.
+rm -f "$T/lt/wake"
+r=$(api POST /linktap/push "{\"dev_stat\":[{\"dev_id\":\"$DEV\",\"is_watering\":1}]}" REMOTE_ADDR=192.168.8.50 HTTP_AUTHORIZATION="")
+check "push route: answers ok with no key (the gateway has none)" "200" "$(status_of "$r")"
+check "push route: a push naming a watched valve rings the poll loop" "yes" "$([ -f "$T/lt/wake" ] && echo yes || echo no)"
+rm -f "$T/lt/wake"
+r=$(api POST /linktap/push "{\"dev_id\":\"$DEV\"}" REMOTE_ADDR=192.168.8.99 HTTP_AUTHORIZATION="")
+check "push route: from anywhere else it is the same 'ok' and does nothing" "200 no" "$(status_of "$r") $([ -f "$T/lt/wake" ] && echo yes || echo no)"
+
+echo ""
+echo "# --- slice 3: the rest of the daemon's hub contract ----------------------------------------"
+cp "$T/conf" "$T/conf.orig"
+r=$(api POST /config '{"name":"Aft router","heartbeatSecs":900,"shellySecret":"s3cr3t-Value_1","unknownKey":1}')
+check "config: accepted" "200" "$(status_of "$r")"
+check "config: answers with the new status" "1" "$(body_of "$r" | grep -c '"name":"Aft router","enabled":true,"heartbeatSecs":900')"
+check "config: shellySecret arms the ingest, and is never echoed" "1 0" "$(body_of "$r" | grep -c '"shellyIngestArmed":true') $(body_of "$r" | grep -c 's3cr3t')"
+check "config: unknown conf keys survive the rewrite" "1" "$(grep -c '^LINKTAP_NORMAL_VOL_L=378' "$T/conf")"
+check "config: the rewritten conf is chmod 600" "600" "$(ls -l "$T/conf" | cut -c2-10 | sed 's/rw-------/600/')"
+check "config: asks the collector to reload" "yes" "$([ -f "$T/reload" ] && echo yes || echo no)"
+r=$(api POST /config '{"heartbeatSecs":30}')
+check "config: heartbeat below the 60 s floor is 422" "422" "$(status_of "$r")"
+r=$(api POST /config '{"enabled":false}')
+check "config: 'enabled' is refused — it would stop the service serving this door" "422" "$(status_of "$r")"
+r=$(api POST /config '{"name":"x\"; reboot; \""}')
+check "config: a name that is not plain text is refused" "422" "$(status_of "$r")"
+r=$(api POST /config '{"name":"$(reboot)"}')
+. "$T/conf"
+check "config: shell metacharacters are STORED, never executed, when the conf is sourced" '$(reboot)' "$HUB_NAME"
+r=$(api POST /config '{"gps":{"kind":"cradlepoint","host":"192.168.0.1","username":"admin","password":"p@ss w0rd"}}')
+check "config: a daemon-shaped cradlepoint gps source" "200" "$(status_of "$r")"
+check "config: gps reported redacted, with 443 as the default port" "1 0" \
+  "$(body_of "$r" | grep -c '"gps":{"kind":"cradlepoint","host":"192.168.0.1","port":443,"protocol":"tcp","username":"admin","devId":"","enabled":true,"hasPassword":true}') $(body_of "$r" | grep -c 'p@ss')"
+r=$(api POST /gps '{"kind":"nmea","host":"192.168.8.30","port":10110,"protocol":"udp"}')
+check "gps: UDP NMEA is refused honestly" "422" "$(status_of "$r")"
+r=$(api POST /gps '{"kind":"nmea","host":"192.168.8.30","port":2000}')
+check "gps: TCP NMEA source set" "1" "$(body_of "$r" | grep -c '"gps":{"kind":"nmea","host":"192.168.8.30","port":2000')"
+r=$(api POST /token '{"token":"short"}')
+check "token: not a device token is 422" "422" "$(status_of "$r")"
+r=$(api POST /token '{"token":"tok_ROTATED_0123456789"}')
+check "token: rotated" "200 1" "$(status_of "$r") $(grep -c '^DEVICE_TOKEN="tok_ROTATED_0123456789"' "$T/conf")"
+r=$(api GET /logs "")
+check "logs: tails the hub-lite's own lines only" "3" "$(body_of "$r" | sed 's/\\n/\n/g' | grep -c 'brvg-hub-lite')"
+check "logs: the management key and any t= value are redacted" "0 0" \
+  "$(body_of "$r" | grep -c "$KEY") $(body_of "$r" | grep -c 'tok_SECRET')"
+r=$(PATH="$T/bin:/usr/bin:/bin" api POST /update "")
+check "update: 501 where there is no opkg (a Pi, a test box)" "501" "$(status_of "$r")"
+
+r=$(api GET /identity "" REMOTE_ADDR=127.0.0.1)
+check "identity: a claimed router refuses setup forever" "409" "$(status_of "$r")"
+cat > "$T/conf" <<'CONF'
+WORKER_URL="https://api.example.test"
+CONF
+r=$(api GET /identity "" REMOTE_ADDR=10.9.9.9 HTTP_AUTHORIZATION="")
+check "identity: off the router's /24 is refused" "403" "$(status_of "$r")"
+r=$(api GET /ping "" HTTP_AUTHORIZATION="")
+check "ping: an unclaimed router inside its window is adoptable" "1" "$(body_of "$r" | grep -c '"adoptable":true')"
+r=$(api GET /identity "" REMOTE_ADDR=192.168.8.20 HTTP_AUTHORIZATION="")
+check "identity: mints a brv_net_ id from the same /24, inside the window" "200 1" "$(status_of "$r") $(body_of "$r" | grep -c '"hubId":"brv_net_[0-9a-f]\{12\}"')"
+echo $(( $(date +%s) - 901 )) > "$T/started"
+r=$(api POST /bootstrap '{"vid":"v_new","token":"tok_NEW_0123456789ab"}' REMOTE_ADDR=192.168.8.20 HTTP_AUTHORIZATION="")
+check "bootstrap: the window closes 15 minutes after service start" "403" "$(status_of "$r")"
+r=$(api POST /bootstrap '{"vid":"v_new","name":"Router","token":"tok_NEW_0123456789ab","heartbeatSecs":600}' REMOTE_ADDR=127.0.0.1 HTTP_AUTHORIZATION="")
+check "bootstrap: loopback is not time-boxed (daemon adopt.rs)" "200" "$(status_of "$r")"
+check "bootstrap: writes the vehicle, the token and the id (double-quoted, as postinst greps)" "3" \
+  "$(grep -cE '^(VID="v_new"|DEVICE_TOKEN="tok_NEW_0123456789ab"|DEVICE_ID="brv_net_[0-9a-f]+")$' "$T/conf")"
+r=$(api POST /bootstrap '{"vid":"v_other","token":"tok_OTHER_0123456789"}' REMOTE_ADDR=127.0.0.1 HTTP_AUTHORIZATION="")
+check "bootstrap: and then the door is shut" "409" "$(status_of "$r")"
+date +%s > "$T/started"
+cp "$T/conf.orig" "$T/conf"
+
+r=$(api GET /shelly "" QUERY_STRING="device=s1&event=flood.alarm&k=x")
+check "shelly: DENY WHEN UNSET, like the daemon" "401" "$(status_of "$r")"
+echo 'SHELLY_SECRET="s3cr3t"' >> "$T/conf"
+r=$(api GET /shelly "" QUERY_STRING="device=s1&event=flood.alarm&k=nope" HTTP_AUTHORIZATION="")
+check "shelly: a wrong k is 401" "401" "$(status_of "$r")"
+r=$(api GET /shelly "" QUERY_STRING="device=s1&event=flood.alarm&k=s3cr3t&vid=v_else" HTTP_AUTHORIZATION="")
+check "shelly: another vehicle's report is 404" "404" "$(status_of "$r")"
+r=$(api GET /shelly "" QUERY_STRING="device=s1&event=flood.alarm&k=s3cr3t" REMOTE_ADDR=8.8.8.8 HTTP_AUTHORIZATION="")
+check "shelly: a caller off any plausible vessel network is 403" "403" "$(status_of "$r")"
+: > "$T/spool"; : > "$SHIM_LOG"; echo 7 > "$SHIM_RC"
+r=$(api GET /shelly "" QUERY_STRING="device=s1&event=flood.alarm&k=s3cr3t&vid=v_test&ts=1" HTTP_AUTHORIZATION="" REMOTE_ADDR=100.70.1.2)
+echo 0 > "$SHIM_RC"
+check "shelly: CGNAT (Starlink/cellular LANs) is plausible, and the report is accepted" "200" "$(status_of "$r")"
+check "shelly: the flood close ran through the receiver" "1" "$(grep -c '"cmd":7' "$SHIM_LOG")"
+check "shelly: the undelivered alarm is spooled WITHOUT the secret" "1 0" "$(grep -c 'flood.alarm' "$T/spool") $(grep -c 's3cr3t' "$T/spool")"
+
+echo ""
+echo "# --- slice 3: GPS, updates, conf, loop ----------------------------------------------------"
+check "nmea: a torn sentence that fails its checksum is rejected" "" \
+  "$(printf '$GPRMC,025433.00,A,4124.50743,N,08144.98471,W,0.958,,140826,,,A*61\n' | parse_nmea_rmc)"
+check "nmea: a sentence with no checksum is accepted (forwarders strip it)" "41.40846 -81.74975" \
+  "$(printf '$GPRMC,025433.00,A,4124.50743,N,08144.98471,W,0.958,,140826,,,A\n' | parse_nmea_rmc)"
+check "nmea: GGA is the fallback, with HDOP x 5 as accuracy" "48.11730 11.51667 4" \
+  "$(printf '$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n' | parse_nmea_rmc)"
+check "nmea: RMC is preferred over GGA" "41.40846 -81.74975" \
+  "$(printf '$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n$GPRMC,025433.00,A,4124.50743,N,08144.98471,W,0.958,,140826,,,A*60\r\n' | parse_nmea_rmc)"
+check "nmea: GGA with no fix quality is not a fix" "" \
+  "$(printf '$GPGGA,123519,4807.038,N,01131.000,E,0,08,0.9,545.4,M,46.9,M,,\r\n' | parse_nmea_rmc)"
+check "cradlepoint: unset port is HTTPS on 443 (daemon default)" "https://192.168.0.1" "$(cradlepoint_base 192.168.0.1 "")"
+check "cradlepoint: 443 is https" "https://h" "$(cradlepoint_base h 443)"
+check "cradlepoint: 80 is http" "http://h" "$(cradlepoint_base h 80)"
+check "cradlepoint: any other port is http with the port" "http://h:8080" "$(cradlepoint_base h 8080)"
+( CRADLEPOINT_HOST=192.168.0.1; CRADLEPOINT_PORT=""; curl() { echo "$*" > "$T/cp"; }; read_gps_cradlepoint )
+check "cradlepoint: the https poll passes -k (NCOS self-signs on the LAN)" "1" "$(grep -c -- '-k .*https://192.168.0.1/api/status/gps' "$T/cp")"
+vn() { if version_newer "$1" "$2"; then echo yes; else echo no; fi; }
+check "version: 0.15.1 > 0.15.0" "yes" "$(vn 0.15.1 0.15.0)"
+check "version: 0.15.0 is not newer than itself" "no" "$(vn 0.15.0 0.15.0)"
+check "version: numeric, not lexical (0.10.0 > 0.9.9)" "yes" "$(vn 0.10.0 0.9.9)"
+check "version: older is not newer" "no" "$(vn 0.14.9 0.15.0)"
+check "feed: the hub-lite's version out of a Packages index" "0.15.2" \
+  "$(printf 'Package: other\nVersion: 9.9\n\nPackage: brvg-hub-lite\nVersion: 0.15.2\nDepends: libc\n' | feed_version)"
+check "nap: sleeps until the soonest due work" "7" "$(LT_NAP_SLICE="" next_nap 100 107 200 "")"
+check "nap: sliced to 5 s while a valve could be woken" "5" "$(LT_NAP_SLICE=5 next_nap 100 200 300)"
+check "nap: overdue work loops straight round (1 s, never 0 or negative)" "1" "$(LT_NAP_SLICE="" next_nap 100 50)"
+( CONF="$T/si.conf"; printf 'KEEP=1\nGPS_INTERVAL=120\n' > "$CONF"; set_intervals 300 600 >/dev/null 2>&1 )
+check "set_intervals: writes \$CONF (not a hard-coded /etc path) and keeps other keys" "KEEP=1 GPS_INTERVAL=\"300\" MODEM_INTERVAL=\"600\"" "$(tr '\n' ' ' < "$T/si.conf" | sed 's/ $//')"
+
+[ -n "${KEEP_T:-}" ] && echo "T=$T" || rm -rf "$T"
+
+# --- the PACKAGED scripts are the tested scripts ----------------------------------------------
+# build-ipk.sh ships comment-stripped copies. Strip every one the same way, prove each still parses,
+# and run this whole suite against them. (setup-usb-gps is shipped unstripped: its --help prints
+# its own header.)
+if [ -z "${BRVG_STRIPPED_RUN:-}" ]; then
+  _sd=$(mktemp -d)
+  mkdir -p "$_sd/package"
+  _parse_ok=1
+  for _f in brvg-hub-lite.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh; do
+    sh "$HL_SRC/package/strip-comments.sh" "$HL_SRC/$_f" "$_sd/$_f"
+    sh -n "$_sd/$_f" || _parse_ok=0
+  done
+  cp "$HL_SRC/package/brvg-feed.pub" "$_sd/package/"
+  check "strip: every stripped packaged script still parses (sh -n)" "1" "$_parse_ok"
+  check "strip: the stripped hub-lite is well under the source" "yes" \
+    "$([ "$(wc -c < "$_sd/brvg-hub-lite.sh")" -lt $(( $(wc -c < "$HL_SRC/brvg-hub-lite.sh") * 2 / 3 )) ] && echo yes || echo no)"
+  if BRVG_HUB_LITE_DIR="$_sd" BRVG_STRIPPED_RUN=1 sh "$HL_SRC/test.sh" > "$_sd/run.log" 2>&1; then _sr=pass; else _sr=fail; fi
+  [ "$_sr" = "pass" ] || grep -A2 '^FAIL' "$_sd/run.log"
+  check "strip: the full suite passes against the STRIPPED copies ($(grep -c '^ok' "$_sd/run.log") checks)" "pass" "$_sr"
+  rm -rf "$_sd"
+fi
+
+if [ "$fails" -gt 0 ]; then
+  echo "$fails test(s) FAILED"
+  exit 1
+fi
+echo "all hub-lite tests passed"
