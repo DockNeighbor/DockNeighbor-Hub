@@ -38,6 +38,7 @@ UPDATE_FILE="${BRVG_HUB_LITE_UPDATE:-/tmp/brvg-hub-lite.update}"
 RELOAD_FILE="${BRVG_HUB_LITE_RELOAD:-/tmp/brvg-hub-lite.reload}"
 KEYS_FILE="${BRVG_MEMBER_KEYS:-/etc/brvg-hub-lite.keys}"
 KEYS_STALE="${BRVG_MEMBER_KEYS_STALE:-/tmp/brvg-hub-lite.keys-stale}"
+RT_FILE="${BRVG_HUB_LITE_ROUTERS:-/usr/libexec/brvg-hub-lite/routers}"
 export LT_STATE_DIR
 
 # The first-run window, from service start: the daemon's adopt::ADOPTION_WINDOW.
@@ -215,8 +216,9 @@ registered() { [ -n "${VID:-}" ] && [ -n "${DEVICE_TOKEN:-}${VEHICLE_KEY:-}" ]; 
 #     uci (and dropbear for the latter); modem_at needs the modem's AT port to exist — a GL-MT300N-V2
 #     has no modem and must not claim it; wan_usage needs /sys/class/net; usb_gps needs opkg, which
 #     brvg-setup-usb-gps installs the serial drivers with; anchor_local is the collector itself.
-#   * NOT claimed: routers, sensors, web_ui_toggle and gps_discover. They are daemon features (or D5
-#     names) a hub-lite does not implement yet.
+#   * `routers` (owner D2) only when routers.sh is installed AND passes its own self-test (rt_ok).
+#   * NOT claimed: sensors, web_ui_toggle and gps_discover. They are daemon features (or D5 names) a
+#     hub-lite does not implement yet.
 capabilities() {
   _c=""
   add_cap() { _c="${_c:+$_c,}\"$1\""; }
@@ -229,6 +231,8 @@ capabilities() {
   add_cap anchor_local
   [ -d "${BRVG_SYS_NET:-/sys/class/net}" ] && add_cap wan_usage
   command -v opkg >/dev/null 2>&1 && add_cap usb_gps
+  # shellcheck disable=SC1090
+  [ -r "$RT_FILE" ] && (. "$RT_FILE" && rt_ok) >/dev/null 2>&1 && add_cap routers
   [ "$_uci" = "1" ] && [ -x /etc/init.d/dropbear ] && add_cap local_admin
   printf '[%s]' "$_c"
 }
@@ -247,6 +251,10 @@ gps_json() {
   esac
 }
 
+# The managed routers, redacted (routers.sh rt_list_json); `[]` when there is no routers.sh.
+# shellcheck disable=SC1090
+routers_json() { _rj=$( (. "$RT_FILE" && rt_list_json) 2>/dev/null ); printf '%s' "${_rj:-[]}"; }
+
 # The daemon's StatusBody, field for field, with honest values for a router. `lite: true` is the
 # part the daemon does not send: a client must never assume a hub-lite is a full hub.
 status_json() {
@@ -262,9 +270,9 @@ status_json() {
   [ -n "$_upd" ] && _extra="$_extra,\"updateAvailable\":\"$_upd\""
   _hb=$(printf '%s' "${MODEM_INTERVAL:-600}" | tr -cd '0-9')
   _port=$(printf '%s' "${RECEIVER_PORT:-8722}" | tr -cd '0-9')
-  printf '{"lite":true,"hubId":"%s","vid":"%s","name":"%s","enabled":true,"heartbeatSecs":%s,"httpPort":%s,"registered":%s,"version":"%s","platform":"%s","uptimeSecs":%s,"keysSynced":%s,"capabilities":%s,"shellyIngestArmed":%s%s%s,"webUiEnabled":false,"routers":[],"sensors":[]}' \
+  printf '{"lite":true,"hubId":"%s","vid":"%s","name":"%s","enabled":true,"heartbeatSecs":%s,"httpPort":%s,"registered":%s,"version":"%s","platform":"%s","uptimeSecs":%s,"keysSynced":%s,"capabilities":%s,"shellyIngestArmed":%s%s%s,"webUiEnabled":false,"routers":%s,"sensors":[]}' \
     "$(esc "${DEVICE_ID:-}")" "$(esc "${VID:-}")" "$(esc "${HUB_NAME:-}")" "${_hb:-600}" "${_port:-8722}" "$_reg" \
-    "$(esc "$(hub_version)")" "$_plat" "$(service_uptime)" "$_keys" "$(capabilities)" "$_armed" "$_extra" "$(gps_json)"
+    "$(esc "$(hub_version)")" "$_plat" "$(service_uptime)" "$_keys" "$(capabilities)" "$_armed" "$_extra" "$(gps_json)" "$(routers_json)"
 }
 
 # Re-read after a write, so the answer describes the conf as it now is.
@@ -713,6 +721,30 @@ case "$method:$verb" in
     fi
     printf 'Status: %s\r\nContent-Type: text/plain\r\n\r\nok\r\n' "$(reason 200)"
     exit 0
+    ;;
+
+  # ---- routers (owner D2: this router manages a Cradlepoint or Peplink) --------------------------
+  # The daemon's `/api/hub/routers`, same bodies and answers (routers.sh rt_api). One body, one
+  # `action`. The key is checked BEFORE the body is read; the action then names the level —
+  # `refresh`/`read` are reads (control), everything that signs in with an admin credential or
+  # changes what is stored is configure. No routers.sh ⇒ the route does not exist, as on an old hub.
+  GET:/routers)
+    authorize monitor
+    load_lib
+    command -v rt_list_json >/dev/null 2>&1 || fail 404 "no such hub endpoint"
+    reply 200 "{\"routers\":$(rt_list_json)}"
+    ;;
+  POST:/routers)
+    authorize monitor
+    read_body
+    load_lib
+    command -v rt_api >/dev/null 2>&1 || fail 404 "no such hub endpoint"
+    rt_body "$BODY" || fail 422 "invalid JSON body"
+    case "$(printf '%s' "${BV_action:-}" | tr 'A-Z' 'a-z' | tr -d '[:space:]')" in
+      refresh|read) authorize control ;;
+      *) authorize configure ;;
+    esac
+    rt_api
     ;;
 
   *)
