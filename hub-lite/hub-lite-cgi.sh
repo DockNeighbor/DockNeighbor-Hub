@@ -26,17 +26,35 @@ SPOOL="${BRVG_RELAY_SPOOL:-/tmp/brvg-relay.spool}"
 printf 'Content-Type: text/plain\r\n\r\nok\r\n'
 
 Q="${QUERY_STRING:-}"
-device=""; event=""; rest=""
+device=""; event=""; rest=""; k=""; has_k=0
 IFS='&'
 for kv in $Q; do
   case "$kv" in
     device=*) device="${kv#device=}" ;;
     event=*)  event="${kv#event=}" ;;
+    # The vehicle's webhook secret and vid are ROUTING, never telemetry. Before 0.15 a sensor URL
+    # that carried `k=` had it spooled as a param and posted upstream in the batch body.
+    k=*) k="${kv#k=}"; has_k=1 ;;
+    vid=*) ;;
     '') ;;
     *) rest="${rest:+$rest&}$kv" ;;
   esac
 done
 unset IFS
+
+# A PRESENTED secret must be the right one. This receiver's own contract (the relay tier, sensor
+# URLs written without `k`) stays open to the LAN — refusing un-keyed reports here would silently
+# cut every relay-routed sensor off from the local flood shutoff. But a report that DOES carry a
+# `k` and gets it wrong is a misconfigured sensor or a guess, and is refused like the daemon refuses
+# it. The deny-when-unset route with the daemon's full rule is /api/hub/shelly (hub-lite-api.sh).
+if [ "$has_k" = "1" ] && [ -f "$CONF" ]; then
+  _want=$(sed -n "s/^[[:space:]]*SHELLY_SECRET=[\"']\{0,1\}\([^\"']*\)[\"']\{0,1\}[[:space:]]*$/\1/p" "$CONF" 2>/dev/null | tail -1)
+  # The secret alphabet (valid_secret) has no characters a sensor would percent-encode except + / =.
+  k=$(printf '%s' "$k" | sed 's/%2[Bb]/+/g; s/%2[Ff]/\//g; s/%3[Dd]/=/g')
+  if [ -n "$_want" ] && [ "$k" != "$_want" ]; then
+    exit 0
+  fi
+fi
 
 # Identity fields are constrained hard — they end up in storage keys and JSON. Values stay raw
 # urlencoded here; the drain's parser owns decoding + escaping.
@@ -51,7 +69,14 @@ case "$event" in
   *) urgent=1 ;;
 esac
 
+# A HARD CEILING, cheap enough to run on every webhook: the collector bounds the spool properly (oldest
+# readings first, spool_cap) on every loop, but a sensor storm between two loops must not be able to
+# fill RAM either. Past twice the collector's bound a READING is dropped here; an alarm never is.
+SPOOL_CEILING=$(( ${BRVG_RELAY_SPOOL_MAX:-300} * 2 ))
 spool_line() {
+  if [ "$urgent" = "0" ] && [ -s "$SPOOL" ] && [ "$(wc -l < "$SPOOL" | tr -cd '0-9')" -ge "$SPOOL_CEILING" ]; then
+    return 0
+  fi
   printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$device" "$event" "$rest" >> "$SPOOL"
 }
 

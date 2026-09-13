@@ -41,7 +41,9 @@ GPS_PORT=10110
 # For GPS_SOURCE=cradlepoint: the router's LAN address + admin credential (same names as the
 # TypeScript hub's env, so one enrollment config drives either tier).
 CRADLEPOINT_HOST=""
-CRADLEPOINT_PORT=80
+# 443 = HTTPS with the router's self-signed LAN certificate accepted (the daemon's default); any other
+# port is plain HTTP.
+CRADLEPOINT_PORT=443
 CRADLEPOINT_USER=admin
 CRADLEPOINT_PASSWORD=""
 
@@ -84,6 +86,15 @@ LINKTAP_POLL=120
 LINKTAP_NORMAL_SECS=86400
 LINKTAP_NORMAL_VOL_L=378
 LINKTAP_AUTO_RESTART=0
+# Written by the hub-lite itself from the cloud's reply — do not set by hand. 1 = the vehicle's plan
+# permits OPENING a valve (the daemon's linktap.allowed). Closing is never gated.
+LINKTAP_ALLOWED=0
+
+# --- Written by the app over /api/hub/config (do not set by hand) -------------------------------
+# The router's display name, and the vehicle's Shelly webhook secret that arms /api/hub/shelly
+# (deny when unset, like the daemon). /cgi-bin/report stays open to un-keyed relay sensors.
+HUB_NAME=""
+SHELLY_SECRET=""
 
 # --- Bandwidth saver mode -----------------------------------------------------------------------
 # When lockdown is armed to control metered-SIM spend (not merely to structure the LAN), set this

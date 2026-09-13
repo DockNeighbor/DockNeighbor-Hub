@@ -33,22 +33,46 @@ ARCH="all"                 # pure shell — architecture-independent
 
 mkdir -p "$WORK/data/usr/bin" "$WORK/data/usr/libexec/brvg-hub-lite" "$WORK/data/etc/init.d" "$WORK/data/www/brvg/cgi-bin" "$WORK/data/www/brvg/api" "$WORK/control" "$OUT"
 
-install -m 0755 "$SRC/brvg-hub-lite.sh" "$WORK/data/usr/bin/brvg-hub-lite"
+# 🔬 THE PAYLOAD IS COMMENT-STRIPPED; THE SOURCE IS NOT. Roughly half of these scripts is the
+# reasoning that stops the next person re-breaking them, which belongs in git and not on a router
+# with 416 KB of free overlay (GL-X750) — or a GL-MT300N-V2 with 16 MB of flash in total. Whole-line
+# comments and blank lines only; see strip-comments.sh for why nothing cleverer is attempted, and
+# test.sh for the gate (every stripped script passes `sh -n` and the full suite runs against them).
+#
+# setup-usb-gps is NOT stripped: its --help prints its own header comment.
+STRIP="$SRC/package/strip-comments.sh"
+ship() {  # $1 source, $2 destination, $3 mode
+  sh "$STRIP" "$1" "$2"
+  chmod "$3" "$2"
+}
+_src_bytes=0; _ship_bytes=0
+for _f in brvg-hub-lite.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh openwrt/etc/init.d/brvg-hub-lite; do
+  _src_bytes=$(( _src_bytes + $(wc -c < "$SRC/$_f") ))
+done
+
+ship "$SRC/brvg-hub-lite.sh" "$WORK/data/usr/bin/brvg-hub-lite" 0755
 # The signed-feed provisioner: writes the trust anchor and the customfeeds line self_update needs.
 # Shipped as a payload file (not just baked into postinst) so a re-run — or the app's over-SSH
 # installer, which embeds the same content — has one canonical script to call.
-install -m 0755 "$SRC/package/feed-setup.sh" "$WORK/data/usr/libexec/brvg-hub-lite/feed-setup"
-install -m 0755 "$SRC/openwrt/etc/init.d/brvg-hub-lite" "$WORK/data/etc/init.d/brvg-hub-lite"
+ship "$SRC/package/feed-setup.sh" "$WORK/data/usr/libexec/brvg-hub-lite/feed-setup" 0755
+ship "$SRC/openwrt/etc/init.d/brvg-hub-lite" "$WORK/data/etc/init.d/brvg-hub-lite" 0755
 # USB GPS → TCP NMEA setup. SHIPPED but not run at install: the dongle is normally plugged in later,
 # and it needs working internet for opkg. `brvg-setup-usb-gps` on the router does the whole job.
 install -m 0755 "$SRC/setup-usb-gps.sh" "$WORK/data/usr/bin/brvg-setup-usb-gps"
 # Relay tier: the CGI webhook receiver (inert until HUB_LITE_ENABLED=1 in the config).
-install -m 0755 "$SRC/hub-lite-cgi.sh" "$WORK/data/www/brvg/cgi-bin/report"
-install -m 0755 "$SRC/hub-lite-mgmt.sh" "$WORK/data/www/brvg/cgi-bin/mgmt"
+ship "$SRC/hub-lite-cgi.sh" "$WORK/data/www/brvg/cgi-bin/report" 0755
+ship "$SRC/hub-lite-mgmt.sh" "$WORK/data/www/brvg/cgi-bin/mgmt" 0755
 # The /api/hub/* door. Installed WITHOUT a .sh suffix and directly at api/hub, because uhttpd
 # resolves the longest existing file path and hands the rest over as PATH_INFO — so this one file
 # answers /api/hub/ping, /api/hub/status and /api/hub/linktap/state.
-install -m 0755 "$SRC/hub-lite-api.sh" "$WORK/data/www/brvg/api/hub"
+ship "$SRC/hub-lite-api.sh" "$WORK/data/www/brvg/api/hub" 0755
+
+for _f in usr/bin/brvg-hub-lite www/brvg/api/hub www/brvg/cgi-bin/report www/brvg/cgi-bin/mgmt usr/libexec/brvg-hub-lite/feed-setup etc/init.d/brvg-hub-lite; do
+  _ship_bytes=$(( _ship_bytes + $(wc -c < "$WORK/data/$_f") ))
+  # A stripped script that no longer parses must never be sealed into a package.
+  sh -n "$WORK/data/$_f" || { echo "stripped $_f does not parse" >&2; exit 1; }
+done
+echo "scripts: ${_src_bytes} B source -> ${_ship_bytes} B shipped (comments stripped)"
 
 # NOTE: no config file ships in the package. The config carries this device's token and is written
 # by the app at enrollment; packaging a placeholder would risk overwriting a live one on upgrade.
@@ -87,16 +111,12 @@ cat > "$WORK/control/postinst" <<'EOF'
 # hub-lite NOT RUNNING. It would have come back at the next reboot, which on a boat could be weeks
 # of silence, reported by nothing.
 #
-# The original reason for not starting is real and is preserved as the CONDITION rather than
-# dropped: on a FRESH install there is no config yet, and starting would loop on a fatal error
-# ("VID and DEVICE_ID are required"). So start only when this router already has a usable config —
-# which is exactly the upgrade case, and never the fresh-install one. The app still starts it after
-# writing the configuration on a first-time enrollment.
-if [ -f /etc/brvg-hub-lite.conf ] \
-   && grep -qE '^VID="[^"]+"' /etc/brvg-hub-lite.conf \
-   && grep -qE '^DEVICE_ID="[^"]+"' /etc/brvg-hub-lite.conf; then
-  /etc/init.d/brvg-hub-lite start 2>/dev/null || echo "BRVG_START_FAILED"
-fi
+# 0.15.0: STARTED ON A FRESH INSTALL TOO. The reason it used to wait for a config was real — with no
+# VID the collector exited on a fatal error and procd respawned it forever. The collector now WAITS
+# for a vehicle instead (main() in brvg-hub-lite.sh), and starting the service is what brings up the
+# uhttpd door whose /api/hub/identity + /api/hub/bootstrap let the app set the router up with no
+# SSH at all — inside the 15-minute window that this start opens.
+/etc/init.d/brvg-hub-lite start 2>/dev/null || echo "BRVG_START_FAILED"
 exit 0
 EOF
 chmod 0755 "$WORK/control/postinst"
@@ -169,4 +189,4 @@ for _a in "$IPK" "$WORK/data.tar.gz" "$WORK/control.tar.gz"; do
 done
 [ "$(wc -c < "$IPK" | tr -d ' ')" -gt 2000 ] || { echo "package suspiciously small" >&2; exit 1; }
 
-echo "built $IPK"
+echo "built $IPK ($(wc -c < "$IPK" | tr -d ' ') B)"

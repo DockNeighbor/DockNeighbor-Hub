@@ -8,6 +8,11 @@ START=95
 USE_PROCD=1
 
 start_service() {
+    # The service's start time: `uptimeSecs` on /api/hub/status, and the 15-minute first-run window
+    # /api/hub/bootstrap honours. Written on start and restart but NOT on a procd respawn, so a
+    # crash loop cannot hold the setup window open forever — only a deliberate restart reopens it,
+    # exactly the daemon's rule.
+    date +%s > /tmp/brvg-hub-lite.started 2>/dev/null
     procd_open_instance
     procd_set_param command /usr/bin/brvg-hub-lite
     procd_set_param respawn 3600 30 0   # retry forever, 30 s apart, reset counter hourly

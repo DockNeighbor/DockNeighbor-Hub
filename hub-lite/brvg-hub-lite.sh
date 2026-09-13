@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.14.9"
+HUB_LITE_VERSION="0.15.0"
 HUB_LITE_BACKUP="/etc/brvg-hub-lite.prev"
 
 # The LAST telemetry this hub-lite composed, as JSON, for the LAN management door to serve
@@ -44,6 +44,20 @@ HUB_LITE_STATE="${BRVG_HUB_LITE_STATE:-/tmp/brvg-hub-lite.state}"
 # that verb IS the follow-up. So the CGI touches this file instead, and the loop below consumes it.
 # One tick of latency, and honest — as against instant and false.
 HUB_LITE_FOLLOWUP="${BRVG_HUB_LITE_FOLLOWUP:-/tmp/brvg-hub-lite.followup}"
+
+# The same flag-file pattern, for a CONFIG change made by a CGI (/api/hub/config, /token, /clear,
+# /bootstrap). The collector sources its conf once at start, so a CGI that rewrote it must ask the
+# running loop to read it again, or the new heartbeat or GPS source would wait for a restart.
+HUB_LITE_RELOAD="${BRVG_HUB_LITE_RELOAD:-/tmp/brvg-hub-lite.reload}"
+
+# Epoch the service was last STARTED (written by init.d start_service, and by the collector when
+# absent). Two readers: `uptimeSecs` on /api/hub/status, and the first-run window /api/hub/bootstrap
+# honours. tmpfs, so a reboot or a service restart reopens the window, exactly like the daemon's.
+HUB_LITE_STARTED="${BRVG_HUB_LITE_STARTED:-/tmp/brvg-hub-lite.started}"
+
+# The newest version the signed feed offers, when it is newer than this one (update_check). Absent
+# means current or unknown. Visibility only; installing is still the argument-free self_update.
+HUB_LITE_UPDATE="${BRVG_HUB_LITE_UPDATE:-/tmp/brvg-hub-lite.update}"
 
 
 # --- Pure parsers (stdin → stdout; empty output = no data) -------------------------------------
@@ -90,16 +104,64 @@ parse_cpin() {
        /CME ERROR: 10|SIM not inserted/ { print "missing"; exit }'
 }
 
-# NMEA RMC sentence(s) → "lat lon" from the last valid fix (ddmm.mmmm → decimal degrees).
+# NMEA sentence(s) → "lat lon [acc]" from the freshest valid fix (ddmm.mmmm → decimal degrees).
+#
+# Mirrors the daemon's gps.rs parse_nmea, rule for rule: RMC is preferred (the LAST valid one), GGA
+# is the fallback and carries HDOP x 5 m as a rough accuracy, and any sentence that FAILS its
+# checksum is skipped. A sentence with no checksum at all is accepted, because forwarders strip it.
+#
+# ⚠️ THE CHECKSUM IS NOT PEDANTRY. This parser reads a TCP stream it joined mid-sentence and a USB
+# port it cut off after 4 KB, so a torn line is the normal case, not the exotic one. A torn RMC can
+# still carry `A` and a plausible-looking number, and on an armed anchor watch a position a
+# kilometre off is a false drag alarm.
+#
+# XOR is done by hand: mawk (ubuntu's awk, which CI runs) and POSIX awk have no bitwise operators.
 parse_nmea_rmc() {
-  awk -F, '/RMC/ && $3 == "A" {
-    v = $4 + 0; d = int(v / 100); lat = d + (v - d * 100) / 60; if ($5 == "S") lat = -lat
-    v = $6 + 0; d = int(v / 100); lon = d + (v - d * 100) / 60; if ($7 == "W") lon = -lon
-    if (lat == 0 && lon == 0) next
-    # %.5f (≈1 m), matching the modem path — awk default OFMT is %.6g, which drops the USB dongle
-    # to ~4 decimals (~11 m). Verified live on a u-blox 7 (bench 2026-08-13).
-    out = sprintf("%.5f %.5f", lat, lon)
-  } END { if (out != "") print out }'
+  awk '
+    BEGIN { for (i = 32; i < 127; i++) ord[sprintf("%c", i)] = i; HEX = "0123456789ABCDEF" }
+    function xor8(a, b,  r, bit, i) {
+      r = 0; bit = 1
+      for (i = 0; i < 8; i++) { if ((a % 2) != (b % 2)) r += bit; a = int(a / 2); b = int(b / 2); bit *= 2 }
+      return r
+    }
+    function sum_ok(line,  star, i, c, hx) {
+      star = 0
+      for (i = length(line); i > 1; i--) if (substr(line, i, 1) == "*") { star = i; break }
+      if (star == 0) return 1
+      c = 0
+      for (i = 2; i < star; i++) c = xor8(c, ord[substr(line, i, 1)] + 0)
+      hx = toupper(substr(line, star + 1, 2))
+      if (hx !~ /^[0-9A-F][0-9A-F]$/) return 0
+      return (index(HEX, substr(hx, 1, 1)) - 1) * 16 + index(HEX, substr(hx, 2, 1)) - 1 == c
+    }
+    function coord(raw, hemi,  v, d, m) {
+      if (raw == "" || hemi == "") return ""
+      v = raw + 0; d = int(v / 100); m = v - d * 100
+      if (m >= 60) return ""
+      v = d + m / 60
+      if (hemi == "S" || hemi == "W") v = -v
+      return v
+    }
+    {
+      line = $0; gsub(/[\r\n]/, "", line); sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+      if (substr(line, 1, 1) != "$" || !sum_ok(line)) next
+      body = line; sub(/\*.*$/, "", body)
+      n = split(body, f, ",")
+      tag = substr(f[1], length(f[1]) - 2)
+      if (tag == "RMC" && n >= 7 && f[3] == "A") {
+        la = coord(f[4], f[5]); lo = coord(f[6], f[7])
+        if (la == "" || lo == "" || (la == 0 && lo == 0)) next
+        # %.5f (≈1 m), matching the modem path: awk default OFMT is %.6g, which drops the USB dongle
+        # to ~4 decimals (~11 m). Verified live on a u-blox 7 (bench 2026-08-13).
+        rmc = sprintf("%.5f %.5f", la, lo)
+      } else if (tag == "GGA" && n >= 9 && (f[7] + 0) > 0) {
+        la = coord(f[3], f[4]); lo = coord(f[5], f[6])
+        if (la == "" || lo == "" || (la == 0 && lo == 0)) next
+        hd = f[9] + 0
+        gga = (hd > 0) ? sprintf("%.5f %.5f %.0f", la, lo, hd * 5) : sprintf("%.5f %.5f", la, lo)
+      }
+    }
+    END { if (rmc != "") print rmc; else if (gga != "") print gga }'
 }
 
 # NCOS /api/status/gps → "lat lon". Bench shape (CBA850 fw 7.0.50, captured 2026-08-17): DMS
@@ -209,6 +271,64 @@ build_batch_json() {
 }
 
 RELAY_SPOOL="${BRVG_RELAY_SPOOL:-/tmp/brvg-relay.spool}"
+
+# The most lines the spool (and, separately, a failed batch waiting in .sending) may hold. The
+# daemon's MAX_SHELLY_QUEUE, the same number for the same reason: sensors report on events and
+# wake-ups, so a few hundred lines covers hours of a busy boat, and a bound is what stops a week-long
+# outage filling a router's RAM (tmpfs) until the box falls over — the one outcome worse than
+# losing old readings.
+RELAY_SPOOL_MAX="${BRVG_RELAY_SPOOL_MAX:-300}"
+
+# PURE: is this spooled event an ALARM, kept longest when the spool must shed? The daemon's
+# shelly_is_alarm: the flood rule, plus anything the device itself calls an alarm, flood or leak.
+# Everything else that is not telemetry (a button press, an alarm clear) counts as well, because the
+# receiver sent it NOW rather than batching it, which is the same judgement made one step earlier.
+spool_is_alarm() {
+  _sa=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  case "$_sa" in
+    *alarm*|*flood*|*leak*) return 0 ;;
+    *.measurement|*.change) return 1 ;;
+  esac
+  return 0
+}
+
+# Bound a spool file to $2 lines (default RELAY_SPOOL_MAX), shedding the OLDEST READINGS first and
+# an alarm only when nothing but alarms is left — the daemon's enqueue_shelly rule. Two passes over
+# the same file in one awk: the first counts, the second decides. The rewrite goes through a temp
+# file and a mv, so a receiver appending concurrently loses at most the line that raced the mv —
+# and that line was a reading appended to a spool already over its bound.
+spool_cap() {
+  _sc_f="$1"; _sc_max="${2:-$RELAY_SPOOL_MAX}"
+  [ -s "$_sc_f" ] || return 0
+  _sc_n=$(wc -l < "$_sc_f" | tr -cd '0-9')
+  [ "${_sc_n:-0}" -gt "$_sc_max" ] || return 0
+  _sc_tmp="$_sc_f.cap.$$"
+  awk -F'	' -v max="$_sc_max" '
+    function alarm(ev,  e) {
+      e = tolower(ev)
+      if (e ~ /alarm|flood|leak/) return 1
+      if (e ~ /\.(measurement|change)$/) return 0
+      return 1
+    }
+    NR == FNR { n++; if (!alarm($3)) readings++; next }
+    FNR == 1 { drop = n - max; if (drop < 0) drop = 0; shed_r = (drop < readings) ? drop : readings; shed_a = drop - shed_r }
+    {
+      if (!alarm($3) && shed_r > 0) { shed_r--; next }
+      if (alarm($3) && shed_a > 0) { shed_a--; next }
+      print
+    }' "$_sc_f" "$_sc_f" > "$_sc_tmp" 2>/dev/null && mv "$_sc_tmp" "$_sc_f"
+  rm -f "$_sc_tmp" 2>/dev/null
+  log "relay: spool over ${_sc_max} lines - shed $(( _sc_n - _sc_max )) (oldest readings first)"
+}
+
+# Does the spool hold anything that must not wait for the next modem tick — a batch that already
+# failed once, or an alarm the receiver could not deliver directly? The main loop drains on the GPS
+# tick while this holds, which is the daemon's short shelly_retry_loop in shell-sized form.
+relay_needs_retry() {
+  [ -s "$RELAY_SPOOL.sending" ] && return 0
+  [ -s "$RELAY_SPOOL" ] || return 1
+  awk -F'	' '{ e = tolower($3); if (e ~ /alarm|flood|leak/ || e !~ /\.(measurement|change)$/) { f = 1; exit } } END { exit !f }' "$RELAY_SPOOL"
+}
 RELAY_SEQ_FILE="${BRVG_RELAY_SEQ:-/tmp/brvg-relay.seq}"
 RELAY_STATE_DIR="${BRVG_RELAY_STATE:-/tmp/brvg-relay-state}"
 RELAY_BOOT_FILE="${BRVG_RELAY_BOOT:-/tmp/brvg-relay.boot}"
@@ -246,7 +366,11 @@ drain_relay() {
   _sending="$RELAY_SPOOL.sending"
   [ -s "$RELAY_SPOOL" ] || [ -s "$_sending" ] || return 0
   # A previous failed drain left a .sending file — retry it first, oldest data wins.
+  # The batch endpoint authenticates with the per-device token; a legacy VEHICLE_KEY-only box has no
+  # way to send one, so its spool is bounded and left in place rather than posted and refused.
+  [ -n "${DEVICE_TOKEN:-}" ] || { spool_cap "$RELAY_SPOOL"; return 0; }
   if [ ! -s "$_sending" ]; then
+    spool_cap "$RELAY_SPOOL"
     mv "$RELAY_SPOOL" "$_sending" 2>/dev/null || return 0
   fi
   mkdir -p "$RELAY_STATE_DIR"
@@ -279,7 +403,22 @@ EOF_DEVS
   # Same command piggyback + ack as send_event: the batch reply carries pending verbs, and the
   # request that delivers acks is the next one out — whichever path (event or batch) goes first.
   [ -n "$PENDING_ACK" ] && _url="${_url}&ack=${PENDING_ACK}"
-  if _resp=$(curl -fsS --max-time 20 -X POST -H 'Content-Type: application/json' -d "$_body" "$_url" 2>/dev/null); then
+  # The status code is read rather than `-f`'s exit status, because a refusal and an outage need
+  # opposite handling (classify_http): retrying a 401 forever wedges the spool behind a batch the
+  # cloud will never accept, and dropping a 503 loses an alarm to a blip.
+  _resp_f="$_sending.resp"
+  _code=$(curl -sS --max-time 20 -o "$_resp_f" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d "$_body" "$_url" 2>/dev/null)
+  _resp=$(cat "$_resp_f" 2>/dev/null); rm -f "$_resp_f"
+  _verdict=$(classify_http "$_code")
+  if [ "$_verdict" = "refused" ]; then
+    # Dropped LOUDLY, like the daemon's drain_shelly. The sequence still advances: the cloud did
+    # not record this seq, so reusing it would be harmless, but a fresh one keeps the log honest.
+    echo "$_seq" > "$RELAY_SEQ_FILE"
+    rm -f "$_sending" "$_items_src"
+    log "relay: batch seq=$_seq REFUSED by the cloud (HTTP $_code) - dropped; resending cannot help"
+    return 0
+  fi
+  if [ "$_verdict" = "sent" ]; then
     PENDING_ACK=""
     echo "$_seq" > "$RELAY_SEQ_FILE"
     # Persist last-sent per device so the next delta knows what "unchanged" means.
@@ -295,9 +434,12 @@ EOF_DEVS2
     # Config-as-state rides the same reply (cloud-server #100) — apply after commands so a
     # profile edit and a verb in one reply behave like the TS hub: verb runs, state lands.
     printf '%s' "$_resp" | lt_parse_profiles | lt_apply_profiles
+    # The plan gate travels with the same blob (cloud-server #101): apply it on every reply.
+    lt_apply_allowed "$(printf '%s' "$_resp" | lt_parse_allowed)"
   else
     rm -f "$_items_src"
-    log "relay: batch seq=$_seq failed (will retry with the same seq)"
+    spool_cap "$_sending"
+    log "relay: batch seq=$_seq failed (HTTP ${_code:-000}; will retry with the same seq)"
   fi
 }
 
@@ -340,6 +482,55 @@ load_config() {
 }
 
 log() { echo "brvg-hub-lite: $*" >&2; }
+
+# PURE: one conf line for KEY and VALUE, in a form that is safe to SOURCE. The conf is sourced as root
+# by the collector, three CGIs and init.d, so a value that came off the LAN (a name, a GPS password)
+# must never be able to become code.
+#
+# Double quotes when the value is plain, because that is the shape every other writer uses AND the
+# shape the package's postinst greps for (`^VID="[^"]+"`): a VID written in single quotes would make
+# the next upgrade leave the collector stopped. Anything carrying a shell metacharacter is
+# single-quoted instead, with embedded single quotes closed, escaped and reopened.
+conf_line() {
+  case "$2" in
+    *[!A-Za-z0-9\ _.,:/@+=-]*) printf "%s='%s'\n" "$1" "$(printf '%s' "$2" | sed "s/'/'\\\\''/g")" ;;
+    *) printf '%s="%s"\n' "$1" "$2" ;;
+  esac
+}
+
+# Rewrite KEY=VALUE pairs in "$CONF", keeping every other line (unknown keys included) and the mode.
+# Args: KEY VALUE [KEY VALUE ...]. Atomic: written beside the conf and moved over it, so a power cut
+# mid-write leaves the old file, never half of the new one. Returns 1 when the conf cannot be
+# written (a read-only /etc), so a caller never reports a change that did not land.
+conf_set() {
+  [ $# -ge 2 ] || return 1
+  _cs_tmp="${CONF}.$$"
+  _cs_keys=""
+  _cs_i=1
+  for _cs_a in "$@"; do
+    [ $((_cs_i % 2)) -eq 1 ] && _cs_keys="${_cs_keys:+$_cs_keys|}$_cs_a"
+    _cs_i=$((_cs_i + 1))
+  done
+  { [ -f "$CONF" ] && grep -vE "^[[:space:]]*(${_cs_keys})=" "$CONF"; } > "$_cs_tmp" 2>/dev/null
+  while [ $# -ge 2 ]; do
+    conf_line "$1" "$2" >> "$_cs_tmp" || { rm -f "$_cs_tmp"; return 1; }
+    shift 2
+  done
+  chmod 600 "$_cs_tmp" 2>/dev/null
+  mv "$_cs_tmp" "$CONF" 2>/dev/null || { rm -f "$_cs_tmp"; return 1; }
+}
+
+# PURE: what one HTTP answer means for queued telemetry — the daemon's classify_forward, verbatim.
+# 2xx sent; 408, 429 and every 5xx are the path or the cloud being unwell, so keep it and retry; any
+# other status is a refusal of THIS payload (bad token, malformed), which resending cannot fix.
+# `000` is curl's "no HTTP answer at all" (DNS, no route, timeout) and is a retry.
+classify_http() {
+  case "$1" in
+    2[0-9][0-9]) echo sent ;;
+    408|429|5[0-9][0-9]|000|'') echo retry ;;
+    *) echo refused ;;
+  esac
+}
 
 # --- AT transport (GL.iNet path — root on-device, straight to the modem port) ------------------
 
@@ -400,10 +591,31 @@ read_gps_tcp() {
 
 # Cradlepoint NCOS local HTTP poll (the hub's CRADLEPOINT_HOST source, in shell): the router is
 # POLLED, never configured to send anywhere (owner ruling 2026-08-17).
+#
+# Scheme by PORT, exactly as the daemon's gps.rs cradlepoint_base: 443 is HTTPS, anything else is
+# HTTP, and an unset port means 443 (owner: "the default should be 443"). NCOS serves a SELF-SIGNED
+# certificate on the LAN, so `-k` is required there; the daemon's LAN client accepts invalid certs
+# for the same reason (routers.rs lan_client). This is a LAN poll of a box we were told the address
+# of, never a WAN call, so there is no CA to check the certificate against in the first place.
+cradlepoint_base() {
+  _cp_port="${2:-443}"
+  [ "$_cp_port" = "0" ] && _cp_port=443
+  _cp_scheme=http
+  [ "$_cp_port" = "443" ] && _cp_scheme=https
+  case "$_cp_port" in
+    80|443) printf '%s://%s' "$_cp_scheme" "$1" ;;
+    *)      printf '%s://%s:%s' "$_cp_scheme" "$1" "$_cp_port" ;;
+  esac
+}
+
 read_gps_cradlepoint() {
   [ -n "$CRADLEPOINT_HOST" ] || return 1
-  curl -fsS --max-time 10 -u "${CRADLEPOINT_USER:-admin}:${CRADLEPOINT_PASSWORD:-}" \
-    "http://${CRADLEPOINT_HOST}:${CRADLEPOINT_PORT:-80}/api/status/gps" 2>/dev/null | parse_cradlepoint_gps
+  _cp_url="$(cradlepoint_base "$CRADLEPOINT_HOST" "${CRADLEPOINT_PORT:-}")/api/status/gps"
+  _cp_k=""
+  case "$_cp_url" in https://*) _cp_k="-k" ;; esac
+  # shellcheck disable=SC2086
+  curl -fsS $_cp_k --max-time 10 -u "${CRADLEPOINT_USER:-admin}:${CRADLEPOINT_PASSWORD:-}" \
+    "$_cp_url" 2>/dev/null | parse_cradlepoint_gps
 }
 
 collect_gps() {
@@ -657,6 +869,15 @@ send_event() {
   [ -n "$_cmds" ] && run_commands "$_cmds"
   _anch=$(printf '%s' "$_resp" | parse_anchor)
   [ -n "$_anch" ] && apply_anchor $_anch
+  # LinkTap config-as-state, when this reply carries it. Today the worker attaches the blob to
+  # /api/agent replies for hub_ devices only and to EVERY batch reply, so on a router it normally
+  # arrives through drain_relay; reading it here too costs a substring test and means a cloud that
+  # starts sending it on this path needs no hub-lite release to be heard.
+  case "$_resp" in
+    *'"linktap"'*)
+      printf '%s' "$_resp" | lt_parse_profiles | lt_apply_profiles
+      lt_apply_allowed "$(printf '%s' "$_resp" | lt_parse_allowed)" ;;
+  esac
   return 0
 }
 
@@ -669,13 +890,9 @@ set_intervals() {
   MODEM_INTERVAL="$2"
   [ "$GPS_INTERVAL" -lt 30 ] && GPS_INTERVAL=30
   [ "$MODEM_INTERVAL" -lt 60 ] && MODEM_INTERVAL=60
-  if [ -f /etc/brvg-hub-lite.conf ]; then
-    _tmp="/etc/brvg-hub-lite.conf.$$"
-    grep -vE '^[[:space:]]*(GPS_INTERVAL|MODEM_INTERVAL)=' /etc/brvg-hub-lite.conf > "$_tmp" 2>/dev/null || true
-    printf 'GPS_INTERVAL=%s\nMODEM_INTERVAL=%s\n' "$GPS_INTERVAL" "$MODEM_INTERVAL" >> "$_tmp"
-    chmod 600 "$_tmp" 2>/dev/null
-    mv "$_tmp" /etc/brvg-hub-lite.conf
-  fi
+  # "$CONF", not a hard-coded /etc path: the hard-coded one ignored BRVG_HUB_LITE_CONF, so a test (or
+  # a Pi install with its conf elsewhere) silently wrote the real router file or nothing at all.
+  [ -f "$CONF" ] && conf_set GPS_INTERVAL "$GPS_INTERVAL" MODEM_INTERVAL "$MODEM_INTERVAL"
   FOLLOWUP_REPORT=1
 }
 
@@ -1206,6 +1423,9 @@ push_modem() {
   # are unmanageable without the version: you cannot decide who to update next if you cannot see
   # what is deployed.
   _p="$_p&av=$HUB_LITE_VERSION$(collect_wan_usage)"
+  # The daemon's heartbeat `update`: the newer feed version, when there is one (update_check).
+  _upd=$(tr -cd '0-9.' < "$HUB_LITE_UPDATE" 2>/dev/null)
+  [ -n "$_upd" ] && _p="$_p&update=$_upd"
   # State BEFORE the send: what this router knows about itself is true whether or not the WAN is
   # up, and the LAN door is exactly the door that still works when the cloud send fails.
   write_state "modem.measurement" "$_p"
@@ -1224,11 +1444,19 @@ push_modem() {
 # The worker's events.ts flood-shutoff line, ported verbatim: /flood|leak|alarm/i, minus clears
 # (_off / .off), minus telemetry (.measurement / .change). Keep the three in the same order so a
 # diff against events.ts stays readable.
+#
+# ⚠️ PLUS THE DAEMON'S SENSOR-FAULT WORDS (linktap_runtime.rs SENSOR_FAULT_WORDS), in the same order.
+# The substring rule alone closes the valve on `flood.cable_unplugged` — the real Shelly Flood G4
+# event for a probe cable coming loose — because the string contains "flood". A loose cable would
+# shut a vessel's water off. A fault is a fault even when its component is the flood sensor.
 is_flood_shutoff() {
   _ev=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
   case "$_ev" in
     *.measurement|*.change) return 1 ;;
     *_off|*.off) return 1 ;;
+  esac
+  case "$_ev" in
+    *unplugged*|*disconnected*|*cable*|*fault*|*error*|*low_battery*|*battery_low*|*mute*|*unmute*|*offline*) return 1 ;;
   esac
   case "$_ev" in
     *flood*|*leak*|*alarm*) return 0 ;;
@@ -1241,26 +1469,104 @@ linktap_stop_body() {
   printf '{"cmd":7,"gw_id":"%s","dev_id":"%s"}' "$1" "$2"
 }
 
+# Where every LinkTap fact on this router lives (tmpfs). Per valve: `<dev>` (the running cycle),
+# `profile.<dev>`, `ledger.<dev>` and `meas.<dev>` (the last measurement, which /api/hub/linktap/state
+# serves); gateway-wide: `unit`, `gw.watch`, `rev`, `wake`. Declared HERE, above the flood close,
+# because the close now marks the run it stops and so needs the path too.
+#
+# 🔴 ONE PATH FOR EVERY WRITER. The /api/hub door used to write its run records to `/tmp/<dev>`
+# while this loop read `/tmp/brvg-linktap/<dev>`, so a washdown opened through the door was met
+# by the next poll as an unknown running valve and ADOPTED as a Normal Run on the profile cap — the
+# washdown volume-cut the door's own comment said it prevented. Only a second bug (the door's key
+# check read a variable nothing set) kept that from ever happening.
+LT_STATE_DIR="${LT_STATE_DIR:-/tmp/brvg-linktap}"
+
+# PURE: the canonical 16-character valve id, the TS client's normalizeDevId and the daemon's.
+lt_norm_id() { printf '%s' "$1" | tr -cd 'A-Za-z0-9' | cut -c1-16; }
+
+# Is a gateway configured at all? Every LinkTap path is a strict no-op without all three.
+lt_configured() { [ -n "${LINKTAP_HOST:-}" ] && [ -n "${LINKTAP_GW_ID:-}" ] && [ -n "${LINKTAP_DEV_IDS:-}" ]; }
+
+# Is $1 (already normalised) one of the configured valves? A hub is not a general-purpose proxy onto
+# the vessel's RF network.
+lt_is_watched() {
+  for _iw in $(printf '%s' "${LINKTAP_DEV_IDS:-}" | tr ',' ' '); do
+    [ "$(lt_norm_id "$_iw")" = "$1" ] && return 0
+  done
+  return 1
+}
+
+# POST one command body to the gateway; the reply on stdout. $2 = timeout seconds (default 10).
+lt_post() {
+  curl -fsS --max-time "${2:-10}" -X POST -H 'Content-Type: application/json' -d "$1" \
+    "http://${LINKTAP_HOST}/api.shtml" 2>/dev/null
+}
+
+# Append one line to the relay spool. BRVG_RELAY_SPOOL is read at CALL time, because the receiver
+# CGI and the tests set it per call.
+lt_spool() {
+  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "$3" >> "${BRVG_RELAY_SPOOL:-$RELAY_SPOOL}"
+}
+
+# Ring the poll loop (the daemon's linktap_wake): a valve command or a gateway push asks for a read
+# NOW, so what the gateway did reaches the cloud within seconds rather than on the next poll.
+# Only where the state dir already exists — the loop creates it on its first poll, and a flood
+# close on a box that has never polled has nothing to read back.
+lt_wake() { [ -d "$LT_STATE_DIR" ] && : > "$LT_STATE_DIR/wake"; return 0; }
+
+# Record THIS run's facts atomically. $1 file, then: state started stop mode dur cap prov resume
+# handover. Temp-and-move, so the poll (a separate process from the door) never reads half a record.
+lt_write_state() {
+  _wsf="$1.$$"
+  printf 'state=%s\nstarted=%s\nstop=%s\nmode=%s\ndur=%s\ncap=%s\nprov=%s\nresume=%s\nhandover=%s\n' \
+    "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:-0}" "${10:-0}" > "$_wsf" 2>/dev/null && mv "$_wsf" "$1" 2>/dev/null
+  rm -f "$_wsf" 2>/dev/null
+  return 0
+}
+
+# Mark a stop WE issued on a running cycle, keeping everything else about it — the daemon's
+# note_stop. Without it a flood close or a manual close classifies as `unknown` when the valve
+# shuts, and the cycle's end tells the owner nothing about why. No file means no running cycle:
+# nothing to mark, exactly like note_stop on an idle track.
+lt_mark_stop() {
+  [ -f "$1" ] || return 0
+  lt_load_state "$1" 0 0
+  [ "$_state" = "watering" ] || return 0
+  lt_write_state "$1" watering "$_started" "$2" "$_mode" "$_dur_eff" "$_cap_eff" "$_prov" "$_resume" "$_handover"
+}
+
 # Close every valve in $LINKTAP_DEV_IDS via http://$LINKTAP_HOST/api.shtml. No-op when LinkTap is
 # not configured, so every existing install is untouched. Each attempt spools a
 # linktap.flood_close.change line (rides the roll-up — visibility with zero new wire surface) and
 # logs locally; a failed close is spooled with ok=0 rather than retried here — the alarm itself is
 # already on its way to the cloud, and the worker's own flood path remains the escalation.
+#
+# ⚠️ NEVER PLAN-GATED, deliberately, exactly as the daemon's linktap_flood_stop_all: a close spends
+# no water, removes no limit and is idempotent, and the worst outcome of running it on a vehicle
+# whose plan does not include valve control is a boat that did not flood. LINKTAP_ALLOWED is not
+# read anywhere on this path.
+#
+# Each close also marks the run `stop=flood_shutoff` (so the end classifies as flood_shutoff and a
+# washdown told to resume can never reopen), spools `linktap.stop_failed` with cause=flood when the
+# gateway did not take it (the daemon's event), and rings the poll loop to read the result back.
 linktap_flood_close() {
-  [ -n "${LINKTAP_HOST:-}" ] && [ -n "${LINKTAP_GW_ID:-}" ] && [ -n "${LINKTAP_DEV_IDS:-}" ] || return 0
+  lt_configured || return 0
   for _d in $(printf '%s' "$LINKTAP_DEV_IDS" | tr ',' ' '); do
-    # Canonical 16-hex id, same normalisation as the TS client's normalizeDevId.
-    _d=$(printf '%s' "$_d" | tr -cd 'A-Za-z0-9' | cut -c1-16)
+    _d=$(lt_norm_id "$_d")
     [ -n "$_d" ] || continue
-    if curl -fsS --max-time 5 -X POST -H 'Content-Type: application/json'         -d "$(linktap_stop_body "$LINKTAP_GW_ID" "$_d")"         "http://${LINKTAP_HOST}/api.shtml" >/dev/null 2>&1; then
+    # Marked BEFORE the command, like the daemon: if the stop lands and this process dies before
+    # it can write, the end must still read as ours rather than as an unexplained close.
+    lt_mark_stop "$LT_STATE_DIR/$_d" flood_shutoff
+    if lt_post "$(linktap_stop_body "$LINKTAP_GW_ID" "$_d")" 5 >/dev/null; then
       _ok=1
     else
       _ok=0
     fi
-    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "lt_${_d}" "linktap.flood_close.change" "ok=${_ok}" \
-      >> "${BRVG_RELAY_SPOOL:-/tmp/brvg-relay.spool}"
+    lt_spool "lt_${_d}" "linktap.flood_close.change" "ok=${_ok}"
+    [ "$_ok" = "1" ] || lt_spool "lt_${_d}" "linktap.stop_failed" "error=gateway_unreachable&cause=flood"
     logger -t brvg-hub-lite "flood shutoff: valve ${_d} close ok=${_ok}" 2>/dev/null || true
   done
+  lt_wake
 }
 
 # --- LinkTap: cycle semantics on hub-lite (parity port of hub/src/cycle.ts) ---------------------
@@ -1269,10 +1575,10 @@ linktap_flood_close() {
 # cycle machine — the shared fixtures in test.sh mirror test/cycle.test.ts case for case, which is
 # what keeps two implementations from diverging (the one-contract rule).
 #
-# Scope of this increment: NORMAL RUNS only (poll, software volume cutoff, end-reason
-# classification, restart-only-on-timer, adoption of external opens). Washdown/tank fill stay
-# app/hub-driven; the ledger stays on the TS hub. State lives in tmpfs — a reboot loses it and the
-# ADOPTION rule rebuilds it from the gateway's own answer, exactly like the TS hub's restart rule.
+# Scope (0.15.0): the whole cycle machine — normal runs, washdown and tank fill through the door,
+# the software volume cutoff, end classification, restart-only-on-timer, the washdown handover and
+# resume, the ledger and adoption of external opens. State lives in tmpfs — a reboot loses it and
+# the ADOPTION rule rebuilds it from the gateway's own answer, exactly like the daemon's restart rule.
 
 # Parse a cmd 3 reply (possibly HTML-wrapped) to "watering volumeL remain". $1 = vol unit
 # (gal|L). Volume is converted to LITRES here so every comparison downstream is one unit; the
@@ -1289,7 +1595,9 @@ lt_parse_status() {
         if (vol < 0 || vol > 100000) vol = 0
         else if (unit == "gal") vol = vol * 3.785411784
       }
-      rem = ""
+      # "-" when the gateway gave no remaining time, never an empty field: the caller splits this
+      # line on whitespace, and an empty third field silently shifted SPEED into the remain slot.
+      rem = "-"
       if (match(buf, /"remain_duration":[[:space:]]*[0-9.]+/)) {
         r = substr(buf, RSTART, RLENGTH); sub(/.*:/, "", r); rem = int(r + 0)
       }
@@ -1353,9 +1661,17 @@ lt_should_restart() {
   case "${3:-normal}" in normal|'') return 0 ;; *) return 1 ;; esac
 }
 
-# cmd 6 body — duration SECONDS, volume_limit in the GATEWAY unit ($3 already converted).
+# cmd 6 body — duration SECONDS, volume_limit in the GATEWAY unit ($4 already converted).
+#
+# An empty or zero cap OMITS volume_limit rather than sending 0, as the daemon's linktap::build_start
+# does: a washdown is time-only by owner spec, and "volume_limit":0 is a number the gateway firmware
+# is free to read as something. Absent is unambiguous.
 lt_start_body() {
-  printf '{"cmd":6,"gw_id":"%s","dev_id":"%s","duration":%d,"volume_limit":%s}' "$1" "$2" "$3" "$4"
+  if [ -n "$4" ] && awk -v c="$4" 'BEGIN{exit !(c > 0)}'; then
+    printf '{"cmd":6,"gw_id":"%s","dev_id":"%s","duration":%d,"volume_limit":%s}' "$1" "$2" "$3" "$4"
+  else
+    printf '{"cmd":6,"gw_id":"%s","dev_id":"%s","duration":%d}' "$1" "$2" "$3"
+  fi
 }
 
 # Per-valve profiles from the worker reply (config-as-state; the same {linktap:{profiles}} blob
@@ -1369,7 +1685,11 @@ lt_parse_profiles() {
   awk '
     { buf = buf $0 }
     END {
-      if (!match(buf, /"linktap":[[:space:]]*\{[[:space:]]*"profiles":[[:space:]]*\{/)) exit
+      # 🔴 NOT "profiles" IMMEDIATELY AFTER THE BRACE. The worker builds the blob as
+      # `{ allowed, ...profiles }`, so the real reply is {"linktap":{"allowed":true,"profiles":{..}}}
+      # and the old anchor matched NOTHING a real worker has ever sent: every wire profile was
+      # dropped and every valve ran on the conf default. [^{}]* skips the scalar siblings.
+      if (!match(buf, /"linktap":[[:space:]]*\{[^{}]*"profiles":[[:space:]]*\{/)) exit
       rest = substr(buf, RSTART + RLENGTH)
       while (match(rest, /^[[:space:],]*"[A-Za-z0-9]+":[[:space:]]*\{[^{}]*\}/)) {
         e = substr(rest, RSTART, RLENGTH)
@@ -1397,6 +1717,53 @@ lt_apply_profiles() {
       [ "$_par"  != "-" ] && echo "P_AR=$_par"
     } > "$LT_STATE_DIR/profile.$_pid"
   done
+}
+
+# The plan gate out of a worker reply: prints 1 or 0 for `"linktap":{..."allowed":true|false...}`,
+# nothing when the reply carries no LinkTap blob (the common case — which must NOT read as a
+# revocation). Depth-aware, so an "allowed" inside a nested profile object can never be taken for
+# the vehicle's permission.
+lt_parse_allowed() {
+  awk '
+    { buf = buf $0 }
+    END {
+      i = index(buf, "\"linktap\""); if (i == 0) exit
+      rest = substr(buf, i + 9)
+      if (!match(rest, /^[[:space:]]*:[[:space:]]*\{/)) exit
+      rest = substr(rest, RLENGTH)
+      depth = 0; instr = 0; n = length(rest)
+      for (j = 1; j <= n; j++) {
+        c = substr(rest, j, 1)
+        if (instr) { if (c == "\\") j++; else if (c == "\"") instr = 0; continue }
+        if (c == "{") { depth++; continue }
+        if (c == "}") { depth--; if (depth == 0) exit; continue }
+        if (c == "\"") {
+          if (depth == 1 && substr(rest, j, 9) == "\"allowed\"") {
+            tail = substr(rest, j + 9)
+            if (match(tail, /^[[:space:]]*:[[:space:]]*true/)) { print 1; exit }
+            if (match(tail, /^[[:space:]]*:[[:space:]]*false/)) { print 0; exit }
+          }
+          instr = 1
+        }
+      }
+    }'
+}
+
+# Adopt the cloud's answer on valve control. Persisted to the conf ONLY WHEN IT CHANGES — a flash
+# write per plan change, not per report — so a router that boots with no WAN still knows the last
+# answer, the same reason the daemon keeps `linktap.allowed` in hub.json. Defaults to 0 everywhere:
+# a hub-lite that has never heard from the cloud may not OPEN a valve. Empty input is "no blob in
+# this reply" and changes nothing.
+lt_apply_allowed() {
+  case "$1" in 0|1) : ;; *) return 0 ;; esac
+  [ "$1" = "${LINKTAP_ALLOWED:-0}" ] && return 0
+  LINKTAP_ALLOWED="$1"
+  [ -f "$CONF" ] && conf_set LINKTAP_ALLOWED "$1"
+  if [ "$1" = "1" ]; then
+    log "linktap: valve control permitted by the vehicle's plan"
+  else
+    log "linktap: valve control NOT permitted by the vehicle's plan - opens refused (closes never are)"
+  fi
 }
 
 # The DAILY LEDGER (parity port of cycle.ts applyToLedger — the last hub-lite gap, 2026-08-19).
@@ -1450,10 +1817,17 @@ lt_day_key() { date -u +%F; }
 # Sets: _state _started _stop _mode _dur_eff _cap_eff. $1 = state file, $2 = profile duration,
 # $3 = profile cap. Everything is cleared first, because these are set by SOURCING and would
 # otherwise leak from the previous valve in a multi-valve loop.
+#
+# Also sets _prov (hub | adopted), _resume and _handover (0/1). A file with no prov predates 0.15
+# and was written by adoption or by an auto-restart; `adopted` is the honest reading of the two,
+# because it claims nothing about targets and can never trigger a handover (which needs `hub`).
 lt_load_state() {
-  state=""; started=""; stop=""; mode=""; dur=""; cap=""
+  state=""; started=""; stop=""; mode=""; dur=""; cap=""; prov=""; resume=""; handover=""
   # shellcheck disable=SC1090
   [ -f "$1" ] && . "$1"
+  _prov="${prov:-adopted}"
+  _resume="${resume:-0}"
+  _handover="${handover:-0}"
   _state="${state:-idle}"
   _started="${started:-0}"
   _stop="${stop:-}"
@@ -1464,133 +1838,489 @@ lt_load_state() {
   _cap_eff="${cap:-$3}"
 }
 
-LT_STATE_DIR="${LT_STATE_DIR:-/tmp/brvg-linktap}"
+# --- LinkTap: the rest of the daemon's runtime (0.15.0 parity) -----------------------------------
+# linktap_runtime.rs, cycle.rs and hub_server.rs's poll loop, in shell. Every decision is a PURE
+# function below with its fixtures in test.sh, ported from the daemon's own tests case for case
+# (the one-contract rule); linktap_tick is only the I/O that strings them together.
 
-linktap_tick() {
-  [ -n "${LINKTAP_HOST:-}" ] && [ -n "${LINKTAP_GW_ID:-}" ] && [ -n "${LINKTAP_DEV_IDS:-}" ] || return 0
-  mkdir -p "$LT_STATE_DIR" 2>/dev/null
-  # Read the gateway's volume unit ONCE per boot (a config change needs a gateway visit anyway).
-  if [ ! -f "$LT_STATE_DIR/unit" ]; then
-    _u=$(curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' \
-      -d "{\"cmd\":16,\"gw_id\":\"$LINKTAP_GW_ID\"}" "http://${LINKTAP_HOST}/api.shtml" 2>/dev/null \
-      | grep -o '"vol_unit":"[^"]*"' | cut -d'"' -f4)
-    # Default GALLONS when unreadable — guessing litres under-reports the cap 3.79x (TS readVolUnit).
-    [ "$_u" = "L" ] || _u="gal"
-    echo "$_u" > "$LT_STATE_DIR/unit"
+# How long BEFORE a resumable washdown expires the valve is reprogrammed into its Normal Run —
+# the daemon's cycle::HANDOVER_LEAD_SECS. Owner, MVP 2026-08-31: "would be nice if it reprogrammed
+# it right before it was going to stop, so it never stops the water flow". Waiting for the close and
+# THEN reopening was measured at 30 s of dry pipe; cmd 6 on an already-open valve swaps the plan
+# underneath a valve that never shuts.
+LT_HANDOVER_LEAD_SECS=20
+
+# The grace window before an unreachable gateway is worth telling anyone about — the daemon's
+# GATEWAY_OFFLINE_GRACE_SECS, and the cloud's GATEWAY_OFFLINE_GRACE_MS. Gateways FLAP; the owner set
+# "30 min plus", and the two debounces must not disagree about what counts as an outage.
+LT_GATEWAY_GRACE_SECS=1800
+
+# PURE: should this RUNNING cycle be reprogrammed into its Normal Run now? cycle.rs should_hand_over.
+#   $1 mode  $2 resume(0/1)  $3 prov  $4 stop ("" = none)  $5 handover(0/1)  $6 remain ("-"/"" =
+#   unknown)  $7 started  $8 dur  $9 now  [$10 lead, default LT_HANDOVER_LEAD_SECS]
+# ONLY a hub-issued washdown that was told to resume, and only once. A washdown with ANY stop issued
+# — flood, manual, volume cap — is on its way shut on purpose and must never be handed over.
+lt_should_hand_over() {
+  [ "$5" = "1" ] && return 1
+  [ -n "$4" ] && return 1
+  [ "$1" = "washdown" ] && [ "$2" = "1" ] || return 1
+  [ "$3" = "hub" ] || return 1
+  # The GATEWAY's own remaining time when it offers one (the clock the valve actually stops on);
+  # our own arithmetic otherwise, so a non-reporting gateway still hands over.
+  case "$6" in
+    ''|-|0|*[!0-9]*)
+      _ho_el=$(( $9 - $7 )); [ "$_ho_el" -lt 0 ] && _ho_el=0
+      _ho_left=$(( $8 - _ho_el )); [ "$_ho_left" -lt 0 ] && _ho_left=0 ;;
+    *) _ho_left=$6 ;;
+  esac
+  [ "$_ho_left" -le "${10:-$LT_HANDOVER_LEAD_SECS}" ]
+}
+
+# PURE: should this END be followed by the Normal Run the washdown was told to resume?
+# cycle.rs should_resume_normal. TIMER ONLY: a washdown cut short by a flood, a manual stop or an
+# unexplained close must never reopen the valve. "When unsure, spend no water."
+#   $1 mode  $2 reason  $3 resume(0/1)
+lt_should_resume() {
+  [ "$1" = "washdown" ] && [ "$2" = "timer" ] && [ "$3" = "1" ]
+}
+
+# PURE: seconds until the poll loop MUST look again, or nothing when nothing is time-critical —
+# linktap_runtime.rs poll_hint. A resumable washdown needs a poll INSIDE its 20 s lead window, and
+# the standing cadence is wider than the window, so a fixed interval could step straight over it.
+# Floored at 5 s so a valve seconds from handover cannot spin the gateway. $1 = now.
+lt_poll_hint() {
+  _ph_best=""
+  for _ph_f in "$LT_STATE_DIR"/*; do
+    [ -f "$_ph_f" ] || continue
+    case "${_ph_f##*/}" in *.*|unit|wake|rev) continue ;; esac
+    lt_load_state "$_ph_f" 0 0
+    [ "$_state" = "watering" ] || continue
+    [ -z "$_stop" ] && [ "$_handover" != "1" ] && [ "$_mode" = "washdown" ] && [ "$_resume" = "1" ] && [ "$_prov" = "hub" ] || continue
+    _ph_el=$(( $1 - _started )); [ "$_ph_el" -lt 0 ] && _ph_el=0
+    _ph_left=$(( _dur_eff - _ph_el )); [ "$_ph_left" -lt 0 ] && _ph_left=0
+    _ph_until=$(( _ph_left - LT_HANDOVER_LEAD_SECS )); [ "$_ph_until" -lt 0 ] && _ph_until=0
+    if [ -z "$_ph_best" ] || [ "$_ph_until" -lt "$_ph_best" ]; then _ph_best=$_ph_until; fi
+  done
+  [ -n "$_ph_best" ] || return 0
+  [ "$_ph_best" -lt 5 ] && _ph_best=5
+  echo "$_ph_best"
+}
+
+# PURE: fold one poll's outcome into the gateway watch — linktap_runtime.rs gateway_watch_step.
+#   $1 last_seen epoch ("" = never)  $2 offline_reported(0/1)  $3 reached(0/1)  $4 now  [$5 grace]
+# Prints "<last_seen> <reported> <none|offline|online> <mins>". OFFLINE once per episode and only
+# after the whole grace window; ONLINE only when an offline was reported, because a recovery notice
+# for an outage nobody was told about is exactly the flap the window exists to swallow.
+lt_gw_watch_step() {
+  _gw_grace="${5:-$LT_GATEWAY_GRACE_SECS}"
+  if [ "$3" = "1" ]; then
+    _gw_mins=0
+    [ -n "$1" ] && _gw_mins=$(( ($4 - $1) / 60 )) && [ "$_gw_mins" -lt 0 ] && _gw_mins=0
+    if [ "$2" = "1" ]; then echo "$4 0 online $_gw_mins"; else echo "$4 0 none 0"; fi
+    return 0
   fi
-  _unit=$(cat "$LT_STATE_DIR/unit")
+  # A hub-lite that has NEVER seen this gateway answer starts its clock now, rather than claiming an
+  # outage of unknown length.
+  [ -n "$1" ] || { echo "$4 0 none 0"; return 0; }
+  [ "$2" = "1" ] && { echo "$1 1 none 0"; return 0; }
+  [ $(( $4 - $1 )) -lt "$_gw_grace" ] && { echo "$1 0 none 0"; return 0; }
+  echo "$1 1 offline $(( ($4 - $1) / 60 ))"
+}
+
+# PURE: the valve ids a gateway HTTP push names, normalised, one per line — linktap_runtime.rs
+# parse_gateway_push, for both shapes (`dev_stat:[{dev_id..}]` and a bare `{dev_id..}`), HTML-wrapped
+# or not. Junk yields nothing.
+lt_parse_push() {
+  tr -d '\n\r' | grep -o '"dev_id"[[:space:]]*:[[:space:]]*"[A-Za-z0-9]*"' | sed 's/.*"\([A-Za-z0-9]*\)"$/\1/' \
+    | while IFS= read -r _pp; do _pp=$(lt_norm_id "$_pp"); [ -n "$_pp" ] && echo "$_pp"; done
+}
+
+# PURE: the valve's own health off a cmd 3 reply, as measurement params — what the app's valve view
+# reads (hubValveReading.ts) and the daemon's observe() reports: meters, battery, signal, rf, and the
+# fault flags broken/leak/clog/cutoff. Printed as "&k=v&k=v". A field the gateway OMITS is omitted
+# here too — a missing reading is not a flat battery.
+lt_parse_fields() {
+  awk '
+    { buf = buf $0 }
+    function num(k,  v) {
+      if (!match(buf, "\"" k "\":[[:space:]]*-?[0-9.]+")) return ""
+      v = substr(buf, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", v); v += 0
+      return (v < 0) ? int(v - 0.5) : int(v + 0.5)
+    }
+    function flag(k,  v) {
+      if (!match(buf, "\"" k "\":[[:space:]]*(true|false|\"true\"|\"false\"|\"1\"|\"0\"|-?[0-9.]+)")) return ""
+      v = substr(buf, RSTART, RLENGTH); sub(/.*:[[:space:]]*/, "", v); gsub(/"/, "", v)
+      if (v == "true") return 1
+      if (v == "false" || v == "") return 0
+      return (v + 0 != 0) ? 1 : 0
+    }
+    END {
+      # is_flm_plugin is authoritative when present (as a JSON boolean); otherwise a volume field
+      # means the valve meters — linktap::reports_volume.
+      m = ""
+      if (match(buf, /"is_flm_plugin":[[:space:]]*(true|false)/)) { v = substr(buf, RSTART, RLENGTH); m = (v ~ /true/) ? 1 : 0 }
+      else m = (buf ~ /"volume":[[:space:]]*-?[0-9.]+/) ? 1 : 0
+      out = "&meters=" m
+      b = num("battery"); if (b != "") out = out "&battery=" b
+      g = num("signal");  if (g != "") out = out "&signal=" g
+      r = flag("is_rf_linked"); if (r != "") out = out "&rf=" r
+      split("is_broken broken is_leak leak is_clog clog is_cutoff cutoff", t, " ")
+      for (i = 1; i <= 8; i += 2) { f = flag(t[i]); if (f != "") out = out "&" t[i + 1] "=" f }
+      printf "%s", out
+    }'
+}
+
+# The effective profile for one valve: the wire profile's fields over the conf defaults, FIELD BY
+# FIELD (the profileFor rule). Sets _p_dur _p_cap _p_ar.
+lt_profile() {
+  _p_dur="${LINKTAP_NORMAL_SECS:-86400}"
+  _p_cap="${LINKTAP_NORMAL_VOL_L:-378}"
+  _p_ar="${LINKTAP_AUTO_RESTART:-0}"
+  if [ -f "$LT_STATE_DIR/profile.$1" ]; then
+    P_DUR=""; P_VOL=""; P_AR=""
+    # shellcheck disable=SC1090
+    . "$LT_STATE_DIR/profile.$1"
+    [ -n "$P_DUR" ] && _p_dur="$P_DUR"
+    [ -n "$P_VOL" ] && _p_cap="$P_VOL"
+    [ -n "$P_AR" ]  && _p_ar="$P_AR"
+  fi
+  return 0
+}
+
+# The gateway's volume unit, read ONCE and cached (a config change needs a gateway visit anyway).
+# Defaults to GALLONS when unreadable — guessing litres under-reports a cap 3.79x, and the software
+# cutoff compares against that number (daemon read_vol_unit).
+lt_unit() {
+  if [ -s "$LT_STATE_DIR/unit" ]; then cat "$LT_STATE_DIR/unit"; return 0; fi
+  _lu=$(lt_post "{\"cmd\":16,\"gw_id\":\"$LINKTAP_GW_ID\"}" 10 | grep -o '"vol_unit":"[^"]*"' | cut -d'"' -f4)
+  [ "$_lu" = "L" ] || _lu="gal"
+  mkdir -p "$LT_STATE_DIR" 2>/dev/null && echo "$_lu" > "$LT_STATE_DIR/unit"
+  echo "$_lu"
+}
+
+# May this router OPEN a valve? Only when the cloud has said the vehicle's plan permits it — the
+# daemon's `linktap.allowed`, default DENY. CLOSING is never asked this question anywhere.
+lt_open_allowed() { [ "${LINKTAP_ALLOWED:-0}" = "1" ]; }
+
+# Open one valve and record the run as OURS. $1 dev  $2 duration secs  $3 volume_limit to SEND in
+# litres ("" = none)  $4 cap litres to TRACK (0 for a washdown)  $5 mode  $6 resume(0/1).
+# Returns non-zero when the gateway did not take it, having recorded nothing.
+#
+# Recording is what stops the next poll ADOPTING our own run (the daemon's note_hub_open): an
+# adopted run takes the profile's cap, which for a washdown is exactly the cap that must not exist.
+lt_open() {
+  _o_unit=$(lt_unit)
+  _o_gw=""
+  [ -n "$3" ] && _o_gw=$(awk -v c="$3" -v u="$_o_unit" 'BEGIN{ if (c + 0 > 0) printf "%.2f", (u == "gal") ? c / 3.785411784 : c }')
+  lt_post "$(lt_start_body "$LINKTAP_GW_ID" "$1" "$2" "$_o_gw")" 10 >/dev/null || return 1
+  _o_res=0
+  [ "$5" = "washdown" ] && [ "$6" = "1" ] && _o_res=1
+  mkdir -p "$LT_STATE_DIR" 2>/dev/null
+  lt_write_state "$LT_STATE_DIR/$1" watering "$(date +%s)" "" "$5" "$2" "$4" hub "$_o_res" 0
+  lt_wake
+  return 0
+}
+
+# PURE: the linktap.measurement params, in the daemon's order and formats (linktap_runtime.rs
+# observe). $1 watering  $2 vol_l  $3 fields (lt_parse_fields)  $4 speed L/min  $5 ledger fragment
+# ("&day=..&day_vol_l=..", or "")  $6 running(0/1)  $7 mode  $8 dur  $9 cap  $10 remain ("-" = none)
+# $11 prov. The run's targets ride only WHILE RUNNING, and the flow rate only while watering: a
+# finished run's numbers or the last non-zero rate, carried forward, are drawn by the app forever.
+lt_measurement_params() {
+  _mp="watering=$1&vol_l=$(awk -v v="$2" 'BEGIN{printf "%.2f", v}')$3"
+  [ "$1" = "1" ] && _mp="$_mp&flow_lpm=$(awk -v v="${4:-0}" 'BEGIN{printf "%.2f", v}')"
+  _mp="$_mp$5"
+  if [ "$6" = "1" ]; then
+    _mp="$_mp&mode=$7&dur_s=$8&cap_l=$(awk -v v="${9:-0}" 'BEGIN{printf "%.2f", v}')"
+    case "${10}" in ''|-|0|*[!0-9]*) : ;; *) _mp="$_mp&remain_s=${10}" ;; esac
+    _mp="$_mp&prov=${11}"
+  fi
+  printf '%s' "$_mp"
+}
+
+# Bump the valve-state revision the /api/hub/linktap/state door hands back as `rev`.
+lt_bump_rev() {
+  _rv=$( (cat "$LT_STATE_DIR/rev" 2>/dev/null || echo 0) | tr -cd '0-9')
+  echo $(( ${_rv:-0} + 1 )) > "$LT_STATE_DIR/rev"
+}
+
+# One poll pass over every configured valve: observe, act, report — linktap_poll_loop + observe +
+# linktap_act. State per valve in $LT_STATE_DIR/<dev>:
+#   state=watering started=<epoch> stop= |volume_cap|manual|flood_shutoff
+#   mode=normal|washdown|tankfill dur=<secs> cap=<litres> prov=hub|adopted resume=0|1 handover=0|1
+# No file = idle. Every field describes THIS RUN, not the profile.
+linktap_tick() {
+  lt_configured || return 0
+  mkdir -p "$LT_STATE_DIR" 2>/dev/null
+  rm -f "$LT_STATE_DIR/wake" 2>/dev/null
+  _unit=$(lt_unit)
+  _lt_reached=""
 
   for _d in $(printf '%s' "$LINKTAP_DEV_IDS" | tr ',' ' '); do
-    _d=$(printf '%s' "$_d" | tr -cd 'A-Za-z0-9' | cut -c1-16)
+    _d=$(lt_norm_id "$_d")
     [ -n "$_d" ] || continue
-    # Effective profile: the wire profile's fields over the conf defaults, FIELD BY FIELD —
-    # the same profileFor rule as the TS hub.
-    _dur="${LINKTAP_NORMAL_SECS:-86400}"
-    _capL="${LINKTAP_NORMAL_VOL_L:-378}"
-    _ar="${LINKTAP_AUTO_RESTART:-0}"
-    if [ -f "$LT_STATE_DIR/profile.$_d" ]; then
-      P_DUR=""; P_VOL=""; P_AR=""
-      # shellcheck disable=SC1090
-      . "$LT_STATE_DIR/profile.$_d"
-      [ -n "$P_DUR" ] && _dur="$P_DUR"
-      [ -n "$P_VOL" ] && _capL="$P_VOL"
-      [ -n "$P_AR" ]  && _ar="$P_AR"
+    lt_profile "$_d"
+    # A reply at all is "the gateway answered", whatever it said about this valve: a `ret: 5` on one
+    # valve is a flat battery, not an outage (daemon reply_reached_gateway).
+    if ! _reply=$(lt_post "{\"cmd\":3,\"gw_id\":\"$LINKTAP_GW_ID\",\"dev_id\":\"$_d\"}" 10); then
+      _lt_reached="${_lt_reached:-0}"
+      continue
     fi
-    _reply=$(curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' \
-      -d "{\"cmd\":3,\"gw_id\":\"$LINKTAP_GW_ID\",\"dev_id\":\"$_d\"}" \
-      "http://${LINKTAP_HOST}/api.shtml" 2>/dev/null) || continue
+    _lt_reached=1
+    # shellcheck disable=SC2046
     set -- $(printf '%s' "$_reply" | lt_parse_status "$_unit")
-    _w="$1"; _volL="$2"; _speedL="${4:-0}"
+    _w="${1:-0}"; _volL="${2:-0}"; _rem="${3:--}"; _speedL="${4:-0}"
+    _fields=$(printf '%s' "$_reply" | lt_parse_fields)
 
     _sf="$LT_STATE_DIR/$_d"
-    lt_load_state "$_sf" "$_dur" "$_capL"
-    _elapsed=$(( $(date +%s) - _started ))
+    lt_load_state "$_sf" "$_p_dur" "$_p_cap"
+    _now=$(date +%s)
+    _elapsed=$(( _now - _started ))
+    _reopen=""
 
     _act=$(lt_decide "$_state" "$_w" "$_volL" "$_cap_eff" "$_stop" "$_elapsed" "$_dur_eff" "$_speedL")
     case "$_act" in
       adopt)
-        # Manual press / external open IS a Normal Run with the profile cap (owner rule).
-        # An ADOPTED cycle is a Normal Run on the profile by the owner's rule, so it records those
-        # targets explicitly rather than leaving them absent and inheriting whatever comes next.
-        printf 'state=watering\nstarted=%s\nstop=\nmode=normal\ndur=%s\ncap=%s\n' \
-          "$(date +%s)" "$_dur" "$_capL" > "$_sf"
-        logger -t brvg-hub-lite "linktap: adopted a running cycle on ${_d} (Normal Run cap ${_capL}L)" 2>/dev/null || true
+        # Manual press / external open IS a Normal Run with the profile cap (owner rule), bounded by
+        # what the GATEWAY says is left when it says anything (cycle.rs adopt_cycle).
+        _adur="$_p_dur"
+        case "$_rem" in ''|-|0|*[!0-9]*) : ;; *) _adur="$_rem" ;; esac
+        lt_write_state "$_sf" watering "$_now" "" normal "$_adur" "$_p_cap" adopted 0 0
+        logger -t brvg-hub-lite "linktap: adopted a running cycle on ${_d} (Normal Run cap ${_p_cap}L)" 2>/dev/null || true
         ;;
       cut)
-        curl -fsS --max-time 5 -X POST -H 'Content-Type: application/json' \
-          -d "$(linktap_stop_body "$LINKTAP_GW_ID" "$_d")" "http://${LINKTAP_HOST}/api.shtml" >/dev/null 2>&1
-        # Keep the run's identity through the stop, so the close that follows classifies against
-        # the cycle that was actually running rather than a default Normal Run.
-        printf 'state=watering\nstarted=%s\nstop=volume_cap\nmode=%s\ndur=%s\ncap=%s\n' \
-          "$_started" "$_mode" "$_dur_eff" "$_cap_eff" > "$_sf"
-        logger -t brvg-hub-lite "linktap: volume cap ${_capL}L reached on ${_d} — stop issued" 2>/dev/null || true
+        # Marked first, so the close that follows classifies against the run that was running.
+        lt_write_state "$_sf" watering "$_started" volume_cap "$_mode" "$_dur_eff" "$_cap_eff" "$_prov" "$_resume" "$_handover"
+        if lt_post "$(linktap_stop_body "$LINKTAP_GW_ID" "$_d")" 5 >/dev/null; then
+          logger -t brvg-hub-lite "linktap: volume cap ${_cap_eff}L reached on ${_d} - stop issued" 2>/dev/null || true
+        else
+          # A close that did not happen is worth hearing about now (daemon linktap.stop_failed).
+          lt_spool "lt_${_d}" "linktap.stop_failed" "error=gateway_unreachable"
+          logger -t brvg-hub-lite "linktap: ${_d} STOP FAILED - will re-issue on the next poll" 2>/dev/null || true
+          # 🔴 AND THE MARK IS TAKEN BACK. A stop that never reached the gateway left `stop=volume_cap`
+          # set, and lt_decide never cuts a run that already has a stop — so one lost packet meant
+          # the only volume enforcement there is stayed off for the rest of the run. Un-marked, the
+          # next poll cuts again: one attempt per poll, never a storm.
+          lt_write_state "$_sf" watering "$_started" "" "$_mode" "$_dur_eff" "$_cap_eff" "$_prov" "$_resume" "$_handover"
+        fi
         ;;
       ended:*)
         _reason="${_act#ended:}"
         rm -f "$_sf"
-        # The cycle's MODE decides whether it counts, and washdown does NOT (daemon cycle.rs
-        # apply_to_ledger, owner rule). The note that used to sit here said this tier only ran
-        # Normal Runs and that adding washdown must not silently miscount — this is that change
-        # honouring its own warning.
+        # Washdown does NOT count against the day (owner rule, daemon apply_to_ledger).
         _dayvol=$(lt_ledger_apply "$_mode" "$_volL" "$(lt_day_key)" "$LT_STATE_DIR/ledger.$_d")
-        printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "lt_${_d}" "linktap.cycle.change" \
-          "reason=${_reason}&vol_l=${_volL}&day=$(lt_day_key)&day_vol_l=${_dayvol}" \
-          >> "${BRVG_RELAY_SPOOL:-/tmp/brvg-relay.spool}"
-        if lt_should_restart "$_reason" "$_ar" "$_mode"; then
-          _capGw=$(awk -v c="$_capL" -v u="$_unit" 'BEGIN{printf "%.2f", (u=="gal") ? c/3.785411784 : c}')
-          curl -fsS --max-time 5 -X POST -H 'Content-Type: application/json' \
-            -d "$(lt_start_body "$LINKTAP_GW_ID" "$_d" "$_dur" "$_capGw")" "http://${LINKTAP_HOST}/api.shtml" >/dev/null 2>&1 \
-            && printf 'state=watering\nstarted=%s\nstop=\nmode=normal\ndur=%s\ncap=%s\n' \
-                 "$(date +%s)" "$_dur" "$_capL" > "$_sf"
-          logger -t brvg-hub-lite "linktap: timer expired on ${_d}, auto-restart on — fresh Normal Run" 2>/dev/null || true
+        lt_spool "lt_${_d}" "linktap.cycle.change" \
+          "mode=${_mode}&reason=${_reason}&vol_l=$(awk -v v="$_volL" 'BEGIN{printf "%.2f", v}')&day=$(lt_day_key)&day_vol_l=${_dayvol}"
+        # Resume is checked FIRST: it answers an instruction attached to THAT run, where auto-restart
+        # is a standing profile switch (linktap_runtime.rs observe).
+        if lt_should_resume "$_mode" "$_reason" "$_resume"; then
+          _reopen="washdown resume"
+        elif lt_should_restart "$_reason" "$_p_ar" "$_mode"; then
+          _reopen="auto-restart"
         fi
         ;;
       none) : ;;
     esac
-    # Telemetry rides the roll-up, same event name as the TS hub.
-    # Same event name and same params as the TS hub / daemon emit, so the cloud cannot tell the
-    # tiers apart — which is the point of the one-contract rule.
+
+    # 🔴 THE SEAMLESS HANDOVER, decided while the valve is STILL OPEN, exactly once.
+    if [ -f "$_sf" ]; then
+      lt_load_state "$_sf" "$_p_dur" "$_p_cap"
+      if lt_should_hand_over "$_mode" "$_resume" "$_prov" "$_stop" "$_handover" "$_rem" "$_started" "$_dur_eff" "$_now"; then
+        lt_write_state "$_sf" watering "$_started" "" "$_mode" "$_dur_eff" "$_cap_eff" "$_prov" "$_resume" 1
+        _reopen="washdown handover"
+      fi
+    fi
+
+    # Telemetry rides the roll-up, with the same event name and params as the daemon, so the cloud
+    # cannot tell the tiers apart. The running cycle is read back AFTER the decision, like observe().
     _ldg=""
     if [ -f "$LT_STATE_DIR/ledger.$_d" ]; then
       DAY=""; DAY_VOL=0
       # shellcheck disable=SC1090
       . "$LT_STATE_DIR/ledger.$_d"
-      _ldg="&day=${DAY}&day_vol_l=${DAY_VOL}"
+      _ldg="&day=${DAY}&day_vol_l=$(awk -v v="$DAY_VOL" 'BEGIN{printf "%.2f", v}')"
     fi
-    printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "lt_${_d}" "linktap.measurement" \
-      "watering=${_w}&vol_l=${_volL}${_ldg}" \
-      >> "${BRVG_RELAY_SPOOL:-/tmp/brvg-relay.spool}"
+    _run=0
+    if [ -f "$_sf" ]; then lt_load_state "$_sf" "$_p_dur" "$_p_cap"; _run=1; fi
+    _meas=$(lt_measurement_params "$_w" "$_volL" "$_fields" "$_speedL" "$_ldg" "$_run" "$_mode" "$_dur_eff" "$_cap_eff" "$_rem" "$_prov")
+    lt_spool "lt_${_d}" "linktap.measurement" "$_meas"
+    printf '%s\n' "$_meas" > "$LT_STATE_DIR/meas.$_d.$$" && mv "$LT_STATE_DIR/meas.$_d.$$" "$LT_STATE_DIR/meas.$_d"
+
+    # THE REOPEN, performed after the report like the daemon's linktap_act. It always returns the
+    # valve to its PROFILE's Normal Run. Plan-gated: an open is the paid feature.
+    if [ -n "$_reopen" ]; then
+      if ! lt_open_allowed; then
+        log "linktap: ${_d} - ${_reopen} skipped: the vehicle's plan does not permit opening a valve"
+        lt_spool "lt_${_d}" "linktap.reopen_failed" "why=$(urlencode_spaces "$_reopen")&error=plan_not_permitted"
+      elif lt_open "$_d" "$_p_dur" "$_p_cap" "$_p_cap" normal 0; then
+        logger -t brvg-hub-lite "linktap: ${_d} - ${_reopen} -> reopened for ${_p_dur}s" 2>/dev/null || true
+      else
+        lt_spool "lt_${_d}" "linktap.reopen_failed" "why=$(urlencode_spaces "$_reopen")&error=gateway_unreachable"
+        logger -t brvg-hub-lite "linktap: ${_d} - ${_reopen} FAILED" 2>/dev/null || true
+      fi
+    fi
   done
+
+  # The GATEWAY-REACHABILITY WATCH. This loop is the only thing aboard that talks to the gateway, so
+  # it is the only thing that can tell an unreachable gateway from a quiet one.
+  if [ -n "$_lt_reached" ]; then
+    set -- $(cat "$LT_STATE_DIR/gw.watch" 2>/dev/null)
+    _gws=$(lt_gw_watch_step "${1:-}" "${2:-0}" "$_lt_reached" "$(date +%s)")
+    set -- $_gws
+    echo "$1 $2" > "$LT_STATE_DIR/gw.watch"
+    if [ "$3" != "none" ]; then
+      lt_spool "lt_gw_${LINKTAP_GW_ID}" "linktap.gateway.$3" "host=${LINKTAP_HOST}&mins=$4"
+      log "linktap: gateway ${LINKTAP_HOST} - linktap.gateway.$3"
+    fi
+  fi
+  lt_bump_rev
+  spool_cap "${BRVG_RELAY_SPOOL:-$RELAY_SPOOL}"
+}
+
+# --- Update visibility (the daemon's update_check_loop, phase 1a) --------------------------------
+# Visibility only: WHAT is installed is still decided by the signed feed and the argument-free
+# self_update. This only tells the owner (status `updateAvailable`, and `update=` on the modem
+# report the fleet console reads) that a newer hub-lite exists.
+#
+# The daemon asks GitHub for its latest tag; a hub-lite asks the feed it would actually update from,
+# so "update available" can never name a version self_update cannot install. The index is a few
+# hundred bytes; `opkg update` would also refresh every OpenWrt feed on a metered link, so it is not
+# used for looking. Every 6 hours, like the daemon.
+UPDATE_CHECK_SECS=21600
+
+# PURE: is dotted version $1 strictly newer than $2? Numeric per component; a missing component is 0.
+version_newer() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, "."); n = (na > nb) ? na : nb
+    for (i = 1; i <= n; i++) { p = x[i] + 0; q = y[i] + 0; if (p > q) exit 0; if (p < q) exit 1 }
+    exit 1
+  }'
+}
+
+# PURE: the brvg-hub-lite Version out of an opkg Packages index on stdin.
+feed_version() {
+  awk '/^Package:/ { pkg = $2 } /^Version:/ && pkg == "brvg-hub-lite" { print $2; exit }'
+}
+
+update_check() {
+  _uc_feed=$(sed -n 's/^src\/gz[[:space:]][[:space:]]*brvg_hublite[[:space:]][[:space:]]*\([^[:space:]]*\).*/\1/p' \
+    /etc/opkg/customfeeds.conf 2>/dev/null | tail -1)
+  [ -n "$_uc_feed" ] || return 0
+  _uc_v=$(curl -fsSL --max-time 20 "$_uc_feed/Packages" 2>/dev/null | feed_version)
+  [ -n "$_uc_v" ] || return 0
+  if version_newer "$_uc_v" "$HUB_LITE_VERSION"; then
+    [ "$(cat "$HUB_LITE_UPDATE" 2>/dev/null)" = "$_uc_v" ] || log "update available: $_uc_v (running $HUB_LITE_VERSION)"
+    echo "$_uc_v" > "$HUB_LITE_UPDATE"
+  else
+    rm -f "$HUB_LITE_UPDATE" 2>/dev/null
+  fi
 }
 
 # --- Main loop ---------------------------------------------------------------------------------
 
+# PURE: how long to sleep before the next piece of due work. $1 now, then due epochs (empty = none).
+# Never below 1 s (a due time in the past means "loop straight round"), and never above
+# $LT_NAP_SLICE when it is set — 5 s while a valve could be woken, so a valve command or a gateway
+# push (which ring the wake file) is noticed within seconds rather than a whole GPS interval later.
+next_nap() {
+  _nn_now=$1; shift
+  _nn_best=""
+  for _nn in "$@"; do
+    [ -n "$_nn" ] || continue
+    _nn_d=$(( _nn - _nn_now ))
+    if [ -z "$_nn_best" ] || [ "$_nn_d" -lt "$_nn_best" ]; then _nn_best=$_nn_d; fi
+  done
+  [ -n "$_nn_best" ] || _nn_best=60
+  [ "$_nn_best" -lt 1 ] && _nn_best=1
+  [ -n "${LT_NAP_SLICE:-}" ] && [ "$_nn_best" -gt "$LT_NAP_SLICE" ] && _nn_best=$LT_NAP_SLICE
+  echo "$_nn_best"
+}
+
 main() {
+  # The first start after boot or restart opens the first-run window (init.d normally wrote it).
+  [ -s "$HUB_LITE_STARTED" ] || date +%s > "$HUB_LITE_STARTED" 2>/dev/null
+  # 🔴 AN UNCLAIMED BOX WAITS, IT DOES NOT CRASH-LOOP. With no VID (a fresh .ipk, or /api/hub/clear)
+  # load_config exits, procd respawns it every 30 s forever, and the log fills with the same fatal
+  # line. Wait for /api/hub/bootstrap to write one instead.
+  while :; do
+    # shellcheck disable=SC1090
+    VID=""; DEVICE_ID=""; [ -f "$CONF" ] && . "$CONF"
+    [ -n "$VID" ] && [ -n "$DEVICE_ID" ] && break
+    [ -n "${_waited:-}" ] || log "no vehicle configured yet - waiting for setup (/api/hub/bootstrap)"
+    _waited=1
+    sleep 30
+  done
   load_config
   log "starting (platform=$(detect_platform), gps every ${GPS_INTERVAL}s, modem every ${MODEM_INTERVAL}s)"
   # Small random start offset so a fleet doesn't tick in lockstep after a regional power event.
   sleep $(( $$ % 20 ))
   # An urgent webhook (alarm) pokes the drain immediately — aggregation must never delay one that
-  # the CGI failed to deliver directly.
-  [ "${HUB_LITE_ENABLED:-0}" = "1" ] && trap drain_relay USR1
-  _elapsed=$MODEM_INTERVAL   # first loop sends both
-  _lt_elapsed=${LINKTAP_POLL:-120}   # first loop polls the gateway too
+  # the CGI failed to deliver directly. Not gated on HUB_LITE_ENABLED any more: see drain below.
+  trap drain_relay USR1
+  _next_gps=0; _next_modem=0; _next_lt=0; _next_update=0
   while :; do
-    push_gps
-    if [ "$_lt_elapsed" -ge "${LINKTAP_POLL:-120}" ]; then
-      linktap_tick
-      _lt_elapsed=0
+    _now=$(date +%s)
+    # A CGI rewrote the conf (/api/hub/config, /token, /bootstrap, /clear): read it again now.
+    if [ -f "$HUB_LITE_RELOAD" ]; then
+      rm -f "$HUB_LITE_RELOAD"
+      VID=""
+      # shellcheck disable=SC1090
+      [ -f "$CONF" ] && . "$CONF"
+      if [ -z "$VID" ]; then log "vehicle removed from this router - stopping reporting"; exec "$0"; fi
+      load_config
+      log "configuration reloaded (gps every ${GPS_INTERVAL}s, modem every ${MODEM_INTERVAL}s)"
+      _next_gps=0; _next_modem=0
     fi
-    _lt_elapsed=$(( _lt_elapsed + GPS_INTERVAL ))
-    if [ "$_elapsed" -ge "$MODEM_INTERVAL" ]; then
+    if [ "$_now" -ge "$_next_gps" ]; then
+      push_gps
+      _next_gps=$(( $(date +%s) + GPS_INTERVAL ))
+    fi
+    if lt_configured; then
+      LT_NAP_SLICE=5
+      _woken=0
+      [ -f "$LT_STATE_DIR/wake" ] && _woken=1
+      if [ "$_woken" = "1" ] || [ "$(date +%s)" -ge "$_next_lt" ]; then
+        # A command just landed at the gateway: let it apply before reading it back (the daemon's
+        # LINKTAP_WAKE_SETTLE).
+        [ "$_woken" = "1" ] && sleep 2
+        linktap_tick
+        _next_lt=$(( $(date +%s) + ${LINKTAP_POLL:-120} ))
+        _hint=$(lt_poll_hint "$(date +%s)")
+        [ -n "$_hint" ] && [ $(( $(date +%s) + _hint )) -lt "$_next_lt" ] && _next_lt=$(( $(date +%s) + _hint ))
+        # Valve telemetry reaches the cloud promptly after a command, not on the next modem tick.
+        [ "$_woken" = "1" ] && drain_relay
+      fi
+    else
+      # No valve to be woken for, but a CGI's follow-up or reload flag should still land within half
+      # a minute rather than a whole GPS interval (which a Cloud Update Schedule can make 30 min).
+      LT_NAP_SLICE=30
+    fi
+    if [ "$(date +%s)" -ge "$_next_modem" ]; then
       push_modem
       # No-op once we have a key. Here rather than at startup so a box that boots with no WAN still
       # collects one the moment the uplink comes back. NOT gated on HUB_LITE_ENABLED: that flag is
       # the RELAY TIER, and the management door is not part of it.
       fetch_mgmt_key
-      [ "${HUB_LITE_ENABLED:-0}" = "1" ] && drain_relay
+      # 🔴 NOT GATED ON HUB_LITE_ENABLED ANY MORE. LinkTap telemetry, cycle ends, flood-close
+      # records AND the plan gate + valve profiles all travel through this drain; gating it on the
+      # relay tier meant a router with the tier off never reported a valve, never learned its
+      # profiles, and grew its spool in RAM without bound. The drain is a no-op on an empty spool.
+      drain_relay
       watch_hub
-      _elapsed=0
+      _next_modem=$(( $(date +%s) + MODEM_INTERVAL ))
+    elif relay_needs_retry; then
+      # A failed batch or an undelivered alarm is retried on this loop's short cadence rather than
+      # waiting out MODEM_INTERVAL (the daemon's shelly_retry_loop). Bounded by the loop's own
+      # period, and a no-op while the spool is empty.
+      if [ "$(date +%s)" -ge "${_next_retry:-0}" ]; then
+        drain_relay
+        _next_retry=$(( $(date +%s) + 30 ))
+      fi
+    fi
+    spool_cap "$RELAY_SPOOL"
+    if [ "$(date +%s)" -ge "$_next_update" ]; then
+      update_check
+      _next_update=$(( $(date +%s) + UPDATE_CHECK_SECS ))
     fi
     # A verb the LAN door ran in its own process asked for a follow-up report (see
     # HUB_LITE_FOLLOWUP above). Consumed here, where FOLLOWUP_REPORT actually means something.
@@ -1607,10 +2337,12 @@ main() {
       log "command follow-up: reporting the new state"
       push_gps force   # a follow-up / report_now wants a fresh line, deadband notwithstanding
       push_modem
-      _elapsed=0
+      _next_gps=$(( $(date +%s) + GPS_INTERVAL ))
+      _next_modem=$(( $(date +%s) + MODEM_INTERVAL ))
     fi
-    sleep "$GPS_INTERVAL"
-    _elapsed=$(( _elapsed + GPS_INTERVAL ))
+    _lt_due=""
+    lt_configured && _lt_due=$_next_lt
+    sleep "$(next_nap "$(date +%s)" "$_next_gps" "$_next_modem" "$_lt_due")"
   done
 }
 
