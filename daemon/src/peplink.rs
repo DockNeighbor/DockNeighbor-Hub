@@ -77,9 +77,16 @@ fn payload(body: &Value) -> Option<&Value> {
     if r.is_object() { Some(r) } else { None }
 }
 
-/// `GET /api/status.system.info` → identity.
+/// `GET /api/status.system.info` → identity. ⚠️ That endpoint is NOT in Peplink's published API for
+/// firmware 8.5 (the owner's Balance One, 8.5.5 build 5824, 2026-09-13) — it is kept because some
+/// firmware answers it, and `probe` no longer depends on it. Accepts the fields flat or nested one
+/// level under `device` / `system` / `info`.
 pub fn parse_probe(body: &Value) -> Option<Probe> {
-    let r = payload(body)?;
+    let top = payload(body)?;
+    let r = ["device", "system", "info"]
+        .iter()
+        .find_map(|k| top.get(*k).filter(|v| v.is_object()))
+        .unwrap_or(top);
     let model = str_of(r.get("productName")).or_else(|| str_of(r.get("model")));
     let firmware = str_of(r.get("firmwareVersion")).or_else(|| str_of(r.get("firmware")));
     let mac = str_of(r.get("mac"));
@@ -87,6 +94,18 @@ pub fn parse_probe(body: &Value) -> Option<Probe> {
         return None;
     }
     Some(Probe { model, firmware, mac, serial: str_of(r.get("serialNumber")) })
+}
+
+/// `GET /api/info.firmware` (documented since 7.1.1, answers even before sign-in) → the version of
+/// the firmware image marked `inUse`, e.g. "8.5.5 build 5824".
+pub fn parse_firmware(body: &Value) -> Option<String> {
+    let r = payload(body)?;
+    r.as_object()?
+        .iter()
+        .filter(|(k, v)| k.as_str() != "order" && v.is_object())
+        .map(|(_, v)| v)
+        .find(|v| v.get("inUse").and_then(|b| b.as_bool()) == Some(true))
+        .and_then(|v| str_of(v.get("version")))
 }
 
 /// The WAN map: every object value except `order` (the display ordering array).
@@ -281,9 +300,27 @@ impl<'a> Peplink<'a> {
     }
 
     /// Prove the sign-in and read identity.
+    ///
+    /// Identity is best-effort; the SIGN-IN is what must be proven. Firmware 8.5 publishes no model
+    /// endpoint, so on the owner's Balance One the old probe (which demanded a model from
+    /// `status.system.info`) failed with "its model could not be read" after a sign-in that had
+    /// worked. Now: try `status.system.info`; if it is absent or unreadable, prove the session with
+    /// the documented `status.wan.connection` and take the firmware from `info.firmware`.
     pub async fn probe(&self) -> Result<Probe, String> {
-        let info = self.get("/api/status.system.info").await?;
-        parse_probe(&info).ok_or_else(|| "the router answered, but its model could not be read".into())
+        match self.get("/api/status.system.info").await {
+            Ok(info) => {
+                if let Some(p) = parse_probe(&info) {
+                    return Ok(p);
+                }
+            }
+            Err(why) if why.starts_with("the router refused the sign-in") || why.contains("could not be reached") || why.contains("did not answer (timed out)") => {
+                return Err(why);
+            }
+            Err(_) => {} // not on this firmware — fall through to the documented endpoints
+        }
+        self.get("/api/status.wan.connection").await?; // proves the session is real
+        let firmware = self.get("/api/info.firmware").await.ok().and_then(|b| parse_firmware(&b));
+        Ok(Probe { model: None, firmware, mac: None, serial: None })
     }
 
     /// The raw WAN map — both `parse_modem` and `parse_wan` read it, one request.
@@ -437,6 +474,52 @@ mod tests {
         assert_eq!(get("model"), Some("MAX Transit"));
         assert_eq!(get("dataMb"), None);
         assert_eq!(get("wanKb_cellular"), None);
+    }
+
+    #[test]
+    fn firmware_comes_from_the_in_use_image_as_documented_for_8_5() {
+        let body = json!({ "stat": "ok", "response": {
+            "1": { "version": "8.5.4 build 5700", "bootable": true, "inUse": false },
+            "2": { "version": "8.5.5 build 5824", "bootable": true, "inUse": true },
+            "order": [1, 2] } });
+        assert_eq!(parse_firmware(&body).as_deref(), Some("8.5.5 build 5824"));
+        assert_eq!(parse_firmware(&json!({ "stat": "ok", "response": { "order": [] } })), None);
+    }
+
+    #[test]
+    fn probe_reads_identity_nested_under_device_too() {
+        let nested = json!({ "stat": "ok", "response": { "device": { "model": "Peplink Balance One", "firmwareVersion": "8.5.5 build 5824" } } });
+        let p = parse_probe(&nested).unwrap();
+        assert_eq!(p.model.as_deref(), Some("Peplink Balance One"));
+        assert!(parse_probe(&json!({ "stat": "ok", "response": { "something": 1 } })).is_none());
+    }
+
+    /// The owner's Balance One on 8.5.5: sign-in works, `status.system.info` answers nothing usable,
+    /// the documented endpoints do. The probe must succeed, not claim the model "could not be read".
+    #[tokio::test]
+    async fn a_firmware_8_5_router_without_a_model_endpoint_still_probes() {
+        use axum::{routing::{get, post}, Json, Router};
+        let app = Router::new()
+            .route("/api/login", post(|| async {
+                ([(axum::http::header::SET_COOKIE, "bauth=ok1; Path=/; Secure; HttpOnly")], Json(json!({ "stat": "ok" })))
+            }))
+            .route("/api/status.system.info", get(|| async { Json(json!({ "stat": "fail", "code": 404, "message": "API not found" })) }))
+            .route("/api/status.wan.connection", get(|headers: axum::http::HeaderMap| async move {
+                if headers.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("").contains("bauth=ok1") {
+                    Json(json!({ "stat": "ok", "response": { "1": { "name": "WAN 1", "type": "ethernet", "message": "Connected", "statusLed": "green", "ip": "10.0.0.2" }, "order": [1] } }))
+                } else {
+                    Json(json!({ "stat": "fail", "code": 401, "message": "Unauthorized" }))
+                }
+            }))
+            .route("/api/info.firmware", get(|| async { Json(json!({ "stat": "ok", "response": { "1": { "version": "8.5.5 build 5824", "bootable": true, "inUse": true }, "order": [1] } })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::routers::lan_client();
+        let pep = Peplink::at_base(&client, format!("http://127.0.0.1:{port}"), "fusionadmin", "x");
+        let p = pep.probe().await.unwrap();
+        assert_eq!(p.firmware.as_deref(), Some("8.5.5 build 5824"));
+        assert_eq!(p.model, None);
     }
 
     /// A mock router: `/api/login` hands out a fresh `bauth` cookie per sign-in; the FIRST session
