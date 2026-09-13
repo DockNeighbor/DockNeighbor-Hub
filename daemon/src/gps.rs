@@ -249,7 +249,7 @@ pub fn parse_nmea(text: &str) -> Option<GpsFix> {
 
 /// Only whole lines are parsed: a sentence cut mid-number by a read boundary must never yield a
 /// wrong position. Everything up to and including the last line terminator.
-fn complete_lines(text: &str) -> &str {
+pub(crate) fn complete_lines(text: &str) -> &str {
     match text.rfind(['\r', '\n']) {
         Some(i) => &text[..=i],
         None => "",
@@ -261,13 +261,37 @@ fn complete_lines(text: &str) -> &str {
 pub async fn poll_nmea(host: &str, port: u16, protocol: &str) -> Result<GpsFix, String> {
     let port = if port == 0 { NMEA_DEFAULT_PORT } else { port };
     if protocol.eq_ignore_ascii_case("udp") {
-        let sock = tokio::net::UdpSocket::bind(("0.0.0.0", port))
-            .await
+        let sock = bind_udp_shared(port)
             .map_err(|e| format!("cannot listen on UDP port {port} ({e})"))?;
         poll_nmea_udp_on(sock).await
     } else {
         poll_nmea_tcp(host, port).await
     }
+}
+
+/// A UDP socket on `0.0.0.0:port` that SHARES the port. The hub often runs on the same PC as the
+/// navigation program (TimeZero, OpenCPN) that already listens on 10110 or 2000; a plain bind would
+/// fail with "address in use" and the hub could never hear the feed the plotter is using.
+/// `SO_REUSEADDR` (+ `SO_REUSEPORT` on unix) lets both sockets hold it. Binding the wildcard address
+/// receives broadcast datagrams too, which is how most Wi-Fi NMEA gateways send.
+///
+/// Caveat for the PR record: broadcast and multicast datagrams reach EVERY socket on the port, but a
+/// UNICAST datagram is delivered to only one of them, so while the hub listens it can take some of
+/// a unicast feed's sentences away from the other program. The listen windows are short (8 s).
+/// Whether the other program's own bind allows sharing is its choice: on macOS/Linux it must have
+/// set SO_REUSEPORT too, else this bind still fails and the caller reports it.
+pub fn bind_udp_shared(port: u16) -> std::io::Result<tokio::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_reuse_address(true)?;
+    #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos", target_os = "cygwin"))))]
+    sock.set_reuse_port(true)?;
+    // Only needed to SEND broadcasts, harmless for receiving, and some stacks want it for both.
+    let _ = sock.set_broadcast(true);
+    sock.set_nonblocking(true)?;
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    sock.bind(&addr.into())?;
+    tokio::net::UdpSocket::from_std(sock.into())
 }
 
 async fn poll_nmea_tcp(host: &str, port: u16) -> Result<GpsFix, String> {

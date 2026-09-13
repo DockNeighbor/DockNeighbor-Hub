@@ -60,6 +60,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 uuid = { version = "1", features = ["v4"] }
+# Shared UDP binds for NMEA-over-IP (gps.rs bind_udp_shared): SO_REUSEADDR + SO_REUSEPORT so the
+# hub can listen on 10110/2000/... while a chartplotter program on the same PC (TimeZero, OpenCPN)
+# already holds the port. Already in the tree via tokio; `all` exposes set_reuse_port.
+socket2 = { version = "0.6", features = ["all"] }
 
 # The desktop tray stack — Windows AND macOS (owner 2026-08-20: "add a taskbar icon line on
 # windows to mac"). LINUX is deliberately excluded: the daemon runs there (containers) but has no

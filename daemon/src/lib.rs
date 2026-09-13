@@ -18,6 +18,7 @@ pub mod update_check;
 pub mod web_bundle;
 pub mod self_update;
 pub mod linktap_discover;
+pub mod nmea_discover;
 pub mod tray_state;
 
 // The Windows service host. Windows-only: it links against the SCM (advapi32 via the
