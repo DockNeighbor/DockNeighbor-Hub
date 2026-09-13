@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.15.1"
+HUB_LITE_VERSION="0.16.0"
 HUB_LITE_BACKUP="/etc/brvg-hub-lite.prev"
 
 # The LAST telemetry this hub-lite composed, as JSON, for the LAN management door to serve
@@ -2287,6 +2287,9 @@ update_check() {
   fi
 }
 
+# Managed routers (routers.sh, owner D2): a Cradlepoint or Peplink this router signs in to. Optional — absent or unparseable, the hub-lite runs without it and /status does not claim `routers`.
+RT_FILE="${BRVG_HUB_LITE_ROUTERS:-/usr/libexec/brvg-hub-lite/routers}"; [ -r "$RT_FILE" ] && sh -n "$RT_FILE" 2>/dev/null && . "$RT_FILE"
+
 # --- Main loop ---------------------------------------------------------------------------------
 
 # PURE: how long to sleep before the next piece of due work. $1 now, then due epochs (empty = none).
@@ -2420,6 +2423,7 @@ main() {
       _next_gps=$(( $(date +%s) + GPS_INTERVAL ))
       _next_modem=$(( $(date +%s) + MODEM_INTERVAL ))
     fi
+    command -v rt_tick >/dev/null 2>&1 && rt_tick   # managed routers: due reads run in the background (routers.sh)
     _lt_due=""
     lt_configured && _lt_due=$_next_lt
     sleep "$(next_nap "$(date +%s)" "$_next_gps" "$_next_modem" "$_lt_due")"

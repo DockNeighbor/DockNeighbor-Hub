@@ -46,11 +46,13 @@ ship() {  # $1 source, $2 destination, $3 mode
   chmod "$3" "$2"
 }
 _src_bytes=0; _ship_bytes=0
-for _f in brvg-hub-lite.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh openwrt/etc/init.d/brvg-hub-lite; do
+for _f in brvg-hub-lite.sh routers.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh openwrt/etc/init.d/brvg-hub-lite; do
   _src_bytes=$(( _src_bytes + $(wc -c < "$SRC/$_f") ))
 done
 
 ship "$SRC/brvg-hub-lite.sh" "$WORK/data/usr/bin/brvg-hub-lite" 0755
+# Managed routers (owner D2) — sourced by the collector and the /api/hub door, never run directly.
+ship "$SRC/routers.sh" "$WORK/data/usr/libexec/brvg-hub-lite/routers" 0644
 # The signed-feed provisioner: writes the trust anchor and the customfeeds line self_update needs.
 # Shipped as a payload file (not just baked into postinst) so a re-run — or the app's over-SSH
 # installer, which embeds the same content — has one canonical script to call.
@@ -67,7 +69,7 @@ ship "$SRC/hub-lite-mgmt.sh" "$WORK/data/www/brvg/cgi-bin/mgmt" 0755
 # answers /api/hub/ping, /api/hub/status and /api/hub/linktap/state.
 ship "$SRC/hub-lite-api.sh" "$WORK/data/www/brvg/api/hub" 0755
 
-for _f in usr/bin/brvg-hub-lite www/brvg/api/hub www/brvg/cgi-bin/report www/brvg/cgi-bin/mgmt usr/libexec/brvg-hub-lite/feed-setup etc/init.d/brvg-hub-lite; do
+for _f in usr/bin/brvg-hub-lite usr/libexec/brvg-hub-lite/routers www/brvg/api/hub www/brvg/cgi-bin/report www/brvg/cgi-bin/mgmt usr/libexec/brvg-hub-lite/feed-setup etc/init.d/brvg-hub-lite; do
   _ship_bytes=$(( _ship_bytes + $(wc -c < "$WORK/data/$_f") ))
   # A stripped script that no longer parses must never be sealed into a package.
   sh -n "$WORK/data/$_f" || { echo "stripped $_f does not parse" >&2; exit 1; }
@@ -150,6 +152,7 @@ tar tzf "$WORK/data.tar.gz" | grep -q './usr/libexec/brvg-hub-lite/feed-setup' |
 tar tzf "$WORK/data.tar.gz" | grep -q './etc/init.d/brvg-hub-lite' || { echo "payload missing the init script" >&2; exit 1; }
 tar tzf "$WORK/data.tar.gz" | grep -q './www/brvg/cgi-bin/report' || { echo "payload missing the relay CGI" >&2; exit 1; }
 tar tzf "$WORK/data.tar.gz" | grep -q './www/brvg/cgi-bin/mgmt' || { echo "payload missing the management CGI" >&2; exit 1; }
+tar tzf "$WORK/data.tar.gz" | grep -q './usr/libexec/brvg-hub-lite/routers' || { echo "payload missing the managed-routers library" >&2; exit 1; }
 tar tzf "$WORK/data.tar.gz" | grep -q './www/brvg/api/hub' || { echo "payload missing the /api/hub CGI" >&2; exit 1; }
 tar tzf "$WORK/control.tar.gz" | grep -q './control' || { echo "control archive incomplete" >&2; exit 1; }
 

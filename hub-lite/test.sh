@@ -10,6 +10,9 @@ export BRVG_HUB_LITE_TEST
 # bytes that ship, not only the bytes in git.
 HL_DIR="${BRVG_HUB_LITE_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 HL_SRC="$(cd "$(dirname "$0")" && pwd)"
+# routers.sh (managed routers) is found beside the scripts under test, stripped or not.
+BRVG_HUB_LITE_ROUTERS="$HL_DIR/routers.sh"
+export BRVG_HUB_LITE_ROUTERS
 # shellcheck disable=SC1091
 . "$HL_DIR/brvg-hub-lite.sh"
 
@@ -1420,6 +1423,366 @@ check "keys: with neither a set nor a MGMT_KEY the door is 503, not open" "503" 
 cp "$T/keys.before" "$T/keys"; cp "$T/conf" "$T/conf.clear"
 api POST /clear "" BRVG_HUB_LITE_CONF="$T/conf.clear" >/dev/null
 check "clear: forgetting the vessel forgets its member set" "no" "$([ -f "$T/keys" ] && echo yes || echo no)"
+echo ""
+echo "# --- managed routers (routers.sh, owner D2): parsers pinned to the daemon's fixtures -----------"
+# Every fixture below is the one daemon/src/routers.rs or peplink.rs pins, so the two tiers are
+# checked against the same captures. flat() = the transport's unwrap, without the network.
+flat_cp() { printf '%s' "$1" | rt_flat | rt_unwrap ncos; }
+flat_pl() { printf '%s' "$1" | rt_flat | rt_unwrap peplink; }
+line() { printf '%s\n' "$1" | awk -F'\t' -v k="$2" '$1 == k { print $2 }'; }
+RT_BENCH='{"success":true,"data":{"mdm-1a2b":{"info":{"type":"mdm"},"status":{"connection_state":"connected","ipinfo":{"ip_address":"100.64.3.9"}},"diagnostics":{"CARRID":"Verizon ","HOMECARRID":"Verizon","SERDIS":"LTE","DBM":"-71","RSRP":"-101","RSRQ":"-12","SINR":"7.4","PIN_STATUS":"READY","MDN":"5551234567"},"stats":{"in":1234567,"out":234567}},"mdm-3c4d":{"info":{"type":"mdm"},"status":{"connection_state":"unplugged"},"diagnostics":{"PIN_STATUS":"NOSIM","RSRP":""}},"ethernet-wan":{"info":{"type":"ethernet"},"status":{"connection_state":"disconnected"}}}}'
+RT_RULES2='[{"priority":1,"trigger_name":"Ethernet","trigger_string":"type|is|ethernet"},{"priority":2,"trigger_name":"LTE-only Modems","trigger_string":"type|is|mdm%tech|is|lte"},{"priority":2.5,"trigger_name":"LTE/3G Multi-mode Modems","trigger_string":"type|is|mdm%tech|is|lte/3g"},{"priority":5,"trigger_name":"3G-only Modems","trigger_string":"type|is|mdm%tech|is|3g"},{"modem":{"apn_mode":"manual","manual_apn":"mw01.VZWSTATIC"},"priority":2.25,"trigger_name":"Modem-3a201cd3","trigger_string":"type|is|mdm%tech|is|lte/3g%uid|is|3a201cd3"}]'
+# The owner's Balance One (fw 8.5.5 build 5824), GET https://172.31.0.1/api/info.firmware, captured
+# live from the boat LAN 2026-09-13 — verbatim, whitespace included. No auth; nothing written.
+RT_PL_FW_LIVE='{
+  "stat": "ok",
+  "response": {
+    "1": {
+      "version": "8.5.5 build 5824",
+      "bootable": true,
+      "inUse": true
+    },
+    "order": [
+      1
+    ]
+  }
+}'
+
+# (Built here, not inline: macOS bash 3.2 — the Mac's sh — mis-parses \" inside "$( … )".)
+RT_RULES2_BODY="{\"success\":true,\"data\":$RT_RULES2}"
+s=$(flat_cp "$RT_BENCH" | rt_cp_status)
+check "cp modem: the CONNECTED SIM of a dual-SIM unit, strings normalized (CBA850 capture)" \
+  "ok|Verizon|LTE|-71|-101|-12|7.4|1|100.64.3.9|234567|1234567" \
+  "$(for k in sim carrier mode rssi rsrp rsrq sinr connected ip txBytes rxBytes; do printf '%s|' "$(line "$s" "m.$k")"; done | sed 's/|$//')"
+check "cp wan: classified by uid prefix" "lte 1 100.64.3.9" "$(line "$s" w.wan) $(line "$s" w.up) $(line "$s" w.ip)"
+s=$(flat_cp '{"success":true,"data":{"mdm-x":{"status":{},"diagnostics":{"PIN_STATUS":"NOSIM","RSRP":""}}}}' | rt_cp_status)
+check "cp modem: SIM absence reported honestly, an empty RSRP is no reading" "missing|" "$(line "$s" m.sim)|$(line "$s" m.rsrp)"
+check "cp modem: none without a cellular entry" "" "$(flat_cp '{"success":true,"data":{"ethernet-wan":{"status":{}}}}' | rt_cp_status | grep '^m\.')"
+check "cp wan: nothing connected is none/down" "none 0" "$(s=$(flat_cp '{"success":true,"data":{"ethernet-wan":{"status":{"connection_state":"disconnected"}}}}' | rt_cp_status); echo "$(line "$s" w.wan) $(line "$s" w.up)")"
+check "cp wan: no entries at all is no wan" "" "$(flat_cp '{"success":true,"data":{}}' | rt_cp_status)"
+s=$( { flat_cp '{"success":true,"data":{"product_name":"CBA850","mac0":"00:30:44:aa:bb:cc"}}'; flat_cp '{"success":true,"data":{"major_version":7,"minor_version":0,"patch_version":50}}' | sed 's/^D/F/'; } | rt_cp_probe)
+check "cp probe: firmware triple joined, MAC kept" "CBA850 7.0.50 00:30:44:aa:bb:cc" "$(line "$s" p.model) $(line "$s" p.firmware) $(line "$s" p.mac)"
+check "cp probe: nothing without a model or firmware" "" "$(flat_cp '{"success":true,"data":{}}' | rt_cp_probe)"
+check "cp apn: the per-modem rule (index 4, manual mw01.VZWSTATIC) beats the first class rule (#135)" \
+  "4	manual	mw01.VZWSTATIC" "$(flat_cp "$RT_RULES2_BODY" | rt_cp_apn)"
+check "cp apn: a plain mdm rule with a modem subtree" "1	manual	vzwinternet" \
+  "$(flat_cp '{"success":true,"data":[{"trigger_string":"type|is|ethernet","trigger_name":"Ethernet"},{"trigger_string":"type|is|mdm","modem":{"apn_mode":"manual","manual_apn":"vzwinternet"}}]}' | rt_cp_apn)"
+check "cp apn: NCOS default is the app's auto, and a stale manual name is dropped" "0	auto	" \
+  "$(flat_cp '{"success":true,"data":[{"trigger_string":"type|is|mdm%uid|is|x","modem":{"apn_mode":"default","manual_apn":"stale"}}]}' | rt_cp_apn)"
+check "cp apn: no per-modem rule yet — the first class rule, automatic" "1	auto	" \
+  "$(flat_cp '{"success":true,"data":[{"trigger_string":"type|is|ethernet"},{"trigger_string":"type|is|mdm%tech|is|lte"}]}' | rt_cp_apn)"
+check "cp apn: no modem rule at all is nothing" "" "$(flat_cp '{"success":true,"data":[{"trigger_string":"type|is|ethernet"}]}' | rt_cp_apn)"
+check "cp envelope: a refusal's string reason" "!bad value" "$(flat_cp '{"success":false,"reason":"bad value"}')"
+check "cp envelope: a refusal's OBJECT data is carried, not flattened to a generic line" \
+  '!the router refused the request: {"apn_mode":"invalid choice"}' "$(flat_cp '{"success":false,"data":{"apn_mode":"invalid choice"}}')"
+check "cp envelope: a bare refusal" "!the router refused the request" "$(flat_cp '{"success":false}')"
+check "cp envelope: not an object is not JSON we can use" "!the router did not answer with JSON" "$(flat_cp '"nope"')"
+check "cp envelope: not JSON at all" "!the router did not answer with JSON" "$(flat_cp '<html>login</html>')"
+check "cp envelope: success unwraps data" "D/a	n	1" "$(flat_cp '{"success":true,"data":{"a":1}}' | tail -n 1)"
+s=$(flat_cp '{"success":true,"data":{"fix":{"latitude":{"degree":41,"minute":29,"second":34.52},"longitude":{"degree":-81,"minute":41,"second":39.5}}}}' | rt_cp_gps)
+check "cp gps: DMS with the sign on degree (CBA850 capture shape)" "41.49292222 -81.69430556" "$(line "$s" f.lat) $(line "$s" f.lon)"
+check "cp gps: the 0,0 placeholder is no fix" "" "$(flat_cp '{"success":true,"data":{"fix":{"latitude":0,"longitude":0}}}' | rt_cp_gps)"
+
+check "pl envelope: fail carries the message" "!Invalid password" "$(flat_pl '{"stat":"fail","message":"Invalid password"}')"
+check "pl envelope: a bare fail" "!the router refused the request" "$(flat_pl '{"stat":"fail"}')"
+check "pl envelope: neither ok nor fail" "!unexpected response from the router" "$(flat_pl '{"nothing":true}')"
+check "pl expired: code 401" "yes" "$(printf '%s' '{"stat":"fail","code":401,"message":"Unauthorized"}' | rt_flat | rt_pl_expired && echo yes || echo no)"
+check "pl expired: 'Please login first'" "yes" "$(printf '%s' '{"stat":"fail","message":"Please login first"}' | rt_flat | rt_pl_expired && echo yes || echo no)"
+check "pl expired: the LIVE Balance One's answer to a status read with no session (HTTP 200, 2026-09-13)" "yes" \
+  "$(printf '{\n  "stat": "fail",\n  "code": 401,\n  "message": "Unauthorized"\n}' | rt_flat | rt_pl_expired && echo yes || echo no)"
+check "pl expired: a wrong password is NOT an expired session" "no" "$(printf '%s' '{"stat":"fail","message":"Invalid password"}' | rt_flat | rt_pl_expired && echo yes || echo no)"
+s=$(flat_pl '{"stat":"ok","response":{"productName":"Balance One","firmwareVersion":"8.5.2","mac":"00:11:22:33:44:55"}}' | rt_pl_probe)
+check "pl probe: model, firmware, mac" "Balance One|8.5.2|00:11:22:33:44:55" "$(line "$s" p.model)|$(line "$s" p.firmware)|$(line "$s" p.mac)"
+check "pl probe: identity nested under device" "Peplink Balance One" "$(flat_pl '{"stat":"ok","response":{"device":{"model":"Peplink Balance One","firmwareVersion":"8.5.5 build 5824"}}}' | rt_pl_probe | awk -F'\t' '$1=="p.model"{print $2}')"
+check "pl probe: nothing usable is nothing" "" "$(flat_pl '{"stat":"ok","response":{"something":1}}' | rt_pl_probe)"
+check "pl firmware: the in-use image (8.5 fixture)" "8.5.5 build 5824" \
+  "$(flat_pl '{"stat":"ok","response":{"1":{"version":"8.5.4 build 5700","bootable":true,"inUse":false},"2":{"version":"8.5.5 build 5824","bootable":true,"inUse":true},"order":[1,2]}}' | rt_pl_firmware)"
+check "pl firmware: the LIVE Balance One answer, verbatim (172.31.0.1, 2026-09-13)" "8.5.5 build 5824" "$(flat_pl "$RT_PL_FW_LIVE" | rt_pl_firmware)"
+check "pl firmware: no image in use is nothing" "" "$(flat_pl '{"stat":"ok","response":{"order":[]}}' | rt_pl_firmware)"
+s=$(flat_pl '{"stat":"ok","response":{"1":{"name":"WAN 1","type":"ethernet","message":"Connected","statusLed":"green","ip":"10.0.0.5"},"2":{"name":"Cellular","type":"cellular","message":"Disconnected","statusLed":"red"},"order":[1,2]}}' | rt_pl_status)
+check "pl wan: the active uplink, classified" "wired 1 10.0.0.5" "$(line "$s" w.wan) $(line "$s" w.up) $(line "$s" w.ip)"
+check "pl wan: cellular is lte" "lte" "$(flat_pl '{"response":{"1":{"type":"cellular","message":"Connected","statusLed":"green"}},"stat":"ok"}' | rt_pl_status | awk -F'\t' '$1=="w.wan"{print $2}')"
+check "pl wan: wifi is repeater" "repeater" "$(flat_pl '{"stat":"ok","response":{"1":{"type":"wifi","statusLed":"green"}}}' | rt_pl_status | awk -F'\t' '$1=="w.wan"{print $2}')"
+check "pl wan: nothing up is none" "none" "$(flat_pl '{"stat":"ok","response":{"1":{"type":"cellular","statusLed":"red"}}}' | rt_pl_status | awk -F'\t' '$1=="w.wan"{print $2}')"
+s=$(flat_pl '{"stat":"ok","response":{"1":{"type":"ethernet","statusLed":"green"},"2":{"type":"cellular","message":"Connected","statusLed":"green","ip":"100.64.1.2","cellular":{"simStatus":"SIM card is ready","carrier":"T-Mobile","dataTechnology":"LTE","signal":{"rssi":-70,"rsrp":-95,"sinr":9}}}}}' | rt_pl_status)
+check "pl modem: the nested cellular block" "ok|T-Mobile|LTE|-70|-95||9|1|100.64.1.2|" \
+  "$(for k in sim carrier mode rssi rsrp rsrq sinr connected ip txBytes; do printf '%s|' "$(line "$s" "m.$k")"; done | sed 's/|$//')"
+check "pl modem: no SIM" "missing" "$(flat_pl '{"stat":"ok","response":{"1":{"cellular":{"simStatus":"No SIM card detected"}}}}' | rt_pl_status | awk -F'\t' '$1=="m.sim"{print $2}')"
+check "pl modem: none on a model with no modem (a Balance One)" "" "$(flat_pl '{"stat":"ok","response":{"1":{"type":"ethernet","statusLed":"green"}}}' | rt_pl_status | grep '^m\.')"
+s=$(flat_pl '{"stat":"ok","response":{"gps":true,"location":{"latitude":37.8044,"longitude":-122.2712}}}' | rt_pl_gps)
+check "pl gps: the gps flag beside the fix" "1 37.8044 -122.2712" "$(line "$s" gpsEnabled) $(line "$s" f.lat) $(line "$s" f.lon)"
+check "pl gps: no hardware is gps off, no fix" "gpsEnabled	0" "$(flat_pl '{"stat":"ok","response":{"gps":false}}' | rt_pl_gps)"
+check "pl base: https unless :80" "https://192.168.50.1 https://192.168.50.1 http://192.168.50.1 https://192.168.50.1:8443" \
+  "$(rt_pl_base 192.168.50.1 0) $(rt_pl_base 192.168.50.1 443) $(rt_pl_base 192.168.50.1 80) $(rt_pl_base 192.168.50.1 8443)"
+
+s=$( { flat_cp "$RT_BENCH" | rt_cp_status; printf 'p._\t1\np.model\tCBA850\np.firmware\t7.0.50\n'; } | HUB_LITE_VERSION=0.16.0 rt_params 512)
+check "measurement: the daemon's modem_params names and order (= push_modem's)" \
+  "up=1&mode=LTE&rssi=-71&rsrp=-101&sinr=7.4&rsrq=-12&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-0.16.0&wanKb_cellular=512" "$s"
+s=$(flat_pl '{"stat":"ok","response":{"1":{"type":"cellular","statusLed":"green","ip":"100.64.1.2","cellular":{"simStatus":"ready","carrier":"T-Mobile","dataTechnology":"LTE","signal":{"rsrp":-95,"sinr":9}}}}}' | rt_pl_status | { cat; printf 'p._\t1\np.firmware\t8.5.5 build 5824\n'; } | HUB_LITE_VERSION=0.16.0 rt_params "")
+check "measurement: vendor-blind — a Peplink has no counters, so no dataMb, and a spaced fw is encoded" \
+  "up=1&mode=LTE&rsrp=-95&sinr=9&carrier=T-Mobile&sim=ok&wan=lte&ip=100.64.1.2&fw=8.5.5%20build%205824&av=hub-lite-0.16.0" "$s"
+check "measurement: nothing to report without a modem" "" "$(printf 'w.wan\twired\n' | rt_params "")"
+check "kb delta: none on the first sample" "" "$(rt_kb_delta "" "10 10")"
+check "kb delta: KB since the last poll" "3" "$(rt_kb_delta "1024 2048" "2048 4096")"
+check "kb delta: a counter reset is never charged" "" "$(rt_kb_delta "5000 5000" "10 10")"
+check "read scrub: secrets blanked, objects under secret-looking keys descended, compact JSON" \
+  '{"system":{"admin":{"password":"•••","username":"admin"}},"wlan":{"radio":[{"bss":[{"ssid":"Boat","wpapsk":"•••","enabled":true}]}]},"vpn":{"ipsec":{"shared_key":"•••"},"sections":[]},"snmp":{"community":"•••"},"nested":{"passwordPolicy":{"min":8}}}' \
+  "$(printf '%s' '{"success":true,"data":{"system":{"admin":{"password":"$1$abc","username":"admin"}},"wlan":{"radio":[{"bss":[{"ssid":"Boat","wpapsk":"hunter2","enabled":true}]}]},"vpn":{"ipsec":{"shared_key":"k"},"sections":[]},"snmp":{"community":"public"},"nested":{"passwordPolicy":{"min":8}}}}' | rt_flat J data)"
+check "flat: escapes decode, a bad document ends in the error line" "a	s	x\"y|	!	" \
+  "$(printf '%s' '{"a":"x\"y"}' | rt_flat | tail -n 1)|$(printf '%s' '{"a":' | rt_flat | tail -n 1)"
+
+echo ""
+echo "# --- managed routers: the door, against a stub router on 127.0.0.1 (real curl, nc) -----------"
+if ! command -v nc >/dev/null 2>&1; then
+  echo "FAIL - routers stub: nc is required for the stub-router tests"; fails=$((fails + 1))
+else
+RP=$(( 20000 + $$ % 20000 ))
+RS="$T/rstub"; mkdir -p "$RS"; echo 0 > "$RS/logins"; printf 'manual\tmw01.VZWSTATIC\n' > "$RS/apn"; : > "$RS/log"
+printf '%s' "$RT_BENCH" > "$RS/devices"
+printf '%s' "$RT_RULES2" | sed 's/"apn_mode":"manual","manual_apn":"mw01.VZWSTATIC"/"apn_mode":"@MODE@","manual_apn":"@APN@"/' > "$RS/rules"
+cat > "$RS/h.sh" <<'STUB'
+#!/bin/sh
+# One HTTP request on stdin → one answer on stdout. A Cradlepoint (admin:s"e\cret) and a Peplink
+# (admin:secret, cookie sessions; the FIRST session is treated as expired, fw 8.5 has no model
+# endpoint) on the same port — their paths do not overlap.
+IFS= read -r rl; rl=$(printf '%s' "$rl" | tr -d '\r'); m=${rl%% *}; p=${rl#* }; p=${p%% *}
+auth=""; cookie=""; len=0
+while IFS= read -r h; do
+  h=$(printf '%s' "$h" | tr -d '\r'); [ -z "$h" ] && break
+  case "$h" in [Aa]uthorization:*) auth=${h#*: } ;; [Cc]ookie:*) cookie=${h#*: } ;; [Cc]ontent-[Ll]ength:*) len=${h#*: } ;; esac
+done
+body=""; [ "$len" -gt 0 ] && body=$(dd bs=1 count="$len" 2>/dev/null)
+printf '%s %s|%s|%s\n' "$m" "$p" "$cookie" "$body" >> "$RS/log"
+hdr=""; code="200 OK"
+good="Basic $(printf 'admin:s"e\\cret' | base64)"
+case "$m $p" in
+  "POST /api/login")
+    case "$body" in
+      '{"username":"admin","password":"secret"}') n=$(( $(cat "$RS/logins") + 1 )); echo "$n" > "$RS/logins"
+        hdr="Set-Cookie: bauth=s$n; Path=/; HttpOnly\r\n"; out='{"stat":"ok","response":{"permission":{"GET":true}}}' ;;
+      *) out='{"stat":"fail","message":"Invalid password"}' ;;
+    esac ;;
+  "GET /api/status.system.info")
+    case "$cookie" in *bauth=s1*|'') out='{"stat":"fail","code":401,"message":"Unauthorized"}' ;; *) out='{"stat":"fail","code":404,"message":"API not found"}' ;; esac ;;
+  "GET /api/status.wan.connection")
+    case "$cookie" in *bauth=s[2-9]*) out='{"stat":"ok","response":{"1":{"name":"WAN 1","type":"ethernet","message":"Connected","statusLed":"green","ip":"10.0.0.2"},"order":[1]}}' ;; *) out='{"stat":"fail","code":401,"message":"Unauthorized"}' ;; esac ;;
+  "GET /api/info.firmware") out='{"stat":"ok","response":{"1":{"version":"8.5.5 build 5824","bootable":true,"inUse":true},"order":[1]}}' ;;
+  "GET /api/info.location") out='{"stat":"ok","response":{"gps":false}}' ;;
+  *)
+    if [ "$auth" != "$good" ]; then code="401 Unauthorized"; out='{"success":false,"reason":"unauthorized"}'
+    else
+      apn_mode=$(cut -f1 "$RS/apn"); apn_name=$(cut -f2 "$RS/apn")
+      case "$m $p" in
+        "GET /api/status/product_info") out='{"success":true,"data":{"product_name":"CBA850","mac0":"00:30:44:aa:bb:cc"}}' ;;
+        "GET /api/status/fw_info") out='{"success":true,"data":{"major_version":7,"minor_version":0,"patch_version":50}}' ;;
+        "GET /api/status/wan/devices") out=$(cat "$RS/devices") ;;
+        "GET /api/config/system/gps/enabled") out='{"success":true,"data":false}' ;;
+        "PUT /api/config/system/gps/enabled") out='{"success":true,"data":true}' ;;
+        "GET /api/status/gps") out='{"success":true,"data":{"fix":{"latitude":{"degree":41,"minute":29,"second":34.52},"longitude":{"degree":-81,"minute":41,"second":39.5},"accuracy":5}}}' ;;
+        "GET /api/config/wan/rules2")
+          out='{"success":true,"data":'$(sed -e "s/@MODE@/$apn_mode/" -e "s/@APN@/$apn_name/" "$RS/rules")'}' ;;
+        "PUT /api/config/wan/rules2/4/modem/manual_apn")
+          v=$(printf '%s' "$body" | sed 's/^data=%22//; s/%22$//'); printf '%s\t%s\n' "$apn_mode" "$v" > "$RS/apn"; out='{"success":true,"data":"ok"}' ;;
+        "PUT /api/config/wan/rules2/4/modem/apn_mode")
+          case "$body" in
+            data=%22manual%22) printf 'manual\t%s\n' "$apn_name" > "$RS/apn"; out='{"success":true,"data":"manual"}' ;;
+            data=%22default%22) printf 'default\t%s\n' "$apn_name" > "$RS/apn"; out='{"success":true,"data":"default"}' ;;
+            *) out='{"success":false,"data":{"apn_mode":"invalid choice"}}' ;;
+          esac ;;
+        "PUT /api/config/wan/rules2/4/modem") out='{"success":false,"data":{"apn_mode":"not a leaf"}}' ;;
+        "PUT /api/control/system") out='{"success":true,"data":null}' ;;
+        "GET /api/config/system/admin") out='{"success":true,"data":{"username":"admin","password":"$1$hash"}}' ;;
+        *) code="404 Not Found"; out='{"success":false,"reason":"no such path"}' ;;
+      esac
+    fi ;;
+esac
+printf "HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %s\r\n${hdr}Connection: close\r\n\r\n%s" "$code" "${#out}" "$out"
+STUB
+rm -f "$RS/fifo"; mkfifo "$RS/fifo"
+( while [ ! -f "$RS/stop" ]; do nc -l 127.0.0.1 "$RP" < "$RS/fifo" | RS="$RS" sh "$RS/h.sh" > "$RS/fifo"; done ) >/dev/null 2>&1 &
+RSTUB_PID=$!
+_w=0; until curl -s -o /dev/null "http://127.0.0.1:$RP/ready" 2>/dev/null || [ "$_w" -ge 50 ]; do sleep 0.1; _w=$((_w + 1)); done
+: > "$RS/log"
+
+# The door with the REAL curl (the CGI shim above answers like a LinkTap gateway) and a routers store
+# of our own; routers.sh is found through BRVG_HUB_LITE_ROUTERS like every other path here.
+RCONF="$T/routers.conf"; RDIR="$T/routers.state"; RLOG="$T/routers.log"; : > "$RLOG"
+rapi() { api "$@" PATH="$PATH" BRVG_HUB_LITE_ROUTERS_CONF="$RCONF" BRVG_ROUTERS_STATE="$RDIR" BRVG_RT_LOG="$RLOG" RT_PL_BASE="http://127.0.0.1:$RP"; }
+CPW='s\"e\\cret'
+r=$(rapi GET /status "")
+check "routers door: /status claims routers when routers.sh is installed and self-tests" "1" "$(body_of "$r" | grep -c '"capabilities":\[[^]]*"routers"')"
+check "routers door: /status lists none yet" "1" "$(body_of "$r" | grep -c '"routers":\[\]')"
+r=$(api GET /status "" BRVG_HUB_LITE_ROUTERS="$T/absent")
+check "routers door: no routers.sh, no routers capability" "0" "$(body_of "$r" | grep -c '"capabilities":\[[^]]*"routers"')"
+r=$(api POST /routers '{"action":"refresh","id":"x"}' BRVG_HUB_LITE_ROUTERS="$T/absent")
+check "routers door: no routers.sh, no route (a 404, like a hub too old to know it)" "404" "$(status_of "$r")"
+r=$(rapi GET /routers "")
+check "routers door: GET lists an empty store" '{"routers":[]}' "$(body_of "$r")"
+r=$(rapi POST /routers '{"action":"refresh","id":"x"}' HTTP_AUTHORIZATION="")
+check "routers door: 401 without the key" "401" "$(status_of "$r")"
+r=$(rapi POST /routers '{"action":')
+check "routers door: a broken body is 422" "422" "$(status_of "$r")"
+r=$(rapi POST /routers '{"action":"probe","vendor":"starlink","host":"192.168.100.1"}')
+check "routers door: no Starlink on a hub-lite (D2)" "422 this hub cannot manage a 'starlink' router yet" "$(status_of "$r") $(body_of "$r" | sed -n 's/.*"error":"\(.*\)"}.*/\1/p')"
+r=$(rapi POST /routers '{"action":"probe","vendor":"cradlepoint","host":"127.0.0.1;reboot","password":"x"}')
+check "routers door: a host that is not a host never reaches curl" "422" "$(status_of "$r")"
+r=$(rapi POST /routers '{"action":"frobnicate"}')
+check "routers door: unknown action" "422" "$(status_of "$r")"
+
+# The door goes through 0.15.1's role-aware authorize (D3), as the daemon's do_routers: refresh/read
+# are control-grade, everything that signs in with an admin credential or changes the store is
+# configure-grade, and listing is any member.
+cp "$T/keys.before" "$T/keys"
+r=$(rapi GET /routers "" HTTP_AUTHORIZATION="Bearer $K_MON")
+check "routers role: a MONITOR key may list" "200" "$(status_of "$r")"
+r=$(rapi POST /routers '{"action":"refresh","id":"brv_net_none"}' HTTP_AUTHORIZATION="Bearer $K_MON")
+check "routers role: a MONITOR key may not refresh (control)" "403" "$(status_of "$r")"
+for a in refresh read; do
+  r=$(rapi POST /routers "{\"action\":\"$a\",\"id\":\"brv_net_none\"}" HTTP_AUTHORIZATION="Bearer $K_CTL")
+  check "routers role: a CONTROL key passes $a (then 404: no such router)" "404" "$(status_of "$r")"
+done
+for a in probe add remove apn gps password reboot; do
+  r=$(rapi POST /routers "{\"action\":\"$a\",\"id\":\"brv_net_none\"}" HTTP_AUTHORIZATION="Bearer $K_CTL")
+  check "routers role: a CONTROL key may not $a (configure)" "403" "$(status_of "$r")"
+done
+r=$(rapi POST /routers '{"action":"remove","id":"brv_net_none"}' HTTP_AUTHORIZATION="Bearer $K_OWN")
+check "routers role: an OWNER key passes configure (then 404)" "404" "$(status_of "$r")"
+rm -f "$T/keys"
+
+: > "$RS/log"
+r=$(rapi POST /routers "{\"action\":\"probe\",\"vendor\":\"cradlepoint\",\"host\":\"127.0.0.1\",\"port\":$RP,\"password\":\"wrong\"}")
+check "cp sign-in REFUSED: 502 with the owner-fixable reason" "502 the router refused the sign-in — check the admin username and password" \
+  "$(status_of "$r") $(body_of "$r" | sed -n 's/.*"error":"\(.*\)"}.*/\1/p')"
+r=$(rapi POST /routers "{\"action\":\"probe\",\"vendor\":\"cradlepoint\",\"host\":\"127.0.0.1\",\"port\":$RP,\"password\":\"$CPW\"}")
+check "cp sign-in: Basic auth with a quote and a backslash in the password, through curl's stdin config" "200" "$(status_of "$r")"
+check "cp probe: the daemon's ProbeBody" \
+  '{"probe":{"model":"CBA850","firmware":"7.0.50","mac":"00:30:44:aa:bb:cc"},"modem":{"sim":"ok","carrier":"Verizon","mode":"LTE","rssi":-71,"rsrp":-101,"rsrq":-12,"sinr":7.4,"connected":true,"ip":"100.64.3.9","txBytes":234567,"rxBytes":1234567},"wan":{"wan":"lte","up":true,"ip":"100.64.3.9"},"gpsEnabled":false,"fix":{"lat":41.49292222,"lon":-81.69430556,"acc":5},"capabilities":["modem","wan","gps","gpsSwitch","apn","reboot","read","signin"]}' \
+  "$(body_of "$r")"
+r=$(rapi POST /routers "{\"action\":\"add\",\"id\":\"brv_net_cp1\",\"vendor\":\"cradlepoint\",\"host\":\"127.0.0.1\",\"port\":$RP,\"password\":\"$CPW\",\"agentToken\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"gpsEnabled\":true,\"gpsDevId\":\"brv_gps_cp1\",\"enabled\":true}")
+check "cp add: proved and stored" "200" "$(status_of "$r")"
+check "cp add: the answer is a RouterStatus with no password and no token in it" "0" "$(body_of "$r" | grep -c 'cret\|aaaaaaaaaaaaaaaa')"
+check "cp add: named from the probe, flags only" '"name":"CBA850","host":"127.0.0.1"' "$(body_of "$r" | grep -o '"name":"CBA850","host":"127.0.0.1"')"
+check "cp add: hasPassword/agentEnrolled/gps" '"hasPassword":true,"agentEnrolled":true,"gpsEnabled":true,"gpsDevId":"brv_gps_cp1","pollSecs":120,"enabled":true' \
+  "$(body_of "$r" | grep -o '"hasPassword".*"enabled":true')"
+check "cp add: the router's GNSS was switched on at the router" "1" "$(grep -c '^PUT /api/config/system/gps/enabled|.*|data=true' "$RS/log")"
+check "cp add: the store is root-only (600)" "600" "$(ls -l "$RCONF" | awk '{ print $1 }' | sed 's/^-rw-------.*/600/')"
+check "cp add: the password never reached the world-readable conf" "0" "$(grep -c 'cret' "$T/conf")"
+check "cp add: the log says what happened and nothing secret" "1 0" "$(grep -c "cradlepoint 'CBA850' at 127.0.0.1 added (gps on)" "$RLOG") $(grep -c 'cret\|aaaaaaaa' "$RLOG")"
+r=$(rapi POST /routers '{"action":"add","id":"brv_net_cp2","host":"127.0.0.1","gpsEnabled":true,"password":"x"}')
+check "cp add: gps on needs the brv_gps_ record" "422" "$(status_of "$r")"
+r=$(rapi POST /routers '{"action":"add","id":"brv_net_cp2","host":"127.0.0.1"}')
+check "cp add: a new router needs its admin password" "422 the router's admin password is required" "$(status_of "$r") $(body_of "$r" | sed -n 's/.*"error":"\(.*\)"}.*/\1/p')"
+r=$(rapi GET /status "")
+check "routers door: /status and GET agree, and neither carries a secret" "1 0" "$(body_of "$r" | grep -c '"routers":\[{"id":"brv_net_cp1"') $(body_of "$r" | grep -c 'cret\|aaaaaaaa')"
+
+: > "$RS/log"
+r=$(rapi POST /routers '{"action":"apn","id":"brv_net_cp1"}')
+check "cp apn read: rule 4's manual static APN" '200 {"mode":"manual","apn":"mw01.VZWSTATIC"}' "$(status_of "$r") $(body_of "$r")"
+: > "$RS/log"
+r=$(rapi POST /routers '{"action":"apn","id":"brv_net_cp1","mode":"manual","apn":"vzwinternet"}')
+check "cp apn manual: the answer is what the router now holds" '200 {"mode":"manual","apn":"vzwinternet"}' "$(status_of "$r") $(body_of "$r")"
+check "cp apn manual: one PUT per LEAF, name FIRST, never the modem object" \
+  "PUT /api/config/wan/rules2/4/modem/manual_apn data=%22vzwinternet%22,PUT /api/config/wan/rules2/4/modem/apn_mode data=%22manual%22" \
+  "$(grep '^PUT' "$RS/log" | awk -F'|' '{ print $1 " " $3 }' | paste -sd, -)"
+: > "$RS/log"
+r=$(rapi POST /routers '{"action":"apn","id":"brv_net_cp1","mode":"auto"}')
+check "cp apn auto: written as NCOS's default, answered as auto" '200 {"mode":"auto"} PUT /api/config/wan/rules2/4/modem/apn_mode data=%22default%22' \
+  "$(status_of "$r") $(body_of "$r") $(grep '^PUT' "$RS/log" | awk -F'|' '{ print $1 " " $3 }' | paste -sd, -)"
+r=$(rapi POST /routers '{"action":"apn","id":"brv_net_cp1","mode":"manual","apn":"  "}')
+check "cp apn manual: no name is refused before any write" "502 0" "$(status_of "$r") $(grep -c 'manual_apn.*data=%22%20' "$RS/log")"
+r=$(rapi POST /routers '{"action":"apn","id":"brv_net_cp1","mode":"sideways"}')
+check "cp apn: mode must be auto or manual" "422" "$(status_of "$r")"
+r=$(rapi POST /routers '{"action":"read","id":"brv_net_cp1","path":"/api/config/system/admin"}')
+check "cp read: scrubbed" '{"path":"/api/config/system/admin","data":{"username":"admin","password":"•••"}}' "$(body_of "$r")"
+r=$(rapi POST /routers '{"action":"read","id":"brv_net_cp1","path":"/api/control/system"}')
+check "cp read: a control path is refused" "422" "$(status_of "$r")"
+r=$(rapi POST /routers '{"action":"read","id":"brv_net_cp1","path":"/api/config/../control/system"}')
+check "cp read: traversal is refused" "422" "$(status_of "$r")"
+r=$(rapi POST /routers '{"action":"refresh","id":"brv_net_cp1"}')
+check "cp refresh: state carries modem/wan/fix and the apn last read" "1 1 1" \
+  "$(body_of "$r" | grep -c '"state":{"atMs":[0-9]*,"okAtMs":[0-9]*,"probe":{"model":"CBA850"') $(body_of "$r" | grep -c '"fix":{"lat":41.49292222') $(body_of "$r" | grep -c '"apn":{"mode":"auto"}')"
+r=$(rapi POST /routers '{"action":"refresh","id":"nope"}')
+check "cp refresh: unknown id is 404" "404" "$(status_of "$r")"
+r=$(rapi POST /routers '{"action":"password","id":"brv_net_cp1","password":"wrong"}')
+check "cp password: a new credential is PROVED first — a wrong one is 502 and the stored one survives" "502 1" \
+  "$(status_of "$r") $(grep -c 's"e\\cret' "$RCONF")"
+r=$(rapi POST /routers '{"action":"reboot","id":"brv_net_cp1"}')
+check "cp reboot" '200 {"ok":true}' "$(status_of "$r") $(body_of "$r")"
+
+# Reporting: as the ROUTER through send_event, the fix as the brv_gps_ device through the spool —
+# and a command queued for the router in the reply never runs on this hub-lite.
+: > "$T/rt.urls"; : > "$T/rt.ran"; rm -f "$T/rt.spool"
+(
+  # The REAL send_event, not the recorder the anchor tests above left in this shell.
+  # shellcheck disable=SC1091
+  . "$HL_DIR/brvg-hub-lite.sh"
+  BRVG_HUB_LITE_ROUTERS_CONF="$RCONF"; RT_CONF="$RCONF"; RT_DIR="$RDIR"; BRVG_RT_LOG="$RLOG"; BRVG_RELAY_SPOOL="$T/rt.spool"
+  VID=v_test; WORKER_URL=https://api.example.test; DEVICE_ID=brv_net_hublite; DEVICE_TOKEN=hubtok_0123456789abcdef; PENDING_ACK=""
+  curl() { if [ "$1" = "-K" ]; then command curl "$@"; else eval "echo \"\${$#}\"" >> "$T/rt.urls"; printf '%s' '{"commands":[{"id":"c9","cmd":"reboot"}]}'; fi; }
+  run_commands() { echo "RAN $1" >> "$T/rt.ran"; }
+  rm -f "$RDIR/brv_net_cp1.ctr"
+  ( rt_load brv_net_cp1 && rt_poll_report )
+  ( rt_load brv_net_cp1 && rt_poll_report )
+  echo "$DEVICE_ID $DEVICE_TOKEN ack=$PENDING_ACK" > "$T/rt.after"
+)
+check "report: modem.measurement goes AS the router, with the router's own token" "2" \
+  "$(grep -c '^https://api.example.test/api/agent?vid=v_test&device=brv_net_cp1&event=modem.measurement&t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&up=1&mode=LTE&rssi=-71&rsrp=-101&sinr=7.4&rsrq=-12&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-' "$T/rt.urls")"
+check "report: a command queued for the ROUTER never runs on the hub-lite" "0" "$(wc -l < "$T/rt.ran" | tr -d ' ')"
+check "report: the hub-lite's own identity and ack list are untouched" "brv_net_hublite hubtok_0123456789abcdef ack=" "$(cat "$T/rt.after")"
+check "report: the first poll has no plan-burn baseline, the second a zero delta sends none" "0" "$(grep -c wanKb_cellular "$T/rt.urls")"
+check "report: the fix is spooled as the brv_gps_ device" "brv_gps_cp1	gps.measurement	lat=41.492922&lon=-81.694306&acc=5.0" "$(head -n 1 "$T/rt.spool" | cut -f2-)"
+check "report: the loop is asked to drain" "yes" "$([ -f "$RDIR/drain" ] && echo yes || echo no)"
+check "report: no secret in any log line" "0" "$(grep -c 'cret\|aaaaaaaa' "$RLOG")"
+
+# The loop hook: a due router is read in the BACKGROUND (never stalling the valve loop), once.
+(
+  RT_CONF="$RCONF"; RT_DIR="$RDIR"; BRVG_RT_LOG="$RLOG"; BRVG_RELAY_SPOOL="$T/rt.spool"; VID=v_test; WORKER_URL=https://api.example.test
+  curl() { if [ "$1" = "-K" ]; then command curl "$@"; else printf '{}'; fi; }
+  drain_relay() { echo drained > "$T/rt.drained"; }
+  rm -f "$RDIR"/*.due "$RDIR"/*.pid "$T/rt.drained"; : > "$RDIR/drain"
+  rt_tick
+  _p=$(cat "$RDIR/brv_net_cp1.pid"); _n=0
+  while kill -0 "$_p" 2>/dev/null && [ "$_n" -lt 100 ]; do sleep 0.1; _n=$((_n + 1)); done
+  _d1=$(cat "$RDIR/brv_net_cp1.due")
+  rt_tick
+  echo "$(cat "$T/rt.drained" 2>/dev/null) $([ "$_d1" -gt "$(date +%s)" ] && echo due-later) $([ "$(cat "$RDIR/brv_net_cp1.due")" = "$_d1" ] && echo not-repolled)" > "$T/rt.tick"
+)
+check "tick: drains when asked, schedules by due time, does not re-poll early" "drained due-later not-repolled" "$(cat "$T/rt.tick")"
+
+: > "$RS/log"
+r=$(rapi POST /routers '{"action":"apn","id":"brv_net_pl1"}')
+check "pl: unknown id before vendor rules" "404" "$(status_of "$r")"
+r=$(rapi POST /routers "{\"action\":\"add\",\"id\":\"brv_net_pl1\",\"vendor\":\"peplink\",\"host\":\"127.0.0.1\",\"port\":$RP,\"username\":\"admin\",\"password\":\"wrong\"}")
+check "pl sign-in REFUSED: the router's own reason, the credential nowhere" "502 the router refused the sign-in — Invalid password" \
+  "$(status_of "$r") $(body_of "$r" | sed -n 's/.*"error":"\(.*\)"}.*/\1/p')"
+echo 0 > "$RS/logins"; : > "$RS/log"
+r=$(rapi POST /routers "{\"action\":\"add\",\"id\":\"brv_net_pl1\",\"vendor\":\"peplink\",\"host\":\"127.0.0.1\",\"port\":$RP,\"username\":\"admin\",\"password\":\"secret\"}")
+check "pl add: fw 8.5 with no model endpoint still probes (#146)" "200" "$(status_of "$r")"
+check "pl add: one re-login for the expired first session, then the cookie is kept" "2" "$(cat "$RS/logins")"
+check "pl add: the session cookie rides every read after sign-in" "0" "$(grep '^GET' "$RS/log" | grep -vc '|bauth=s')"
+check "pl add: firmware from info.firmware, named Router, Peplink capabilities" '"name":"Router"|"firmware":"8.5.5 build 5824"|"capabilities":["modem","wan","gps","signin"]' \
+  "$(body_of "$r" | grep -o '"name":"Router"')|$(body_of "$r" | grep -o '"firmware":"8.5.5 build 5824"')|$(body_of "$r" | grep -o '"capabilities":\[[^]]*\]')"
+for a in apn reboot read; do
+  : > "$RS/log"
+  r=$(rapi POST /routers "{\"action\":\"$a\",\"id\":\"brv_net_pl1\"}")
+  check "pl $a: refused as unsupported BEFORE any sign-in" "422 0" "$(status_of "$r") $(wc -l < "$RS/log" | tr -d ' ')"
+done
+check "pl apn: the daemon's wording" "reading or setting the APN is not supported on a Peplink through the hub — use the device's own app or admin pages" \
+  "$(body_of "$(rapi POST /routers '{"action":"apn","id":"brv_net_pl1"}')" | sed -n 's/.*"error":"\(.*\)"}.*/\1/p')"
+: > "$RS/log"
+r=$(rapi POST /routers '{"action":"gps","id":"brv_net_pl1","gpsEnabled":true,"gpsDevId":"brv_gps_pl1"}')
+check "pl gps: hub-side only — no request reaches the router" "200 0" "$(status_of "$r") $(wc -l < "$RS/log" | tr -d ' ')"
+r=$(rapi POST /routers '{"action":"remove","id":"brv_net_pl1"}')
+check "remove" '200 {"ok":true}' "$(status_of "$r") $(body_of "$r")"
+check "remove: gone from the store, and its state with it" "0 0" "$(grep -c '^brv_net_pl1' "$RCONF") $(ls "$RDIR" | grep -c '^brv_net_pl1\.')"
+r=$(rapi POST /routers '{"action":"remove","id":"brv_net_pl1"}')
+check "remove: twice is 404" "404" "$(status_of "$r")"
+: > "$T/keepme.snap"
+r=$(rapi POST /routers '{"action":"remove","id":"../keepme"}')
+check "remove: an id that is a path never reaches rm" "422 yes" "$(status_of "$r") $([ -f "$T/keepme.snap" ] && echo yes || echo no)"
+
+touch "$RS/stop"; curl -s -o /dev/null "http://127.0.0.1:$RP/stop" 2>/dev/null; kill "$RSTUB_PID" 2>/dev/null; wait "$RSTUB_PID" 2>/dev/null
+fi
 
 [ -n "${KEEP_T:-}" ] && echo "T=$T" || rm -rf "$T"
 
@@ -1431,7 +1794,7 @@ if [ -z "${BRVG_STRIPPED_RUN:-}" ]; then
   _sd=$(mktemp -d)
   mkdir -p "$_sd/package"
   _parse_ok=1
-  for _f in brvg-hub-lite.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh; do
+  for _f in brvg-hub-lite.sh routers.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh; do
     sh "$HL_SRC/package/strip-comments.sh" "$HL_SRC/$_f" "$_sd/$_f"
     sh -n "$_sd/$_f" || _parse_ok=0
   done
