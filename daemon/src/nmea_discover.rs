@@ -35,6 +35,13 @@ pub const TCP_READ_WINDOW: Duration = Duration::from_millis(2500);
 pub const TCP_DEADLINE: Duration = Duration::from_millis(11_500);
 /// Parallel TCP connects. ~1000 targets per /24 at 128 wide and 400 ms each is ~3 s worst case.
 pub const TCP_CONCURRENCY: usize = 128;
+/// Pass 2 (see `discover`): a patient retry of only the hosts the LAN says are alive. 1.5 s covers
+/// Windows' behaviour of dropping the first SYN to a host whose ARP entry is still being resolved
+/// and resending it about a second later — which a 400 ms pass-1 timeout never waits for.
+pub const TCP_RETRY_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+pub const TCP_RETRY_CONCURRENCY: usize = 16;
+/// Pass 1 is cut off here so pass 2 always has time left inside TCP_DEADLINE.
+pub const TCP_SWEEP_DEADLINE: Duration = Duration::from_millis(4_000);
 /// Text kept per source; enough for every sentence type a feed sends in a few seconds.
 const MAX_TEXT: usize = 64 * 1024;
 
@@ -211,7 +218,7 @@ pub async fn listen_udp(ports: &[u16], window: Duration) -> (Vec<NmeaSource>, Ve
             Ok(sock) => {
                 set.spawn(async move { listen_one(sock, port, window).await });
             }
-            Err(e) => skipped.push(Skipped { protocol: "udp".into(), port, error: e.to_string() }),
+            Err(e) => skipped.push(Skipped { protocol: "udp".into(), port, error: udp_bind_error(&e) }),
         }
     }
     let mut datagrams: Vec<(String, u16, String)> = Vec::new();
@@ -221,6 +228,21 @@ pub async fn listen_udp(ports: &[u16], window: Duration) -> (Vec<NmeaSource>, Ve
         }
     }
     (group_datagrams(&datagrams), skipped)
+}
+
+/// Say what a refused UDP bind usually MEANS. Windows answers WSAEACCES (10013) when another program
+/// holds the port exclusively — on the boat PC that is the chart plotter (TimeZero on CENTRAL,
+/// 2026-09-13). The raw text alone ("forbidden by its access permissions") reads like a hub fault.
+pub fn udp_bind_error(e: &std::io::Error) -> String {
+    let in_use = e.kind() == std::io::ErrorKind::AddrInUse
+        || e.kind() == std::io::ErrorKind::PermissionDenied
+        || e.raw_os_error() == Some(10013)
+        || e.raw_os_error() == Some(10048);
+    if in_use {
+        format!("another program on this computer holds this port (a chart plotter?) — its TCP feed can still be found ({e})")
+    } else {
+        e.to_string()
+    }
 }
 
 async fn listen_one(sock: tokio::net::UdpSocket, port: u16, window: Duration) -> Vec<(String, u16, String)> {
@@ -255,22 +277,37 @@ pub async fn probe_tcp(
     deadline: tokio::time::Instant,
     concurrency: usize,
 ) -> Vec<NmeaSource> {
+    probe_tcp_pass(targets, connect_timeout, read_window, deadline, concurrency).await.0
+}
+
+/// One pass: the sources heard, and the targets whose connect TIMED OUT (or never got a turn
+/// before `deadline`) — the only ones a slower retry could still find something on.
+async fn probe_tcp_pass(
+    targets: Vec<(String, u16)>,
+    connect_timeout: Duration,
+    read_window: Duration,
+    deadline: tokio::time::Instant,
+    concurrency: usize,
+) -> (Vec<NmeaSource>, Vec<(String, u16)>) {
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
     let mut set = tokio::task::JoinSet::new();
     for (host, port) in targets {
         let sem = sem.clone();
         set.spawn(async move {
-            let _permit = sem.acquire_owned().await.ok()?;
+            let Ok(_permit) = sem.acquire_owned().await else { return (host, port, Probe::TimedOut) };
             if tokio::time::Instant::now() + connect_timeout > deadline {
-                return None;
+                return (host, port, Probe::TimedOut);
             }
-            probe_one(&host, port, connect_timeout, read_window, deadline).await
+            let outcome = probe_one(&host, port, connect_timeout, read_window, deadline).await;
+            (host, port, outcome)
         });
     }
     let mut found = Vec::new();
+    let mut timed_out = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, set.join_next()).await {
-            Ok(Some(Ok(Some(s)))) => found.push(s),
+            Ok(Some(Ok((_, _, Probe::Heard(Some(s)))))) => found.push(s),
+            Ok(Some(Ok((host, port, Probe::TimedOut)))) => timed_out.push((host, port)),
             Ok(Some(_)) => continue,
             Ok(None) => break,
             Err(_) => {
@@ -279,7 +316,90 @@ pub async fn probe_tcp(
             }
         }
     }
-    found
+    (found, timed_out)
+}
+
+/// PURE: IPv4 addresses the OS neighbour (ARP) table holds as RESOLVED, from `arp -a` / `arp -an`
+/// output (Windows and macOS/BSD) or `/proc/net/arp` (Linux). Incomplete entries, broadcast,
+/// multicast and all-zero MACs are dropped — they are not hosts that answered.
+pub fn parse_neighbors(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("incomplete") {
+            continue;
+        }
+        let ip = line
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .find(|t| t.parse::<std::net::Ipv4Addr>().is_ok());
+        let Some(ip) = ip else { continue };
+        let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() else { continue };
+        if addr.is_multicast() || addr.is_broadcast() || addr.octets()[3] == 255 || addr.octets()[3] == 0 {
+            continue;
+        }
+        // A real MAC on the line: six hex groups separated by ':' or '-', not all zero / all ff.
+        let mac = lower
+            .split_whitespace()
+            .find(|t| {
+                let parts: Vec<&str> = t.split([':', '-']).collect();
+                parts.len() == 6 && parts.iter().all(|p| !p.is_empty() && p.len() <= 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+            })
+            .map(|t| t.replace('-', ":"));
+        let Some(mac) = mac else { continue };
+        if mac.split(':').all(|p| p.trim_start_matches('0').is_empty()) || mac.split(':').all(|p| p == "ff") {
+            continue;
+        }
+        let ip = addr.to_string();
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+/// PURE: the pass-2 targets — pass-1 timeouts on hosts the LAN says are alive (neighbour table, or a
+/// host we heard any datagram from), known NMEA senders first.
+pub fn retry_targets(timed_out: &[(String, u16)], alive: &[String], senders: &[String]) -> Vec<(String, u16)> {
+    let mut picked: Vec<(String, u16)> = timed_out
+        .iter()
+        .filter(|(h, _)| alive.contains(h) || senders.contains(h))
+        .cloned()
+        .collect();
+    picked.sort_by_key(|(h, p)| (!senders.contains(h), h.clone(), *p));
+    picked.dedup();
+    picked
+}
+
+/// The OS neighbour table, read the way each platform exposes it. Best-effort: an empty list only
+/// means pass 2 falls back to the hosts heard over UDP.
+async fn neighbor_ipv4s() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(t) = tokio::fs::read_to_string("/proc/net/arp").await {
+            return parse_neighbors(&t);
+        }
+    }
+    let args: &[&str] = if cfg!(windows) { &["-a"] } else { &["-an"] };
+    let mut cmd = tokio::process::Command::new("arp");
+    cmd.args(args).kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        // No console window flashing up on the boat PC for a background read.
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match tokio::time::timeout(Duration::from_millis(1500), cmd.output()).await {
+        Ok(Ok(out)) => parse_neighbors(&String::from_utf8_lossy(&out.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// What one connect attempt learned. Only `TimedOut` is worth a patient second try: a refusal is a
+/// live host with nothing on that port, and `Heard` already read what there was.
+#[derive(Debug)]
+enum Probe {
+    Heard(Option<NmeaSource>),
+    Refused,
+    TimedOut,
 }
 
 async fn probe_one(
@@ -288,12 +408,14 @@ async fn probe_one(
     connect_timeout: Duration,
     read_window: Duration,
     deadline: tokio::time::Instant,
-) -> Option<NmeaSource> {
+) -> Probe {
     use tokio::io::AsyncReadExt;
-    let mut stream = tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect((host, port)))
-        .await
-        .ok()?
-        .ok()?;
+    let mut stream = match tokio::time::timeout(connect_timeout, tokio::net::TcpStream::connect((host, port))).await {
+        Err(_) => return Probe::TimedOut,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::TimedOut => return Probe::TimedOut,
+        Ok(Err(_)) => return Probe::Refused,
+        Ok(Ok(s)) => s,
+    };
     let stop = std::cmp::min(tokio::time::Instant::now() + read_window, deadline);
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 2048];
@@ -304,7 +426,7 @@ async fn probe_one(
         }
     }
     let text = String::from_utf8_lossy(&buf);
-    summarize("tcp", host, port, crate::gps::complete_lines(&text))
+    Probe::Heard(summarize("tcp", host, port, crate::gps::complete_lines(&text)))
 }
 
 /// The endpoint's work: UDP listen and TCP probe at once, results ordered, all within ~12 s.
@@ -318,11 +440,30 @@ pub async fn discover() -> DiscoverBody {
         UDP_WINDOW.as_secs(),
         targets.len()
     );
-    let ((udp, skipped), tcp) = tokio::join!(
-        listen_udp(&UDP_PORTS, UDP_WINDOW),
-        probe_tcp(targets, TCP_CONNECT_TIMEOUT, TCP_READ_WINDOW, start + TCP_DEADLINE, TCP_CONCURRENCY),
-    );
+    let tcp_two_pass = async {
+        // Pass 1: the fast sweep. Besides finding quick hosts it makes the OS resolve every live
+        // neighbour, which is what lets pass 2 be small.
+        let (mut found, timed_out) =
+            probe_tcp_pass(targets, TCP_CONNECT_TIMEOUT, TCP_READ_WINDOW, start + TCP_SWEEP_DEADLINE, TCP_CONCURRENCY).await;
+        // Pass 2: patient retries, only on hosts that exist. CENTRAL (Windows) missed a Digital
+        // Yacht Nemo serving NMEA on TCP 10110 on 2026-09-13 with pass 1 alone; this Mac found it.
+        let alive = neighbor_ipv4s().await;
+        let have: Vec<(String, u16)> = found.iter().map(|s| (s.host.clone(), s.port)).collect();
+        let retry: Vec<(String, u16)> = retry_targets(&timed_out, &alive, &[])
+            .into_iter()
+            .filter(|t| !have.contains(t))
+            .collect();
+        let retried = retry.len();
+        let (more, _) =
+            probe_tcp_pass(retry, TCP_RETRY_CONNECT_TIMEOUT, TCP_READ_WINDOW, start + TCP_DEADLINE, TCP_RETRY_CONCURRENCY).await;
+        found.extend(more);
+        (found, alive.len(), retried)
+    };
+    let ((udp, skipped), (tcp, alive, retried)) = tokio::join!(listen_udp(&UDP_PORTS, UDP_WINDOW), tcp_two_pass);
+    crate::hlog!("nmea discovery: {alive} live neighbour(s), {retried} slow TCP target(s) retried");
     let mut sources = udp;
+    // A feed heard on BOTH transports from the same host:port is listed once per transport — the
+    // owner picks; TCP is the one that coexists with a chart plotter holding the UDP port.
     sources.extend(tcp);
     order_sources(&mut sources);
     crate::hlog!(
@@ -557,5 +698,110 @@ mod tests {
     fn free_tcp_port() -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
+    }
+}
+
+#[cfg(test)]
+mod two_pass {
+    use super::*;
+
+    #[test]
+    fn windows_arp_a_output_yields_resolved_hosts_only() {
+        let t = "\r\nInterface: 172.31.0.105 --- 0x7\r\n  Internet Address      Physical Address      Type\r\n  172.31.0.1            00-1a-dd-c2-11-02     dynamic   \r\n  172.31.0.112          04-79-b7-f2-18-b8     dynamic   \r\n  172.31.0.255          ff-ff-ff-ff-ff-ff     static    \r\n  224.0.0.22            01-00-5e-00-00-16     static    \r\n  239.255.255.250       01-00-5e-7f-ff-fa     static    \r\n";
+        assert_eq!(parse_neighbors(t), vec!["172.31.0.1".to_string(), "172.31.0.112".to_string()]);
+    }
+
+    #[test]
+    fn macos_arp_an_and_linux_proc_net_arp() {
+        let mac = "? (172.31.0.112) at 4:79:b7:f2:18:b8 on en0 ifscope [ethernet]\n? (172.31.0.9) at (incomplete) on en0 ifscope [ethernet]\n? (172.31.0.255) at ff:ff:ff:ff:ff:ff on en0 ifscope [ethernet]\n";
+        assert_eq!(parse_neighbors(mac), vec!["172.31.0.112".to_string()]);
+        let linux = "IP address       HW type     Flags       HW address            Mask     Device\n192.168.8.20     0x1         0x2         aa:bb:cc:dd:ee:01     *        br-lan\n192.168.8.21     0x1         0x0         00:00:00:00:00:00     *        br-lan\n";
+        assert_eq!(parse_neighbors(linux), vec!["192.168.8.20".to_string()]);
+    }
+
+    #[test]
+    fn retry_takes_only_live_timeouts_senders_first() {
+        let timed_out = vec![
+            ("172.31.0.50".to_string(), 10110), ("172.31.0.112".to_string(), 10110),
+            ("172.31.0.112".to_string(), 2000), ("172.31.0.200".to_string(), 10110),
+        ];
+        let alive = vec!["172.31.0.112".to_string(), "172.31.0.200".to_string()];
+        let senders = vec!["172.31.0.200".to_string()];
+        assert_eq!(retry_targets(&timed_out, &alive, &senders), vec![
+            ("172.31.0.200".to_string(), 10110),
+            ("172.31.0.112".to_string(), 2000), ("172.31.0.112".to_string(), 10110),
+        ]);
+        assert!(retry_targets(&timed_out, &[], &[]).is_empty(), "a host nothing says is alive is not retried");
+    }
+
+    #[test]
+    fn a_port_held_by_another_program_says_so() {
+        let e = std::io::Error::from_raw_os_error(if cfg!(windows) { 10013 } else { 98 });
+        let _ = e; // raw codes differ per OS; the kind path is what unix exercises
+        let in_use = std::io::Error::new(std::io::ErrorKind::AddrInUse, "Address already in use");
+        assert!(udp_bind_error(&in_use).contains("another program"));
+        let other = std::io::Error::new(std::io::ErrorKind::Other, "boom");
+        assert_eq!(udp_bind_error(&other), "boom");
+    }
+
+    #[tokio::test]
+    async fn the_retry_pass_reads_a_feed_on_a_host_the_sweep_timed_out_on() {
+        use tokio::io::AsyncWriteExt;
+        // Loopback accepts instantly, so a real sweep timeout cannot be staged here; the sweep's
+        // verdict is supplied directly and the test proves the retry pass reads the feed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = {
+            let s = "GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W";
+            let cs = s.bytes().fold(0u8, |a, b| a ^ b);
+            format!("${s}*{cs:02X}\r\n")
+        };
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    for _ in 0..20 { if sock.write_all(body.as_bytes()).await.is_err() { break; } tokio::time::sleep(Duration::from_millis(100)).await; }
+                });
+            }
+        });
+        let timed_out = vec![("127.0.0.1".to_string(), port)];
+        let retry = retry_targets(&timed_out, &["127.0.0.1".to_string()], &[]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (found, _) = probe_tcp_pass(retry, TCP_RETRY_CONNECT_TIMEOUT, Duration::from_millis(800), deadline, TCP_RETRY_CONCURRENCY).await;
+        assert_eq!(found.len(), 1);
+        assert!(found[0].fix.is_some());
+    }
+}
+
+#[cfg(test)]
+mod live_lan {
+    /// Real-network check, run by hand on a boat LAN: `NMEA_LIVE=1 cargo test --lib live_lan -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn discover_on_this_lan() {
+        if std::env::var("NMEA_LIVE").is_err() { return; }
+        let own = crate::linktap_discover::local_ipv4s();
+        let t0 = std::time::Instant::now();
+        let body = super::discover().await;
+        eprintln!("own={own:?} elapsed={:?}", t0.elapsed());
+        for s in &body.sources { eprintln!("{} {}:{} fix={:?} {:?}", s.protocol, s.host, s.port, s.fix, s.sentences); }
+        eprintln!("skipped={:?}", body.skipped.iter().map(|k| (k.port, k.error.clone())).collect::<Vec<_>>());
+    }
+    /// Same, but the sweep is given a 1 ms connect timeout so every host times out and ONLY the
+    /// neighbour-table retry can find anything — the CENTRAL failure, reproduced on purpose.
+    #[tokio::test]
+    #[ignore]
+    async fn retry_alone_finds_the_feed_on_this_lan() {
+        if std::env::var("NMEA_LIVE").is_err() { return; }
+        let own = crate::linktap_discover::local_ipv4s();
+        let targets = super::tcp_targets(&own, &super::TCP_PORTS);
+        let start = tokio::time::Instant::now();
+        let (found1, timed_out) = super::probe_tcp_pass(targets, std::time::Duration::from_millis(1), super::TCP_READ_WINDOW, start + super::TCP_SWEEP_DEADLINE, super::TCP_CONCURRENCY).await;
+        let alive = super::neighbor_ipv4s().await;
+        let retry = super::retry_targets(&timed_out, &alive, &[]);
+        let (found2, _) = super::probe_tcp_pass(retry.clone(), super::TCP_RETRY_CONNECT_TIMEOUT, super::TCP_READ_WINDOW, start + super::TCP_DEADLINE, super::TCP_RETRY_CONCURRENCY).await;
+        eprintln!("sweep found {} | timed out {} | alive {} | retried {} | retry found {:?} in {:?}", found1.len(), timed_out.len(), alive.len(), retry.len(), found2.iter().map(|s| format!("{}:{} fix={}", s.host, s.port, s.fix.is_some())).collect::<Vec<_>>(), start.elapsed());
+        assert!(found2.iter().any(|s| s.fix.is_some()));
     }
 }
