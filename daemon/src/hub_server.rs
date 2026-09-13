@@ -380,6 +380,7 @@ pub fn router(rt: Shared) -> Router {
         .route("/api/hub/update", post(h_update))
         .route("/api/hub/linktap/valve", post(h_valve))
         .route("/api/hub/gps", post(h_gps))
+        .route("/api/hub/gps/discover", post(h_gps_discover))
         .route("/api/hub/routers", get(h_routers_list).post(h_routers))
         .route("/api/hub/sensors", get(h_sensors_list).post(h_sensors))
         .route("/api/hub/linktap/state", get(h_valve_state))
@@ -584,6 +585,8 @@ fn capabilities_of(lt: &hub_config::LinkTapConfig) -> Vec<String> {
     caps.push("routers".to_string());
     // Sensor wiring (sensors.rs): the hub finishes a sleepy sensor's setup on the LAN.
     caps.push("sensors".to_string());
+    // NMEA-over-IP discovery (nmea_discover.rs): Add GPS can ask the hub to find the boat's feed.
+    caps.push("gps_discover".to_string());
     caps
 }
 
@@ -655,6 +658,7 @@ pub async fn dispatch(rt: &Rt, caller: &Caller, method: &str, path: &str, body: 
         ("POST", "/api/hub/update") => do_update(caller).await,
         ("POST", "/api/hub/linktap/valve") => do_valve(rt, caller, body).await,
         ("POST", "/api/hub/gps") => do_gps(rt, caller, body).await,
+        ("POST", "/api/hub/gps/discover") => do_gps_discover(caller).await,
         ("GET", "/api/hub/routers") => do_routers_list(rt).await,
         ("POST", "/api/hub/routers") => do_routers(rt, caller, body).await,
         ("GET", "/api/hub/sensors") => do_sensors_list(rt).await,
@@ -1088,6 +1092,10 @@ async fn h_valve(State(rt): State<Shared>, headers: HeaderMap, body: axum::body:
 
 async fn h_gps(State(rt): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     lan_call(&rt, &headers, "POST", "/api/hub/gps", &body).await
+}
+
+async fn h_gps_discover(State(rt): State<Shared>, headers: HeaderMap) -> Response {
+    lan_call(&rt, &headers, "POST", "/api/hub/gps/discover", b"").await
 }
 
 async fn h_routers_list(State(rt): State<Shared>, headers: HeaderMap) -> Response {
@@ -2504,6 +2512,16 @@ async fn do_gps(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
     ok_json(&status_body(rt).await)
 }
 
+/// Find NMEA 0183 feeds on the boat LAN (nmea_discover.rs): passive UDP on the common ports plus a
+/// TCP probe of the hub's private /24s, ~12 s. Control-grade: it reads the network and changes
+/// nothing, but it does sweep the LAN, which a `monitor` has no reason to start.
+async fn do_gps_discover(caller: &Caller) -> Answer {
+    if !may_control(&caller.role) {
+        return err(403, "finding a GPS source needs control access or above");
+    }
+    ok_json(&crate::nmea_discover::discover().await)
+}
+
 // --- Managed routers (routers.rs) -------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -3462,6 +3480,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gps_discover_is_routed_and_refuses_a_monitor() {
+        // Only the refusal is exercised end to end: a permitted call sweeps the real LAN for ~12 s
+        // (nmea_discover.rs tests the listen and the probe against local sockets instead).
+        let base = temp_base("gps_discover");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let (origin, _rt) = spawn_server(base, vec![key("monitor")]).await;
+        let r = reqwest::Client::new()
+            .post(format!("{origin}/api/hub/gps/discover")).header(KEY_HEADER, key("monitor").key)
+            .send().await.unwrap();
+        assert_eq!(r.status(), 403, "a monitor may look but not sweep the LAN");
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert!(v["error"].as_str().unwrap_or("").contains("control"), "{v}");
+    }
+
+    #[tokio::test]
     async fn a_damaged_config_is_reported_and_cannot_be_silently_re_signed() {
         // THE CENTRAL FAILURE OF 2026-08-28, as an endpoint test. A hub.json that will not parse
         // reads back as defaults, so the hub USED to present as factory-fresh: not registered, no
@@ -4003,7 +4036,7 @@ mod tests {
             .get(format!("{origin}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
         // `routers` is unconditional (managed routers need no plan or gateway to be OFFERED).
-        assert_eq!(body["capabilities"], serde_json::json!(["linktap", "routers", "sensors"]));
+        assert_eq!(body["capabilities"], serde_json::json!(["linktap", "routers", "sensors", "gps_discover"]));
 
         let base2 = temp_base("caps_denied");
         hub_config::write_config_in(&base2, &valve_cfg(false)).unwrap();
@@ -4011,7 +4044,7 @@ mod tests {
         let body2: serde_json::Value = reqwest::Client::new()
             .get(format!("{origin2}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(body2["capabilities"], serde_json::json!(["routers", "sensors"]), "an unpermitted plan must not advertise valve capability");
+        assert_eq!(body2["capabilities"], serde_json::json!(["routers", "sensors", "gps_discover"]), "an unpermitted plan must not advertise valve capability");
 
         let base3 = temp_base("caps_nogw");
         hub_config::write_config_in(&base3, &seeded_cfg()).unwrap(); // allowed defaults false, no gateway
@@ -4019,7 +4052,7 @@ mod tests {
         let body3: serde_json::Value = reqwest::Client::new()
             .get(format!("{origin3}/api/hub/status")).header(KEY_HEADER, key("owner").key)
             .send().await.unwrap().json().await.unwrap();
-        assert_eq!(body3["capabilities"], serde_json::json!(["routers", "sensors"]));
+        assert_eq!(body3["capabilities"], serde_json::json!(["routers", "sensors", "gps_discover"]));
     }
 
     #[tokio::test]
