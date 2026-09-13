@@ -324,6 +324,24 @@ pub struct Rt {
     /// and double-send the front report. Pushes take `pending_reports` only briefly and never wait
     /// on this, so enqueuing never blocks behind a network flush.
     pub report_flush: tokio::sync::Mutex<()>,
+    /// 🔴 Sensor reports (a FLOOD ALARM among them) the hub could not forward to the cloud yet.
+    /// Until 2026-09-13 a failed forward was logged and DROPPED: a bilge alarm that fired during an
+    /// uplink blip closed the valve locally and never reached the cloud — no push, no WhatsApp, no
+    /// alert log. Queued here, retried by `shelly_retry_loop` every few seconds and after each good
+    /// heartbeat, shed oldest-READING-first so an alarm is the last thing a long outage loses.
+    /// In-memory, like `pending_reports`.
+    pub pending_shelly: tokio::sync::Mutex<std::collections::VecDeque<QueuedShelly>>,
+    /// One drain at a time, for the same double-send reason as `report_flush`.
+    pub shelly_flush: tokio::sync::Mutex<()>,
+}
+
+/// A sensor report waiting for the uplink, with when it first failed (for the log line only — the
+/// report itself is forwarded byte-for-byte as the sensor sent it).
+#[derive(Debug, Clone)]
+pub struct QueuedShelly {
+    pub call: ShellyCall,
+    pub queued_ms: i64,
+    pub attempts: u32,
 }
 
 /// Record that something happened locally and wake the heartbeat to report it immediately.
@@ -360,6 +378,8 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         handled_cmds: tokio::sync::Mutex::new(HashSet::new()),
         pending_acks: tokio::sync::Mutex::new(Vec::new()),
         pending_reports: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+        pending_shelly: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+        shelly_flush: tokio::sync::Mutex::new(()),
         report_flush: tokio::sync::Mutex::new(()),
     })
 }
@@ -1322,7 +1342,7 @@ async fn h_linktap_push(
 
 /// One parsed Shelly webhook. Field-for-field the shape the cloud's `/api/shelly` reads out of its
 /// searchParams, so a sensor URL is portable between the two without editing.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ShellyCall {
     pub vid: String,
     pub event: String,
@@ -1537,6 +1557,7 @@ async fn heartbeat_loop(rt: Shared) {
                     // A good heartbeat means the uplink is up — flush any telemetry that failed to
                     // send while it was down (drain_reports is a no-op when the queue is empty).
                     drain_reports(&rt).await;
+                    drain_shelly(&rt).await;
                 }
                 Err(e) => {
                     if !sending.is_empty() {
@@ -2166,15 +2187,74 @@ async fn forward_shelly_to_cloud(rt: &Rt, call: &ShellyCall) {
     // ACTIVE cadence. The forward itself is what carries the alarm; this only makes the liveness
     // beat track the situation too.
     note_activity(rt);
+    let dropped = {
+        let mut q = rt.pending_shelly.lock().await;
+        enqueue_shelly(&mut q, QueuedShelly { call: call.clone(), queued_ms: now_ms(), attempts: 0 }, MAX_SHELLY_QUEUE)
+    };
+    if let Some(d) = dropped {
+        crate::hlog!("shelly: forward backlog full - dropped queued '{}' from {}", d.call.event, d.call.device);
+    }
+    drain_shelly(rt).await;
+}
+
+/// How many sensor reports the hub holds across an outage. Sensors report on events and wake-ups,
+/// not every second — a few hundred covers hours of a busy boat.
+pub const MAX_SHELLY_QUEUE: usize = 300;
+/// How often queued sensor reports are retried while any are waiting. Short on purpose: the queue
+/// exists for alarms, and the heartbeat that also drains it can be asleep for 20 minutes.
+pub const SHELLY_RETRY_SECS: u64 = 10;
+
+/// PURE: is this sensor event an ALARM (kept longest when the queue must shed), as opposed to a
+/// reading? The same water rule the valve close uses, plus anything the device itself calls an alarm.
+pub fn shelly_is_alarm(event: &str) -> bool {
+    let e = event.to_ascii_lowercase();
+    crate::linktap_runtime::is_flood_shutoff(event) || e.contains("alarm") || e.contains("flood") || e.contains("leak")
+}
+
+/// PURE: queue a report, shedding when full — the OLDEST READING first, an alarm only when the queue
+/// holds nothing but alarms. Returns what was shed, if anything.
+pub fn enqueue_shelly(q: &mut std::collections::VecDeque<QueuedShelly>, item: QueuedShelly, cap: usize) -> Option<QueuedShelly> {
+    q.push_back(item);
+    if q.len() <= cap {
+        return None;
+    }
+    let victim = q.iter().position(|x| !shelly_is_alarm(&x.call.event)).unwrap_or(0);
+    q.remove(victim)
+}
+
+/// What one forward attempt means for the queued report.
+#[derive(Debug, PartialEq)]
+pub enum ForwardOutcome {
+    Sent,
+    /// Uplink or cloud trouble — keep it and try again.
+    Retry(String),
+    /// The cloud refused THIS report (bad secret, unknown device): resending cannot help.
+    Refused(String),
+}
+
+/// PURE: classify a forward's HTTP status. 408/429 and every 5xx are the cloud or the path being
+/// unwell — retry. Any other non-2xx is a refusal of this report — drop it, loudly.
+pub fn classify_forward(status: u16, device: &str) -> ForwardOutcome {
+    if (200..300).contains(&status) {
+        ForwardOutcome::Sent
+    } else if status == 408 || status == 429 || status >= 500 {
+        ForwardOutcome::Retry(format!("cloud answered HTTP {status}"))
+    } else {
+        ForwardOutcome::Refused(report_refusal(status, device).unwrap_or_default())
+    }
+}
+
+async fn send_shelly_once(rt: &Rt, call: &ShellyCall) -> ForwardOutcome {
     let cfg = hub_config::read_config_in(&rt.base);
     if cfg.shelly_secret.is_empty() || cfg.vid.is_empty() {
         // Unreachable in practice: an empty secret means the ingest refused this report long before
         // here. Said out loud anyway, because "unreachable" and "silent" is how the last one hid.
-        crate::hlog!("shelly: cannot forward '{}' - no webhook secret", call.event);
-        return;
+        return ForwardOutcome::Refused("no webhook secret".into());
     }
     let base = rt.worker_base.trim_end_matches('/');
-    let Ok(mut u) = url::Url::parse(&format!("{base}/api/shelly")) else { return };
+    let Ok(mut u) = url::Url::parse(&format!("{base}/api/shelly")) else {
+        return ForwardOutcome::Refused("bad worker url".into());
+    };
     u.query_pairs_mut()
         .append_pair("vid", &cfg.vid)
         .append_pair("device", &call.device)
@@ -2184,13 +2264,48 @@ async fn forward_shelly_to_cloud(rt: &Rt, call: &ShellyCall) {
     }
     // The secret goes on LAST and is never logged — the url is not printed anywhere below.
     u.query_pairs_mut().append_pair("k", &cfg.shelly_secret);
+    match http_client().get(u).send().await {
+        Err(e) => ForwardOutcome::Retry(format!("failed to send: {}", e.without_url())),
+        Ok(res) => classify_forward(res.status().as_u16(), &call.device),
+    }
+}
 
-    let outcome = match http_client().get(u).send().await {
-        Err(e) => Some(format!("failed to send: {}", e.without_url())),
-        Ok(res) => report_refusal(res.status().as_u16(), &call.device),
-    };
-    if let Some(why) = outcome {
-        crate::hlog!("shelly: forward of '{}' {why}", call.event);
+/// Forward everything queued, oldest first, stopping at the first transient failure so order is
+/// kept and a dead uplink is not hammered. Refusals leave the queue (with a log line); sends leave it.
+async fn drain_shelly(rt: &Rt) {
+    let _flush = rt.shelly_flush.lock().await;
+    loop {
+        let next = { rt.pending_shelly.lock().await.pop_front() };
+        let Some(mut item) = next else { break };
+        item.attempts += 1;
+        match send_shelly_once(rt, &item.call).await {
+            ForwardOutcome::Sent => {
+                if item.attempts > 1 {
+                    let late_s = (now_ms() - item.queued_ms).max(0) / 1000;
+                    crate::hlog!("shelly: forwarded '{}' from {} after {} attempt(s), {late_s} s late", item.call.event, item.call.device, item.attempts);
+                }
+            }
+            ForwardOutcome::Refused(why) => {
+                crate::hlog!("shelly: forward of '{}' {why} - dropped", item.call.event);
+            }
+            ForwardOutcome::Retry(why) => {
+                if item.attempts == 1 || item.attempts % 30 == 0 {
+                    crate::hlog!("shelly: forward of '{}' {why} - queued, will retry", item.call.event);
+                }
+                rt.pending_shelly.lock().await.push_front(item);
+                break;
+            }
+        }
+    }
+}
+
+/// Retry queued sensor reports on a short timer while any are waiting.
+async fn shelly_retry_loop(rt: Shared) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(SHELLY_RETRY_SECS)).await;
+        if !rt.pending_shelly.lock().await.is_empty() {
+            drain_shelly(&rt).await;
+        }
     }
 }
 
@@ -2413,6 +2528,7 @@ where
         tokio::spawn(linktap_poll_loop(rt.clone()));
         // GPS acquisition on the LAN — re-reads its own config each pass, same as the LinkTap loop.
         tokio::spawn(gps_poll_loop(rt.clone()));
+        tokio::spawn(shelly_retry_loop(rt.clone()));
         // Managed routers (routers.rs) — the hub reads each on its cadence and reports as it.
         tokio::spawn(router_poll_loop(rt.clone()));
         // Sensor wiring — hunts each pending sleepy sensor on the LAN until it answers (sensors.rs).
@@ -4531,6 +4647,73 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(stops.load(Ordering::SeqCst), 1, "a flood must close the valve; a measurement must not");
+    }
+
+    #[test]
+    fn a_full_forward_queue_sheds_readings_before_alarms() {
+        let q_item = |event: &str, n: i64| QueuedShelly {
+            call: ShellyCall { vid: "v1".into(), event: event.into(), device: "sh".into(), k: String::new(), extras: vec![] },
+            queued_ms: n, attempts: 0,
+        };
+        let mut q = std::collections::VecDeque::new();
+        assert!(enqueue_shelly(&mut q, q_item("flood.alarm", 1), 3).is_none());
+        assert!(enqueue_shelly(&mut q, q_item("temperature.change", 2), 3).is_none());
+        assert!(enqueue_shelly(&mut q, q_item("flood.alarm", 3), 3).is_none());
+        let shed = enqueue_shelly(&mut q, q_item("devicepower.battery_change", 4), 3).unwrap();
+        assert_eq!(shed.call.event, "temperature.change", "the oldest READING goes, not the older alarm");
+        let shed = enqueue_shelly(&mut q, q_item("flood.alarm", 5), 3).unwrap();
+        assert_eq!(shed.call.event, "devicepower.battery_change");
+        // Nothing but alarms left: then, and only then, the oldest alarm.
+        let shed = enqueue_shelly(&mut q, q_item("flood.alarm", 6), 3).unwrap();
+        assert_eq!(shed.queued_ms, 1);
+        assert!(shelly_is_alarm("flood.alarm") && shelly_is_alarm("smoke.alarm") && !shelly_is_alarm("temperature.measurement"));
+    }
+
+    #[test]
+    fn a_forward_retries_on_path_trouble_and_drops_a_refusal() {
+        assert_eq!(classify_forward(200, "sh"), ForwardOutcome::Sent);
+        assert!(matches!(classify_forward(502, "sh"), ForwardOutcome::Retry(_)));
+        assert!(matches!(classify_forward(503, "sh"), ForwardOutcome::Retry(_)));
+        assert!(matches!(classify_forward(429, "sh"), ForwardOutcome::Retry(_)));
+        assert!(matches!(classify_forward(408, "sh"), ForwardOutcome::Retry(_)));
+        assert!(matches!(classify_forward(401, "sh"), ForwardOutcome::Refused(_)));
+        assert!(matches!(classify_forward(404, "sh"), ForwardOutcome::Refused(_)));
+    }
+
+    #[tokio::test]
+    async fn a_flood_alarm_forward_that_fails_is_retried_until_the_cloud_takes_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        // A cloud that is down for the first two attempts (the uplink blip), then accepts.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let got_event = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let (h2, g2) = (hits.clone(), got_event.clone());
+        let app = axum::Router::new().route("/api/shelly", axum::routing::get(move |q: axum::extract::Query<HashMap<String, String>>| {
+            let (h, g) = (h2.clone(), g2.clone());
+            async move {
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                if n < 2 { return axum::http::StatusCode::SERVICE_UNAVAILABLE; }
+                g.lock().await.push(format!("{}|{}|{}", q.get("event").cloned().unwrap_or_default(), q.get("device").cloned().unwrap_or_default(), q.get("battery").cloned().unwrap_or_default()));
+                axum::http::StatusCode::OK
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cloud = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let base = temp_base("shelly_forward_retry");
+        hub_config::write_config_in(&base, &shelly_cfg("s3cr3t")).unwrap();
+        let rt = new_rt(base, cloud);
+        let call = ShellyCall { vid: "v1".into(), event: "flood.alarm".into(), device: "sh_bilge".into(), k: "s3cr3t".into(), extras: vec![("battery".into(), "97".into())] };
+
+        forward_shelly_to_cloud(&rt, &call).await;
+        assert_eq!(rt.pending_shelly.lock().await.len(), 1, "a failed forward must be KEPT, not dropped");
+        drain_shelly(&rt).await; // still down
+        assert_eq!(rt.pending_shelly.lock().await.len(), 1);
+        drain_shelly(&rt).await; // back up
+        assert!(rt.pending_shelly.lock().await.is_empty());
+        assert_eq!(*got_event.lock().await, vec!["flood.alarm|sh_bilge|97".to_string()], "delivered once, exactly as the sensor sent it");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
