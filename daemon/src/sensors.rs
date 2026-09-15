@@ -171,6 +171,17 @@ pub fn substitute_hub_host(hooks: &mut [DesiredHook], lan_ip: &str) {
     }
 }
 
+/// PURE: the hooks the hub will actually install — the job's hooks WITHOUT the device's PERIODIC
+/// `*.measurement` reports (hub cadence audit H9, the cheaper alternative, decided 2026-09-15).
+///
+/// A `.measurement` hook fires on the device's own clock whether or not anything changed, which is
+/// exactly the per-sample traffic the owner ruled out ("100–200 updates from the hub to the cloud a
+/// day"). The THRESHOLD hooks (`*.change`, `*_change`) stay, pointing wherever the job says — today the
+/// cloud — and so do alarm hooks (flood/leak, hub first). Nothing else about a hook is rewritten.
+pub fn without_periodic_hooks(hooks: &[DesiredHook]) -> Vec<DesiredHook> {
+    hooks.iter().filter(|h| !h.event.to_ascii_lowercase().ends_with(".measurement")).cloned().collect()
+}
+
 /// PURE: is this `Shelly.GetDeviceInfo` reply the sensor we are hunting?
 pub fn is_target(info: &Value, id: &str) -> bool {
     let want = id.to_ascii_lowercase();
@@ -264,7 +275,10 @@ pub async fn attempt(client: &reqwest::Client, job: &SensorJob, host: &str, now_
     if !is_target(&info, &job.id) {
         return Err(format!("{host} answered as a different device"));
     }
-    let (confirmed, missing) = wire_hooks(client, host, &job.password, &job.hooks).await;
+    // H9: periodic `.measurement` hooks are never installed (see without_periodic_hooks). The job is
+    // verified against what the hub installs, so a job that asked for one still reaches `wired`.
+    let hooks = without_periodic_hooks(&job.hooks);
+    let (confirmed, missing) = wire_hooks(client, host, &job.password, &hooks).await;
     let mut st = SensorState::pending(job);
     st.host = Some(host.to_string());
     st.confirmed = confirmed;
@@ -287,6 +301,24 @@ pub async fn attempt(client: &reqwest::Client, job: &SensorJob, host: &str, now_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_measurement_hooks_are_dropped_and_threshold_and_alarm_hooks_kept_as_given() {
+        let h = |e: &str, u: &[&str]| DesiredHook { event: e.into(), urls: u.iter().map(|s| s.to_string()).collect() };
+        let job = vec![
+            h("flood.alarm", &["http://hub/api/hub/shelly?x", "https://cloud/api/shelly?x"]),
+            h("temperature.change", &["https://cloud/api/shelly?t"]),
+            h("temperature.measurement", &["https://cloud/api/shelly?t"]),
+            h("humidity.Measurement", &["https://cloud/api/shelly?h"]),
+            h("pm1.voltage_change", &["https://cloud/api/shelly?v"]),
+            h("devicepower.battery_change", &["https://cloud/api/shelly?b"]),
+        ];
+        let kept = without_periodic_hooks(&job);
+        let events: Vec<&str> = kept.iter().map(|k| k.event.as_str()).collect();
+        assert_eq!(events, vec!["flood.alarm", "temperature.change", "pm1.voltage_change", "devicepower.battery_change"]);
+        assert_eq!(kept[0].urls, job[0].urls, "an alarm hook keeps both urls, hub first");
+        assert_eq!(kept[1].urls, job[1].urls, "a threshold hook points where it did");
+    }
 
     #[test]
     fn digest_matches_the_app_s_recipe() {

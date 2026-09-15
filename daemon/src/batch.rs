@@ -1,0 +1,342 @@
+// THE BATCH WIRE SHAPES — every item and envelope the daemon puts on `POST /api/agent/batch`, in ONE
+// module so the contract has one place to change.
+//
+// Contract of record: DockNeighbor-Cloud `src/agentBatch.ts` header at commit 4edb08b
+// (feat/hub-cadence-15min), "THE CONSOLIDATED PAYLOAD". Summary of what this file must honour:
+//
+//   POST /api/agent/batch?vid=&device=<hub_id>&t=<hub token>[&ack=<ids>][&anchorsig=<sig>]
+//   { "v": 1, "seq": N, "boot": "<per-process id>", "kind": "keyframe" | "delta",
+//     "agent": { "av": "<daemon version>", "tier": "hub" }, "items": [{device, event, params}], "ok": [] }
+//
+//   * kind "keyframe" — the 15-minute payload. EVERY item is the device's COMPLETE current reading; the
+//     cloud overwrites sensorState without a prev read. Exactly one `hub.status` item, device = the hub id.
+//   * kind "delta" — immediate single events and outage replays; today's merge semantics.
+//   * `wanKb_cellular|wifi|wired` are KB DELTAS since the last SENT report, summed across skipped sends.
+//   * limits: ≤ 50 items, ≤ 24 params per item, values ≤ 256 chars, names ≤ 64, every value a string.
+//     A keyframe that exceeds 50 items is split into several posts.
+//   * reply 200: {status, processed, failed, touched, skipped, duplicate?, commands?, anchor?, linktap?}.
+//
+// Param NAMES are the daemon's established ones (routers.rs `modem_params`: `wan`, `up`; the valve's
+// `battery`, `signal`, `rf`), not renamed to the contract's illustrative examples (`wanSrc`, `batt`):
+// the app reads `wan` (connectivityStatus.ts) and `battery` (hubValveReading.ts) off sensorState, and
+// the keyframe's rule is "every field the hub holds", which these are.
+
+use serde_json::{json, Map, Value};
+
+pub const MAX_ITEMS: usize = 50;
+pub const MAX_PARAMS: usize = 24;
+pub const MAX_VALUE_LEN: usize = 256;
+pub const MAX_NAME_LEN: usize = 64;
+
+/// The hub's own status item (cloud events.ts HUB_STATUS_EVENT) — classified as device state.
+pub const HUB_STATUS_EVENT: &str = "hub.status";
+/// The armed "checks in OK" item (cloud gpsFeed.ts GPS_HEARTBEAT_EVENT) — intercepted, never an alert.
+pub const GPS_HEARTBEAT_EVENT: &str = "gps.heartbeat";
+pub const GPS_FIX_EVENT: &str = "gps.measurement";
+/// The tier this daemon declares in `agent.tier`.
+pub const TIER: &str = "hub";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Keyframe,
+    Delta,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Keyframe => "keyframe",
+            Kind::Delta => "delta",
+        }
+    }
+}
+
+/// One batch item. Params keep wire order; duplicates are resolved last-wins by `clamp_item`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Item {
+    pub device: String,
+    pub event: String,
+    pub params: Vec<(String, String)>,
+}
+
+fn cut(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// PURE: make an item legal under the contract limits. Empty values are dropped (the cloud's
+/// `str()` refuses a zero-length value and would reject the WHOLE batch), duplicate keys keep the
+/// LAST value in the FIRST key's position, values are cut to 256 chars on a char boundary, and params
+/// beyond 24 are dropped. Returns the item and how many params were dropped for the 24 cap.
+pub fn clamp_item(item: &Item) -> (Item, usize) {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in &item.params {
+        if k.is_empty() || k.len() > MAX_NAME_LEN || v.is_empty() {
+            continue;
+        }
+        let v = cut(v, MAX_VALUE_LEN);
+        match out.iter_mut().find(|(ok, _)| ok == k) {
+            Some(slot) => slot.1 = v,
+            None => out.push((k.clone(), v)),
+        }
+    }
+    let dropped = out.len().saturating_sub(MAX_PARAMS);
+    out.truncate(MAX_PARAMS);
+    (Item { device: cut(&item.device, MAX_NAME_LEN), event: cut(&item.event, MAX_NAME_LEN), params: out }, dropped)
+}
+
+/// PURE: the JSON envelope for one post. Items must already be ≤ MAX_ITEMS (see `split`).
+///
+/// `seq` is OPTIONAL on the wire and the daemon sets it only on the spooled EVENT queue (kind delta),
+/// which is strictly serialized and resends a failed post with the SAME seq — so a retry the cloud
+/// already took is dropped whole instead of re-firing its alarms. Keyframes and heartbeats carry no
+/// seq on purpose: they are idempotent full state, and a seq on them would race the event queue — a
+/// heartbeat accepted as seq 11 would make a still-retrying event post with seq 10 read as a replay
+/// (agentBatch.ts isNewSeq) and its alarms would be silently discarded.
+pub fn envelope(kind: Kind, seq: Option<u64>, boot: &str, items: &[Item], av: &str) -> Value {
+    let items: Vec<Value> = items
+        .iter()
+        .map(|it| {
+            let (it, _) = clamp_item(it);
+            let mut params = Map::new();
+            for (k, v) in it.params {
+                params.insert(k, Value::String(v));
+            }
+            json!({ "device": it.device, "event": it.event, "params": Value::Object(params) })
+        })
+        .collect();
+    let mut body = json!({
+        "v": 1,
+        "boot": boot,
+        "kind": kind.as_str(),
+        "agent": { "av": av, "tier": TIER },
+        "items": items,
+        "ok": [],
+    });
+    if let Some(seq) = seq {
+        body["seq"] = json!(seq);
+    }
+    body
+}
+
+/// PURE: split a payload into posts of at most MAX_ITEMS. The hub.status item (if present) rides the
+/// FIRST post. An empty payload is one empty post — never zero posts, so a keyframe with nothing but
+/// the hub still checks in.
+pub fn split(items: Vec<Item>) -> Vec<Vec<Item>> {
+    if items.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut items = items;
+    if let Some(i) = items.iter().position(|it| it.event == HUB_STATUS_EVENT) {
+        let hs = items.remove(i);
+        items.insert(0, hs);
+    }
+    items.chunks(MAX_ITEMS).map(|c| c.to_vec()).collect()
+}
+
+/// PURE: the batch URL. The only place the hub token meets a batch URL.
+pub fn batch_url(worker_base: &str, vid: &str, hub_id: &str, token: &str, ack: Option<&str>, anchorsig: u64) -> Result<String, String> {
+    let base = worker_base.trim_end_matches('/');
+    let mut u = url::Url::parse(&format!("{base}/api/agent/batch")).map_err(|e| e.to_string())?;
+    u.query_pairs_mut().append_pair("vid", vid).append_pair("device", hub_id).append_pair("t", token);
+    if let Some(a) = ack.filter(|a| !a.is_empty()) {
+        u.query_pairs_mut().append_pair("ack", a);
+    }
+    u.query_pairs_mut().append_pair("anchorsig", &anchorsig.to_string());
+    Ok(u.to_string())
+}
+
+/// The `hub.status` item: `{name, ver, platform, update?, anchorsig}`.
+pub fn hub_status_item(hub_id: &str, name: &str, ver: &str, platform: &str, update: Option<&str>, anchorsig: u64) -> Item {
+    let mut params =
+        vec![("name".to_string(), name.to_string()), ("ver".to_string(), ver.to_string()), ("platform".to_string(), platform.to_string())];
+    if let Some(u) = update.filter(|u| !u.is_empty()) {
+        params.push(("update".into(), u.to_string()));
+    }
+    params.push(("anchorsig".into(), anchorsig.to_string()));
+    Item { device: hub_id.to_string(), event: HUB_STATUS_EVENT.into(), params }
+}
+
+/// The `gps.measurement` params: `lat lon acc? sog? sats? hdop? anchorsig`. `anchorsig` tells the
+/// cloud this sender runs its own geofence (gpsFeed.ts shouldPersistGpsFix trusts it).
+pub fn gps_fix_params(fix: &crate::gps::GpsFix, anchorsig: u64) -> Vec<(String, String)> {
+    let mut p = vec![("lat".to_string(), format!("{:.6}", fix.lat)), ("lon".to_string(), format!("{:.6}", fix.lon))];
+    if let Some(acc) = fix.acc {
+        p.push(("acc".into(), format!("{acc:.1}")));
+    }
+    if let Some(sog) = fix.sog_kn {
+        p.push(("sog".into(), format!("{sog:.1}")));
+    }
+    if let Some(n) = fix.sats {
+        p.push(("sats".into(), n.to_string()));
+    }
+    if let Some(h) = fix.hdop {
+        p.push(("hdop".into(), format!("{h:.1}")));
+    }
+    p.push(("anchorsig".into(), anchorsig.to_string()));
+    p
+}
+
+pub fn gps_fix_item(device: &str, fix: &crate::gps::GpsFix, anchorsig: u64) -> Item {
+    Item { device: device.to_string(), event: GPS_FIX_EVENT.into(), params: gps_fix_params(fix, anchorsig) }
+}
+
+pub fn heartbeat_item(device: &str, params: Vec<(String, String)>) -> Item {
+    Item { device: device.to_string(), event: GPS_HEARTBEAT_EVENT.into(), params }
+}
+
+/// A router's `modem.measurement`, with the KB accumulated since the last SENT report (only when
+/// non-zero — "never send totals", and a zero delta is noise).
+pub fn router_item(device: &str, params: &[(String, String)], wan_kb_cellular: u64) -> Item {
+    let mut p: Vec<(String, String)> = params.iter().filter(|(k, _)| !k.starts_with("wanKb_")).cloned().collect();
+    if wan_kb_cellular > 0 {
+        p.push(("wanKb_cellular".into(), wan_kb_cellular.to_string()));
+    }
+    Item { device: device.to_string(), event: "modem.measurement".into(), params: p }
+}
+
+pub fn valve_item(dev_id: &str, params: &[(String, String)]) -> Item {
+    Item { device: format!("lt_{dev_id}"), event: "linktap.measurement".into(), params: params.to_vec() }
+}
+
+pub fn from_report(r: &crate::linktap_runtime::Report) -> Item {
+    Item { device: r.device.clone(), event: r.event.clone(), params: r.params.clone() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gps::GpsFix;
+
+    fn keyframe_items(n_shellys: usize) -> Vec<Item> {
+        let mut items = vec![hub_status_item("hub_8f39", "CENTRAL", "0.3.49", "linux", Some("0.3.50"), 0)];
+        let modem: Vec<(String, String)> = [
+            ("up", "1"),
+            ("mode", "LTE"),
+            ("rssi", "-71"),
+            ("rsrp", "-101"),
+            ("sinr", "12"),
+            ("rsrq", "-9"),
+            ("carrier", "Verizon"),
+            ("sim", "ok"),
+            ("dataMb", "1234"),
+            ("wan", "lte"),
+            ("ip", "100.64.3.9"),
+            ("model", "CBA850"),
+            ("fw", "7.0.50"),
+            ("av", "hub-0.3.49"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        items.push(router_item("brv_net_cp850", &modem, 812));
+        items.push(valve_item("ABC123", &[("watering".into(), "0".into()), ("battery".into(), "92".into()), ("rf".into(), "1".into())]));
+        let fix = GpsFix { lat: 41.4929, lon: -81.6943, acc: Some(4.0), hdop: Some(0.9), sats: Some(11), sog_kn: Some(0.1) };
+        items.push(gps_fix_item("brv_gps_a", &fix, 0));
+        for i in 0..n_shellys {
+            items.push(Item {
+                device: format!("shellyht-{i}"),
+                event: "temperature.measurement".into(),
+                params: vec![("tC".into(), "21.5".into()), ("rh".into(), "60".into())],
+            });
+        }
+        items
+    }
+
+    fn assert_within_limits(body: &Value) {
+        assert_eq!(body["v"], 1);
+        let items = body["items"].as_array().unwrap();
+        assert!(items.len() <= MAX_ITEMS, "{} items", items.len());
+        assert!(body["ok"].as_array().unwrap().is_empty());
+        assert_eq!(body["agent"]["tier"], "hub");
+        for it in items {
+            let dev = it["device"].as_str().unwrap();
+            let ev = it["event"].as_str().unwrap();
+            assert!(!dev.is_empty() && dev.len() <= MAX_NAME_LEN && !ev.is_empty() && ev.len() <= MAX_NAME_LEN);
+            let params = it["params"].as_object().unwrap();
+            assert!(params.len() <= MAX_PARAMS, "{dev} carries {} params", params.len());
+            for (k, v) in params {
+                let s = v.as_str().unwrap_or_else(|| panic!("{dev}.{k} is not a string"));
+                assert!(!s.is_empty() && s.len() <= MAX_VALUE_LEN && k.len() <= MAX_NAME_LEN, "{dev}.{k}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_keyframe_serialises_inside_the_contract_limits_and_splits_past_fifty_items() {
+        // A realistic boat: one post.
+        let posts = split(keyframe_items(5));
+        assert_eq!(posts.len(), 1);
+        let body = envelope(Kind::Keyframe, None, "a1b2c3d4", &posts[0], "0.3.49");
+        assert_within_limits(&body);
+        assert_eq!(body["kind"], "keyframe");
+        assert!(body.get("seq").is_none(), "keyframes carry no seq (see envelope)");
+        assert_eq!(envelope(Kind::Delta, Some(1201), "a1b2c3d4", &[], "0.3.49")["seq"], 1201);
+        assert_eq!(body["boot"], "a1b2c3d4");
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.iter().filter(|i| i["event"] == HUB_STATUS_EVENT).count(), 1, "exactly one hub.status");
+        assert_eq!(items[0]["device"], "hub_8f39", "hub.status device is the hub's own id");
+        assert_eq!(items[0]["params"]["update"], "0.3.50");
+        assert_eq!(items[1]["params"]["wanKb_cellular"], "812");
+        assert_eq!(items[3]["params"]["sats"], "11");
+        assert_eq!(items[3]["params"]["hdop"], "0.9");
+        assert_eq!(items[3]["params"]["sog"], "0.1");
+
+        // A marina facility with 120 sensors: three posts, each legal, hub.status only in the first.
+        let posts = split(keyframe_items(120));
+        assert_eq!(posts.len(), 3);
+        for (i, p) in posts.iter().enumerate() {
+            let body = envelope(Kind::Keyframe, None, "b", p, "0.3.49");
+            assert_within_limits(&body);
+            let hs = body["items"].as_array().unwrap().iter().filter(|x| x["event"] == HUB_STATUS_EVENT).count();
+            assert_eq!(hs, usize::from(i == 0));
+        }
+        assert_eq!(split(Vec::new()).len(), 1, "an empty keyframe is still one check-in");
+    }
+
+    #[test]
+    fn an_oversized_item_is_clamped_rather_than_rejecting_the_whole_batch() {
+        let mut params: Vec<(String, String)> = (0..30).map(|i| (format!("k{i}"), "v".to_string())).collect();
+        params.push(("k0".into(), "last-wins".into()));
+        params.push(("empty".into(), String::new()));
+        params.push(("long".into(), "é".repeat(300)));
+        let (it, dropped) = clamp_item(&Item { device: "d".into(), event: "e".into(), params });
+        assert_eq!(it.params.len(), MAX_PARAMS);
+        assert_eq!(dropped, 7, "31 distinct non-empty keys, 24 kept");
+        assert_eq!(it.params[0], ("k0".into(), "last-wins".into()));
+        assert!(it.params.iter().all(|(_, v)| !v.is_empty()));
+        let body = envelope(
+            Kind::Delta,
+            Some(1),
+            "b",
+            &[Item { device: "d".into(), event: "e".into(), params: vec![("long".into(), "é".repeat(300))] }],
+            "x",
+        );
+        assert_within_limits(&body);
+    }
+
+    #[test]
+    fn wan_deltas_are_never_totals_and_a_zero_delta_is_omitted() {
+        let it = router_item("r", &[("wanKb_cellular".into(), "999".into()), ("up".into(), "1".into())], 0);
+        assert!(!it.params.iter().any(|(k, _)| k.starts_with("wanKb_")), "a stale delta in the latest params is never re-sent");
+        let it = router_item("r", &[("up".into(), "1".into())], 40);
+        assert_eq!(it.params.last().unwrap(), &("wanKb_cellular".to_string(), "40".to_string()));
+    }
+
+    #[test]
+    fn the_batch_url_carries_the_hub_identity_ack_and_anchorsig() {
+        let u = url::Url::parse(&batch_url("https://api.example.com/", "v1", "hub_1", "tok", Some("c1,c2"), 1234).unwrap()).unwrap();
+        assert_eq!(u.path(), "/api/agent/batch");
+        let q: std::collections::HashMap<String, String> = u.query_pairs().into_owned().collect();
+        assert_eq!((q["vid"].as_str(), q["device"].as_str(), q["t"].as_str()), ("v1", "hub_1", "tok"));
+        assert_eq!((q["ack"].as_str(), q["anchorsig"].as_str()), ("c1,c2", "1234"));
+        let u = batch_url("https://api.example.com", "v1", "hub_1", "tok", Some(""), 0).unwrap();
+        assert!(!u.contains("ack="));
+    }
+}

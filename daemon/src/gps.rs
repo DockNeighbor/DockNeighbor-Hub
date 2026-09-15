@@ -7,12 +7,17 @@
 
 use serde::Deserialize;
 
-/// One position fix. `acc` is a radius in metres when the source reports one.
-#[derive(Debug, Clone, PartialEq)]
+/// One position fix. `acc` is a radius in metres when the source reports one. The quality fields
+/// (`hdop`, `sats`) and speed over ground (`sog_kn`) feed the geofence's quality gate and underway
+/// detection (geofence.rs); every one is optional because most sources report only some of them.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct GpsFix {
     pub lat: f64,
     pub lon: f64,
     pub acc: Option<f64>,
+    pub hdop: Option<f64>,
+    pub sats: Option<u32>,
+    pub sog_kn: Option<f64>,
 }
 
 /// PURE: the base URL for a Cradlepoint on `host:port`. NCOS is plain HTTP on the LAN by default,
@@ -63,6 +68,7 @@ fn valid_fix(lat: Option<f64>, lon: Option<f64>, acc: Option<f64>) -> Option<Gps
         lat,
         lon,
         acc: acc.filter(|a| *a >= 0.0),
+        ..Default::default()
     })
 }
 
@@ -207,6 +213,10 @@ fn from_nmea_coord(raw: &str, hemi: &str) -> Option<f64> {
 /// The latest valid fix in a blob of sentences: RMC preferred (the LAST valid one — freshest), GGA
 /// as the fallback, carrying HDOP × 5 m as a rough accuracy. Talker-agnostic (GP/GN/GL…). Void
 /// RMC (`V`), GGA with no fix quality, and sentences that fail their checksum are skipped.
+///
+/// The quality fields ride along whichever sentence supplies the position: RMC field 7 is speed over
+/// ground (knots), GGA fields 7/8 are satellites in use and HDOP. An RMC fix keeps `acc` empty (RMC
+/// carries no accuracy) but borrows `sats`/`hdop` from a GGA in the same blob.
 pub fn parse_nmea(text: &str) -> Option<GpsFix> {
     let mut rmc: Option<GpsFix> = None;
     let mut gga: Option<GpsFix> = None;
@@ -223,28 +233,38 @@ pub fn parse_nmea(text: &str) -> Option<GpsFix> {
         let g = |i: usize| f.get(i).copied().unwrap_or("");
         let typ = &f[0][f[0].len().saturating_sub(3)..];
         if typ == "RMC" && g(2) == "A" {
-            if let Some(fix) = valid_fix(
+            if let Some(mut fix) = valid_fix(
                 from_nmea_coord(g(3), g(4)),
                 from_nmea_coord(g(5), g(6)),
                 None,
             ) {
+                fix.sog_kn = g(7).trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0);
                 rmc = Some(fix);
             }
         } else if typ == "GGA" {
             let quality: f64 = g(6).trim().parse().unwrap_or(0.0);
             if quality > 0.0 {
                 let hdop: Option<f64> = g(8).trim().parse().ok();
-                if let Some(fix) = valid_fix(
+                if let Some(mut fix) = valid_fix(
                     from_nmea_coord(g(2), g(3)),
                     from_nmea_coord(g(4), g(5)),
                     hdop.map(|h| h * 5.0),
                 ) {
+                    fix.hdop = hdop;
+                    fix.sats = g(7).trim().parse::<u32>().ok();
                     gga = Some(fix);
                 }
             }
         }
     }
-    rmc.or(gga)
+    match (rmc, gga) {
+        (Some(mut r), Some(g)) => {
+            r.hdop = g.hdop;
+            r.sats = g.sats;
+            Some(r)
+        }
+        (r, g) => r.or(g),
+    }
 }
 
 /// Only whole lines are parsed: a sentence cut mid-number by a read boundary must never yield a
@@ -434,6 +454,17 @@ mod nmea_tests {
     }
 
     #[test]
+    fn nmea_carries_speed_satellites_and_hdop_for_the_quality_gate() {
+        let rmc = parse_nmea(&sentence(RMC_BODY)).unwrap();
+        assert_eq!(rmc.sog_kn, Some(22.4), "RMC field 7 is SOG in knots");
+        assert_eq!((rmc.sats, rmc.hdop), (None, None));
+        let gga = parse_nmea(&sentence(GGA_BODY)).unwrap();
+        assert_eq!((gga.sats, gga.hdop, gga.sog_kn), (Some(8), Some(0.9), None));
+        let both = parse_nmea(&format!("{}\r\n{}\r\n", sentence(RMC_BODY), sentence(GGA_BODY))).unwrap();
+        assert_eq!((both.sats, both.hdop, both.sog_kn, both.acc), (Some(8), Some(0.9), Some(22.4), None));
+    }
+
+    #[test]
     fn void_rmc_no_fix_gga_bad_checksum_and_junk_are_skipped() {
         let void = sentence("GPRMC,123519,V,4807.038,N,01131.000,E,,,230394,,");
         assert_eq!(parse_nmea(&void), None);
@@ -547,14 +578,14 @@ mod tests {
     #[test]
     fn peplink_parses_the_info_location_envelope() {
         let b = json!({ "stat": "ok", "response": { "gps": true, "location": { "latitude": 37.8044, "longitude": -122.2712, "speed": 0 } } });
-        assert_eq!(parse_peplink_gps(&b), Some(GpsFix { lat: 37.8044, lon: -122.2712, acc: None }));
+        assert_eq!(parse_peplink_gps(&b), Some(GpsFix { lat: 37.8044, lon: -122.2712, acc: None, ..Default::default() }));
     }
 
     #[test]
     fn peplink_tolerates_a_flat_response_and_rejects_garbage() {
         assert_eq!(
             parse_peplink_gps(&json!({ "response": { "latitude": 37.8, "longitude": -122.3 } })),
-            Some(GpsFix { lat: 37.8, lon: -122.3, acc: None })
+            Some(GpsFix { lat: 37.8, lon: -122.3, acc: None, ..Default::default() })
         );
         assert_eq!(parse_peplink_gps(&json!({ "stat": "fail" })), None);
         assert_eq!(parse_peplink_gps(&json!(null)), None);
@@ -570,7 +601,8 @@ mod tests {
             Some(GpsFix {
                 lat: 41.4086,
                 lon: -81.7494,
-                acc: Some(12.5)
+                acc: Some(12.5),
+                ..Default::default()
             })
         );
     }
