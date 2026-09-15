@@ -1990,6 +1990,52 @@ check "heartbeat: never on the legacy /api/shelly path (it would be an alert a m
 check "heartbeat: a SECURITY ZONE alone gets none, and sends no position inside (owner ruling 2026-09-15)" "zone-only: due=no heartbeats=0 positions=0 sig=77" "$(sed -n 10p "$C17/g")"
 check "zone: the breach is still detected locally and sent at once; zone fixes are not tagged as an anchor watch" "zone-breach: event=1 anchorwatch-tag=0" "$(sed -n 11p "$C17/g")"
 
+# --- the anchor heartbeat clock: 5 min inside, retry within 60 s, breach immediate (owner 2026-09-15) ---
+(
+  hl17
+  apply_anchor 4321 41.4086 -81.7494 50 0
+  echo "vars=$GPS_HEARTBEAT_INSIDE_SEC/$GPS_HEARTBEAT_SEC/$GPS_HEARTBEAT_RETRY_SEC/$GPS_HEARTBEAT_RETRY_MAX_SEC" > "$C17/hb"
+  echo "new-watch-due-now=$([ "$(hb_due_at 5000)" = 5000 ] && echo yes || echo no)" >> "$C17/hb"
+  HB_OK=1
+  gps_heartbeat() { echo "$1" >> "$C17/hb.sent"; [ "$HB_OK" = 1 ] || return 1; LAST_REPORT_OK_AT=$1; HB_SENT_SIG=$(anchor_sig); }
+  rm -f "$C17/hb.sent"; ANCHOR_OUT=0
+  _t=100000; while [ "$_t" -lt 103600 ]; do hb_tick "$_t"; _t=$(( _t + 30 )); done
+  echo "armed-hour-inside=$(wc -l < "$C17/hb.sent" | tr -d ' ')" >> "$C17/hb"
+  echo "inside-due=$(( $(hb_due_at 200000) - LAST_REPORT_OK_AT ))" >> "$C17/hb"
+  ANCHOR_OUT=1; echo "outside-due=$(( $(hb_due_at 200000) - LAST_REPORT_OK_AT ))" >> "$C17/hb"; ANCHOR_OUT=0
+  LAST_REPORT_OK_AT=110000; echo "any-report-resets=$(hb_due_at 110010)" >> "$C17/hb"
+  # A failure at the due time: retried 30 s later, then at most 60 s apart, until one succeeds.
+  rm -f "$C17/hb.sent"; LAST_REPORT_OK_AT=120000; HB_OK=0
+  _t=120300; while [ "$_t" -le 120420 ]; do [ "$_t" -ge 120390 ] && HB_OK=1; hb_tick "$_t"; _t=$(( _t + 5 )); done
+  echo "retries=$(tr '\n' ' ' < "$C17/hb.sent")fails=$HB_FAILS next=$(( $(hb_due_at 120400) - 120390 ))" >> "$C17/hb"
+  echo "backoff=$(hb_retry_secs 1) $(hb_retry_secs 2) $(hb_retry_secs 5)" >> "$C17/hb"
+)
+check "heartbeat clock: named 300 s inside, 60 s outside, retry 30 s capped at 60 s" "vars=300/60/30/60" "$(sed -n 1p "$C17/hb")"
+check "heartbeat clock: a newly adopted watch heartbeats at once" "new-watch-due-now=yes" "$(sed -n 2p "$C17/hb")"
+check "heartbeat clock: about 12 heartbeats in an armed hour inside the radius (was 60)" "armed-hour-inside=12" "$(sed -n 3p "$C17/hb")"
+check "heartbeat clock: inside, due 300 s after the last successful report" "inside-due=300" "$(sed -n 4p "$C17/hb")"
+check "heartbeat clock: outside, back to 60 s" "outside-due=60" "$(sed -n 5p "$C17/hb")"
+check "heartbeat clock: any successful report resets it" "any-report-resets=110300" "$(sed -n 6p "$C17/hb")"
+check "heartbeat clock: a failure is retried after 30 s, then 60 s, and stops once one succeeds" "retries=120300 120330 120390 fails=0 next=300" "$(sed -n 7p "$C17/hb")"
+check "heartbeat clock: retry backoff 30, 60, never above 60" "backoff=30 60 60" "$(sed -n 8p "$C17/hb")"
+(
+  hl17
+  : > "$C17/urls"; printf '{"status":"ok"}' > "$C17/reply"
+  curl() { agent_curl "$@"; }
+  collect_gps() { echo "$SAMPLE"; }
+  apply_anchor 999 41.4086 -81.7494 50 0
+  SAMPLE="41.4086 -81.7494 5 9 0.9 0.0"; GPS_LAST_LAT=""; gps_tick; gps_tick
+  _before=$(wc -l < "$C17/urls" | tr -d ' ')
+  SAMPLE="41.4095 -81.7494 5 9 0.9 0.0"; gps_tick; gps_tick; HB_SENT_SIG=999
+  echo "breach: motion=$(grep -c 'event=anchor.motion' "$C17/urls") positions=$(grep -c 'event=gps.measurement' "$C17/urls") heartbeat-due=$(( $(hb_due_at "$(date +%s)") - LAST_REPORT_OK_AT ))" > "$C17/hbb"
+  # Curl fails (-f exit 22) on a real send: send_event reports failure and the retry is scheduled.
+  curl() { return 22; }
+  HB_SENT_SIG=999; LAST_REPORT_OK_AT=$(( $(date +%s) - 400 )); ANCHOR_OUT=0; hb_tick "$(date +%s)"
+  echo "fail: fails=$HB_FAILS retry-in=$(( HB_RETRY_AT - $(date +%s) ))" >> "$C17/hbb"
+)
+check "breach: the drag alarm on the 2nd outside sample and a position on each, with no wait for any clock" "breach: motion=1 positions=2 heartbeat-due=60" "$(sed -n 1p "$C17/hbb")"
+check "retry: a real failed heartbeat send (curl error) schedules the retry within 60 s" "fail: fails=1 retry-in=30" "$(sed -n 2p "$C17/hbb")"
+
 # --- the check-in (L1): the cadence switch, and what rides it ---
 LEASE_REPLY='{"status":"ok","event":"hub.checkin","lease":1,"leaseUntil":4102444800,"checkinSec":60,"live":1}'
 NOLEASE_REPLY='{"status":"ok","event":"hub.checkin","lease":0,"leaseUntil":0,"checkinSec":900,"live":0}'

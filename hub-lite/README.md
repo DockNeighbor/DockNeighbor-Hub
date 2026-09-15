@@ -193,8 +193,10 @@ If the app shows no position from the router, the order to check is: does `/dev/
   one position every 5 min (`UW_SEND_SEC`, owner ruling 2026-09-15) while underway (SOG >= 1.5 kn
   or >= 50 m on 2 fixes; ends after 5 min under 0.5 kn and 25 m; still sampled at 30 s); every sample while outside an armed ring; one final fix on disarm. There is no liveness
   send any more — the check-in is the liveness.
-- **Anchor watch armed:** 30 s samples, `gps.heartbeat` every 60 s (`fixValid sats hdop fixAgeS
-  inside distFromCenterM streak unreliable anchorsig`, no position), breach = 2 reliable samples
+- **Anchor watch armed:** 30 s samples; `gps.heartbeat` (`fixValid sats hdop fixAgeS inside
+  distFromCenterM streak unreliable anchorsig`, no position) 300 s after the last successful report
+  while inside the radius (`GPS_HEARTBEAT_INSIDE_SEC`, owner 2026-09-15), 60 s while outside, at once
+  for a new watch, and a failed one retried after 30 s then every 60 s; breach = 2 reliable samples
   outside by more than their accuracy. **Security zone armed:** detected locally (streak 3,
   `zone.motion` sent at once) with **no heartbeat** — owner, 2026-09-15: "Security zone is 15 min
   checkin, not faster like the anchorwatch." The quality gate (hdop > 5, sats < 4, fix older than 3

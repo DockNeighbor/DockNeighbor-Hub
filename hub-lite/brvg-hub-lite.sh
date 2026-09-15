@@ -514,6 +514,7 @@ EOF_DEVS
   fi
   if [ "$_verdict" = "sent" ]; then
     PENDING_ACK=""
+    LAST_REPORT_OK_AT=$(date +%s)
     echo "$_seq" > "$RELAY_SEQ_FILE"
     # Persist last-sent per device so the next delta knows what "unchanged" means.
     while IFS= read -r _dev; do
@@ -1118,6 +1119,7 @@ send_event() {
     return 1
   fi
   PENDING_ACK=""   # the worker saw our acks; anything still queued comes back below
+  LAST_REPORT_OK_AT=$(date +%s)   # any successful report resets the anchor heartbeat clock
   LAST_REPLY="$_resp"
   _cmds=$(printf '%s' "$_resp" | parse_commands)
   [ -n "$_cmds" ] && run_commands "$_cmds"
@@ -1516,7 +1518,10 @@ watch_hub() {
 # Numbers are the approved G1 set and the cloud's gpsFeed.ts constants; keep them equal.
 GPS_DEADBAND_FLOOR_M=25        # unarmed deadband floor (§A7.2: wander is 5-15 m, so never below 25)
 GPS_ARMED_SAMPLE_SEC=30        # sample interval while armed, underway, leased or read on the LAN
-GPS_HEARTBEAT_SEC=60           # `gps.heartbeat` while an ANCHOR WATCH is armed (never for a zone alone)
+GPS_HEARTBEAT_SEC=60           # `gps.heartbeat` while an ANCHOR WATCH is armed and the boat is OUTSIDE
+GPS_HEARTBEAT_INSIDE_SEC=300   # ...and while it is INSIDE the watch radius (owner ruling 2026-09-15)
+GPS_HEARTBEAT_RETRY_SEC=30     # a failed heartbeat is retried after 30 s, backing off to at most
+GPS_HEARTBEAT_RETRY_MAX_SEC=60 #   60 s: the cloud's lost-device alarm fires after 10 min without a report
 GPS_UNRELIABLE_HDOP=5          # the quality gate: hdop > 5, sats < 4, or a fix older than 3 samples
 GPS_UNRELIABLE_MIN_SATS=4
 UW_ENTER_SOG_KN=1.5            # underway: SOG >= 1.5 kn, or >= 50 m from the last SENT position,
@@ -1660,11 +1665,52 @@ gps_heartbeat_params() {
 }
 
 # One heartbeat. The legacy VEHICLE_KEY path posts to /api/shelly, which does NOT intercept
-# gps.heartbeat — it would be an alert every minute — so a token is required.
+# gps.heartbeat — it would be an alert every minute — so a token is required. Returns the send's
+# status, so the caller can schedule a retry.
 gps_heartbeat() {
   [ -n "${DEVICE_TOKEN:-}" ] || return 0
   hb_armed || return 0
-  send_event "gps.heartbeat" "$(gps_heartbeat_params "$1")"
+  send_event "gps.heartbeat" "$(gps_heartbeat_params "$1")" || return 1
+  HB_SENT_SIG=$(anchor_sig)
+}
+
+# The heartbeat clock (owner ruling 2026-09-15): "the anchor-watch gps.heartbeat goes every 5 minutes
+# while the boat is INSIDE the geofence."
+#   * Inside: GPS_HEARTBEAT_INSIDE_SEC (300 s) after the last SUCCESSFUL report of any kind — a
+#     check-in, an event, a batch or a heartbeat all prove the hub is alive, so each resets the clock.
+#   * Outside the radius: GPS_HEARTBEAT_SEC (60 s); breach positions go every 30 s sample anyway.
+#   * A newly adopted watch (a signature no heartbeat has carried yet): due at once, so the cloud
+#     sweep sees this hub running THIS watch as soon as possible.
+#   * A failed heartbeat: retried after GPS_HEARTBEAT_RETRY_SEC, backing off to
+#     GPS_HEARTBEAT_RETRY_MAX_SEC, until one succeeds.
+LAST_REPORT_OK_AT=0; HB_SENT_SIG=""; HB_FAILS=0; HB_RETRY_AT=0
+
+# PURE-ish (reads the clock globals): epoch seconds at which the next heartbeat is due. $1 now.
+hb_due_at() {
+  [ "$(anchor_sig)" != "${HB_SENT_SIG:-}" ] && { echo "$1"; return 0; }
+  _hbi=$GPS_HEARTBEAT_INSIDE_SEC; [ "${ANCHOR_OUT:-0}" = "1" ] && _hbi=$GPS_HEARTBEAT_SEC
+  _hbd=$(( ${LAST_REPORT_OK_AT:-0} + _hbi ))
+  [ "${HB_FAILS:-0}" -gt 0 ] && [ "${HB_RETRY_AT:-0}" -gt "$_hbd" ] && _hbd=$HB_RETRY_AT
+  echo "$_hbd"
+}
+
+# PURE: seconds to wait after the Nth consecutive heartbeat failure (30, then 60, never more).
+hb_retry_secs() {
+  _hr=$(( GPS_HEARTBEAT_RETRY_SEC * ${1:-1} ))
+  [ "$_hr" -gt "$GPS_HEARTBEAT_RETRY_MAX_SEC" ] && _hr=$GPS_HEARTBEAT_RETRY_MAX_SEC
+  echo "$_hr"
+}
+
+# Send the heartbeat if it is due, and schedule the retry when it fails. $1 now.
+hb_tick() {
+  hb_armed || { HB_SENT_SIG=""; HB_FAILS=0; HB_RETRY_AT=0; return 0; }
+  [ "$1" -ge "$(hb_due_at "$1")" ] || return 0
+  if gps_heartbeat "$1"; then
+    HB_FAILS=0; HB_RETRY_AT=0
+  else
+    HB_FAILS=$(( HB_FAILS + 1 )); HB_RETRY_AT=$(( $1 + $(hb_retry_secs "$HB_FAILS") ))
+    log "gps.heartbeat failed - retrying in $(( HB_RETRY_AT - $1 ))s"
+  fi
 }
 
 # The LAN read's file: the last sample and what the hub made of it. JSON with plain numbers only.
@@ -3029,7 +3075,7 @@ main() {
   # A link child from a previous run of this service must not outlive it; the first check-in (now)
   # decides afresh whether anyone is watching.
   rm -f "$LIVE_UNTIL_FILE" 2>/dev/null
-  _next_gps=0; _next_modem=0; _next_lt=0; _next_update=0; _next_checkin=0; _next_hb=0
+  _next_gps=0; _next_modem=0; _next_lt=0; _next_update=0; _next_checkin=0
   while :; do
     _now=$(date +%s)
     # A CGI rewrote the conf (/api/hub/config, /token, /bootstrap, /clear): read it again now.
@@ -3049,17 +3095,10 @@ main() {
       gps_tick
       _next_gps=$(( $(date +%s) + $(gps_sample_secs "$(date +%s)") ))
     fi
-    # 2. The armed heartbeat, every 60 s while an ANCHOR WATCH is armed (a security zone alone stays on
-    #    the check-in — owner ruling 2026-09-15); the first one straight after arming, so the cloud
-    #    sweep sees this hub running the watch as soon as possible.
-    if hb_armed; then
-      if [ "$(date +%s)" -ge "$_next_hb" ]; then
-        gps_heartbeat "$(date +%s)"
-        _next_hb=$(( $(date +%s) + GPS_HEARTBEAT_SEC ))
-      fi
-    else
-      _next_hb=0
-    fi
+    # 2. The armed heartbeat, ONLY while an ANCHOR WATCH is armed (a security zone alone stays on the
+    #    check-in): 300 s after the last successful report while inside, 60 s while outside, at once
+    #    for a new watch, failures retried within 60 s (hb_due_at). Owner rulings 2026-09-15.
+    hb_tick "$(date +%s)"
     # 3. LinkTap: the poll is the valve's safety loop (the volume cutoff), so it keeps its own clock.
     #    Its REPORTS are by exception (L3): a tick that spooled something drains at once.
     if lt_configured; then
@@ -3141,7 +3180,7 @@ main() {
     _lt_due=""
     lt_configured && _lt_due=$_next_lt
     _hb_due=""
-    [ "$_next_hb" -gt 0 ] && _hb_due=$_next_hb
+    hb_armed && _hb_due=$(hb_due_at "$(date +%s)")
     sleep "$(next_nap "$(date +%s)" "$_next_gps" "$_next_modem" "$_next_checkin" "$_hb_due" "$_lt_due")"
   done
 }
