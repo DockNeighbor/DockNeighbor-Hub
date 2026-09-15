@@ -2023,9 +2023,17 @@ modem_send_params() {
   printf '%s' "$_msp"
 }
 
+# What the check-in item already composed this tick, for send_modem to reuse on the fallback path.
+# 🔴 WITHOUT THIS THE FALLBACK LOSES THE INTERVAL'S WAN BYTES. The compose CONSUMES the deltas
+# (collect_wan_usage advances each interface's baseline), so when the batch that carried them is
+# refused and dropped, recomposing for the legacy GET reports zero and those bytes are gone from the
+# customer's plan-burn total for good. Consumed and cleared below, so it can never go out twice.
+CHECKIN_MODEM_SENT=""
+
 send_modem() {
   [ "$MODEM_PENDING" = "1" ] && [ -n "$MODEM_P" ] || return 0
-  _p=$(modem_send_params)
+  _p="${CHECKIN_MODEM_SENT:-}"; CHECKIN_MODEM_SENT=""
+  [ -n "$_p" ] || _p=$(modem_send_params)
   write_state "modem.measurement" "$_p"
   send_event "modem.measurement" "$_p" && MODEM_PENDING=0
 }
@@ -2952,16 +2960,24 @@ keys_on_checkin() {
 # one of CHECKIN_MODEM_FIELDS is present, and `av` alone is not one of them.
 #
 # `anchorsig` is deliberately absent — it goes on the batch URL (see drain_relay).
-checkin_item_params() {
+#
+# ⚠️ SETS `CHECKIN_ITEM` RATHER THAN ECHOING IT, because it must also leave CHECKIN_MODEM_SENT
+# behind. `CHECKIN_ITEM=$(compose_checkin_item)` would run this in a SUBSHELL, where that second
+# assignment is discarded the instant it returns — the fallback then loses the interval's WAN bytes
+# with nothing to show for it. (collect_wan_usage's own state survives a subshell: it is on disk.)
+compose_checkin_item() {
+  CHECKIN_MODEM_SENT=""
   if [ "${MODEM_PENDING:-0}" = "1" ] && [ -n "${MODEM_P:-}" ]; then
-    _cip=$(modem_send_params)
+    CHECKIN_ITEM=$(modem_send_params)
+    # Handed to send_modem if this batch is refused and the tick finishes the 0.17.0 way: the WAN
+    # deltas are consumed by the compose above and recomposing would report zero (see send_modem).
+    CHECKIN_MODEM_SENT="$CHECKIN_ITEM"
     # The LAN door's copy, exactly as send_modem writes it: what this router says about itself must
     # be the same through both doors, and the LAN door is the one that still works with the WAN down.
-    write_state "modem.measurement" "$_cip"
-    printf '%s' "$_cip"
+    write_state "modem.measurement" "$CHECKIN_ITEM"
     return 0
   fi
-  printf 'av=%s' "$HUB_LITE_VERSION"
+  CHECKIN_ITEM="av=$HUB_LITE_VERSION"
 }
 
 # The 0.17.0 path, kept verbatim for the fallback (rule 5): the check-in as its own GET, then the
@@ -2993,7 +3009,7 @@ do_checkin() {
   if batch_checkin_ready "$1"; then
     _dc_batched=1
     BATCH_REFUSED=0
-    CHECKIN_ITEM=$(checkin_item_params)
+    compose_checkin_item     # sets CHECKIN_ITEM, and CHECKIN_MODEM_SENT for the fallback
     drain_relay              # sets CHECKIN_OK, or BATCH_REFUSED if the endpoint is not there
     CHECKIN_ITEM=""
     [ "$BATCH_REFUSED" = "1" ] && { BATCH_REFUSED_AT=$1; _dc_batched=0; }

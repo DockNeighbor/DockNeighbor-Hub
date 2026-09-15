@@ -2181,6 +2181,25 @@ check "fallback: a 404 from /api/agent/batch still delivers the check-in, down t
 check "fallback: and that is the check-in GET plus the modem GET, exactly as 0.17.0 sent them" "checkin=1 modem=1" "$(sed -n 2p "$C17/fb")"
 check "fallback: the next tick does not re-ask an endpoint the cloud just refused" "next=0post/2get" "$(sed -n 3p "$C17/fb")"
 check "fallback: after the re-probe window a working batch endpoint is adopted again" "reprobe=1post/0get refused=0" "$(sed -n 4p "$C17/fb")"
+# The WAN deltas are CONSUMED by composing the check-in item (collect_wan_usage advances each
+# interface's baseline). If the refused batch is dropped and send_modem recomposes, the interval's
+# bytes report as zero and are gone from the plan-burn total for good — so the legacy GET reuses
+# exactly what the check-in item carried.
+(
+  hl17
+  : > "$C17/urls"; : > "$C17/bodies"
+  curl() { batch_curl "$@"; }
+  live_link_manage() { :; }; fetch_mgmt_key() { :; }; fetch_member_keys() { :; }
+  printf '%s' "$NOLEASE_REPLY" > "$C17/reply"
+  BATCH_CODE=404
+  # One compose's worth of usage, handed out once: a second collect_wan_usage would yield nothing.
+  collect_wan_usage() { if [ -f "$C17/wan.spent" ]; then printf ''; else : > "$C17/wan.spent"; printf '&wanSrc=cellular&wanKb_cellular=812'; fi; }
+  rm -f "$C17/wan.spent"
+  MODEM_P="up=1&rssi=-70"; MODEM_PENDING=1
+  do_checkin 60000
+  echo "kb=$(grep -c 'wanKb_cellular=812' "$C17/urls") pending=$MODEM_PENDING" > "$C17/wanfb"
+)
+check "fallback: the WAN bytes the refused batch consumed still reach the cloud on the legacy GET" "kb=1 pending=0" "$(sed -n 1p "$C17/wanfb")"
 
 # The whole point, counted: a quiet 24 h at the 15-minute idle cadence. Both numbers are MEASURED by
 # running the same code twice — once on the batch path, once forced onto the 0.17.0 path.
