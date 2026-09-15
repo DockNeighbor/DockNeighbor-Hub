@@ -12,6 +12,7 @@ pub mod gps;
 pub mod geofence;
 pub mod batch;
 pub mod cadence;
+pub mod key_sync;
 pub mod routers;
 pub mod peplink;
 pub mod starlink;

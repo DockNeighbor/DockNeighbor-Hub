@@ -63,8 +63,6 @@ use crate::routers::{vendor_supported, Driver};
 const WORKER_BASE: &str = "https://api.dockneighbor.com";
 
 const KEY_HEADER: &str = "x-brvg-key";
-/// Key refresh cadence — this IS the revocation latency until the WS push channel exists.
-const KEY_SYNC_SECS: u64 = 300;
 /// An unregistered hub polls the store at this cadence waiting for the bootstrap seed.
 const UNREGISTERED_POLL_SECS: u64 = 30;
 /// The lowest `heartbeatSecs` the config door accepts. The value is still stored and reported (the
@@ -87,6 +85,10 @@ const HEARTBEAT_FLOOR_SECS: u64 = 15;
 //     zone alone stays on the 15-minute cadence (owner ruling 2026-09-15).
 //   * every sample while a member holds the watch lease (do_watch), and the LAN live feed
 //     (/api/hub/gps/live) that costs the cloud nothing.
+//   * the MEMBER-KEY SYNC on the same principle (key_sync.rs, 0.3.50): it rides the payload reply's
+//     `keysSig` instead of its own 5-minute timer, so the 288 `/api/hub/keys` fetches a day — about
+//     22 Firestore reads each, to learn "no change" 287 times — become one at boot and one when the
+//     set actually changes.
 // A SKIPPED forward is not activity (H3): `note_activity` is rung only by real events, commands, a
 // refresh and a lease start — each of which is worth an early check-in.
 
@@ -184,22 +186,67 @@ struct KeysResp {
     keys: Vec<MemberKey>,
 }
 
+/// What a key fetch learned.
+#[derive(Debug)]
+pub enum KeyFetch {
+    /// A set, and the signature the worker put on it (its `ETag`) when it sent one.
+    Set { keys: Vec<MemberKey>, sig: Option<String> },
+    /// 304: the signature we offered is still the current one. Nothing to apply.
+    NotModified,
+}
+
 /// Pull the member-key set from the worker (increment C's endpoint), authenticated by the hub's
-/// own token. An error keeps the last known set — losing the network must not lock the owner out
-/// of a hub that is otherwise fine.
-pub async fn fetch_member_keys(client: &reqwest::Client, worker_base: &str, cfg: &HubConfig) -> Result<Vec<MemberKey>, String> {
+/// own token, CONDITIONALLY on the signature of the set we already hold. An error keeps the last
+/// known set — losing the network must not lock the owner out of a hub that is otherwise fine.
+///
+/// ⚠️ CONTRACT NOTE, verified against brvg-cloud-server main on 2026-09-15. `/api/hub/keys`
+/// (worker.ts `handleHubKeys`) today answers 200 `{status, keys}` with NO `ETag` and does not read
+/// `If-None-Match` — the conditional half of this is the ROUTER endpoint's
+/// (`/api/agent/member-keys`, routerMemberKeys.ts). Sending the header is therefore free and
+/// forward-compatible: today the worker ignores it and we fall back to signing the set ourselves
+/// with the identical algorithm (key_sync::member_set_sig); the day the hub endpoint grows the ETag
+/// and the 304, this already takes them. Nothing here depends on it.
+pub async fn fetch_member_keys_conditional(
+    client: &reqwest::Client,
+    worker_base: &str,
+    cfg: &HubConfig,
+    known_sig: Option<&str>,
+) -> Result<KeyFetch, String> {
     let base = worker_base.trim_end_matches('/');
     let mut u = url::Url::parse(&format!("{base}/api/hub/keys")).map_err(|e| e.to_string())?;
     u.query_pairs_mut()
         .append_pair("vid", &cfg.vid)
         .append_pair("device", &cfg.hub_id)
         .append_pair("t", &cfg.token);
-    let res = client.get(u).send().await.map_err(|e| e.without_url().to_string())?;
+    let mut req = client.get(u);
+    if let Some(sig) = known_sig.filter(|s| crate::key_sync::valid_sig(s)) {
+        req = req.header(reqwest::header::IF_NONE_MATCH, format!("\"{sig}\""));
+    }
+    let res = req.send().await.map_err(|e| e.without_url().to_string())?;
+    if res.status().as_u16() == 304 {
+        return Ok(KeyFetch::NotModified);
+    }
     if !res.status().is_success() {
         return Err(format!("HTTP {}", res.status().as_u16()));
     }
+    let sig = res
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().trim_start_matches("W/").trim_matches('"').to_string())
+        .filter(|v| crate::key_sync::valid_sig(v));
     let body: KeysResp = res.json().await.map_err(|e| e.without_url().to_string())?;
-    Ok(body.keys)
+    Ok(KeyFetch::Set { keys: body.keys, sig })
+}
+
+/// The unconditional form — the boot sync and the tests.
+pub async fn fetch_member_keys(client: &reqwest::Client, worker_base: &str, cfg: &HubConfig) -> Result<Vec<MemberKey>, String> {
+    match fetch_member_keys_conditional(client, worker_base, cfg, None).await? {
+        KeyFetch::Set { keys, .. } => Ok(keys),
+        // Unreachable: nothing was offered, so nothing can be unchanged. Never a panic — this runs
+        // against whatever the network returns.
+        KeyFetch::NotModified => Err("the worker answered 304 to an unconditional request".into()),
+    }
 }
 
 // --- Server -------------------------------------------------------------------------------------
@@ -214,6 +261,13 @@ pub struct Rt {
     /// The live key set. Loaded from the store at boot (offline reboot still authenticates known
     /// members), replaced wholesale by each successful sync.
     pub keys: tokio::sync::RwLock<Vec<MemberKey>>,
+    /// When the key set is worth fetching, and when it is not (key_sync.rs). The sync loop, the
+    /// batch reply and the LAN door all go through it, so the cadence is decided in ONE pure place
+    /// instead of by three timers.
+    pub key_sync: tokio::sync::Mutex<crate::key_sync::KeySync>,
+    /// Rings the key-sync loop to look NOW — a reply advertised a different signature, or the LAN
+    /// door met a key the set does not contain. Never a fetch by itself; the gate still decides.
+    pub key_wake: tokio::sync::Notify,
     /// Serializes read-modify-write of hub.json between handlers and the sync loop.
     pub store: tokio::sync::Mutex<()>,
     pub started: Instant,
@@ -382,6 +436,9 @@ pub type Shared = Arc<Rt>;
 
 pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
     let keys = hub_config::read_config_in(&base).member_keys;
+    // The signature persisted WITH that set, so a restart does not re-fetch what it already holds.
+    // Absent (every hub.json written before 0.3.50) simply means the boot sync learns it.
+    let key_sig = hub_config::read_config_in(&base).member_keys_sig;
     let web_ui_disabled = hub_config::read_config_in(&base).web_ui_disabled;
     // A turned-off local web app is not loaded at all: nothing served, nothing announced (the relay
     // hello and the status body both read `web`).
@@ -391,6 +448,11 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         web: tokio::sync::RwLock::new(web),
         web_ui_disabled: std::sync::atomic::AtomicBool::new(web_ui_disabled),
         keys: tokio::sync::RwLock::new(keys),
+        key_sync: tokio::sync::Mutex::new(crate::key_sync::KeySync::boot(
+            (!key_sig.is_empty()).then_some(key_sig),
+            now_ms(),
+        )),
+        key_wake: tokio::sync::Notify::new(),
         store: tokio::sync::Mutex::new(()),
         started: Instant::now(),
         worker_base,
@@ -876,6 +938,9 @@ async fn do_clear(rt: &Rt, caller: &Caller) -> Answer {
         }
     }
     *rt.keys.write().await = Vec::new();
+    // The store is gone, so the signature that described it is meaningless: whatever this hub is
+    // signed to next starts from a boot sync, not from a stale cache key.
+    *rt.key_sync.lock().await = crate::key_sync::KeySync::boot(None, now_ms());
     Answer { status: 204, body: String::new() }
 }
 
@@ -921,8 +986,15 @@ async fn do_update(caller: &Caller) -> Answer {
 
 async fn caller_from_headers(rt: &Rt, headers: &HeaderMap) -> Option<Caller> {
     let presented = headers.get(KEY_HEADER).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let keys = rt.keys.read().await;
-    authorize(&keys, presented).map(|k| Caller { uid: k.uid.clone(), role: k.role.clone() })
+    let hit = {
+        let keys = rt.keys.read().await;
+        authorize(&keys, presented).map(|k| Caller { uid: k.uid.clone(), role: k.role.clone() })
+    };
+    // A key we do not know may be one the cloud minted since our last sync. Ask (rate-limited).
+    if hit.is_none() && !presented.is_empty() {
+        note_unknown_key(rt).await;
+    }
+    hit
 }
 
 /// Every LAN request funnels through here: authenticate, THEN dispatch.
@@ -1980,10 +2052,13 @@ async fn post_batch(
     }
 }
 
-/// Everything a batch reply can carry: valve config-as-state, queued commands, the watch config.
+/// Everything a batch reply can carry: valve config-as-state, queued commands, the watch config,
+/// and the member-key set's signature (which is what makes key sync cost nothing while nothing
+/// changes — key_sync.rs).
 async fn handle_batch_reply(rt: &Rt, client: &reqwest::Client, body: &serde_json::Value) {
     apply_linktap_reply(rt, body).await;
     apply_watch_reply(rt, body).await;
+    apply_keys_reply(rt, body).await;
     handle_agent_commands(rt, client, body).await;
 }
 
@@ -2303,27 +2378,86 @@ async fn apply_linktap_reply(rt: &Rt, body: &serde_json::Value) {
     }
 }
 
+/// The key-sync loop — GATED, never periodic (key_sync.rs holds the whole rationale). It wakes on
+/// its tick or when something rings `key_wake`, asks the gate whether a fetch is due, and only then
+/// spends a request. An idle hub whose cloud signs the set fetches ONCE, at boot; the worst case —
+/// a cloud that never signs — is boot plus one refresh a day.
 async fn key_sync_loop(rt: Shared) {
     let client = http_client();
     loop {
-        let cfg = hub_config::read_config_in(&rt.base);
-        if !cfg.token.is_empty() {
-            match fetch_member_keys(&client, &rt.worker_base, &cfg).await {
-                Ok(keys) => {
-                    *rt.keys.write().await = keys.clone();
-                    let _g = rt.store.lock().await;
-                    let mut c = hub_config::read_config_in(&rt.base);
-                    c.member_keys = keys;
-                    if let Err(e) = hub_config::write_config_in(&rt.base, &c) {
-                        crate::hlog!("hub: could not persist member keys: {e}");
-                    }
-                }
-                // Keep the last known set — a network drop must not lock the owner out. (Before
-                // increment C's endpoint deploys this is a permanent 404: deny-all continues.)
-                Err(e) => crate::hlog!("hub: key sync failed (keeping previous keys): {e}"),
+        // The gate is consulted before the config file is even read: a tick that is not due must
+        // cost nothing at all.
+        if let Some(reason) = rt.key_sync.lock().await.due(now_ms()) {
+            let cfg = hub_config::read_config_in(&rt.base);
+            if !cfg.token.is_empty() {
+                sync_member_keys(&rt, &client, &cfg, reason).await;
             }
         }
-        tokio::time::sleep(Duration::from_secs(KEY_SYNC_SECS)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(crate::key_sync::TICK_SECS)) => {}
+            _ = rt.key_wake.notified() => {}
+        }
+    }
+}
+
+/// One key fetch, and everything that follows from its outcome. Separated from the loop so the
+/// tests can drive exactly one pass against a stub worker.
+async fn sync_member_keys(rt: &Rt, client: &reqwest::Client, cfg: &HubConfig, reason: crate::key_sync::Reason) {
+    let known = rt.key_sync.lock().await.if_none_match().map(str::to_string);
+    match fetch_member_keys_conditional(client, &rt.worker_base, cfg, known.as_deref()).await {
+        // The set we hold IS the current one. No write, no swap — and the clock restarts.
+        Ok(KeyFetch::NotModified) => {
+            rt.key_sync.lock().await.not_modified(now_ms());
+            crate::hlog!("hub: key sync ({}) - unchanged", reason.as_str());
+        }
+        Ok(KeyFetch::Set { keys, sig }) => {
+            let local = crate::key_sync::member_set_sig(&keys);
+            let applied = rt.key_sync.lock().await.applied_set(sig, local, now_ms());
+            let n = keys.len();
+            *rt.keys.write().await = keys.clone();
+            let _g = rt.store.lock().await;
+            let mut c = hub_config::read_config_in(&rt.base);
+            c.member_keys = keys;
+            c.member_keys_sig = applied;
+            if let Err(e) = hub_config::write_config_in(&rt.base, &c) {
+                crate::hlog!("hub: could not persist member keys: {e}");
+            }
+            crate::hlog!("hub: key sync ({}) - {n} member key(s)", reason.as_str());
+        }
+        // 🔴 KEEP THE LAST KNOWN SET — a network drop, a 500 or a 401 must not lock the owner out of
+        // a hub that is otherwise fine. The retry backs off (60 s doubling to 30 min) instead of
+        // coming round on the tick, so an outage costs a handful of attempts an hour.
+        Err(e) => {
+            let wait = rt.key_sync.lock().await.failed(now_ms());
+            crate::hlog!("hub: key sync failed (keeping previous keys, retrying in {wait}s): {e}");
+        }
+    }
+}
+
+/// Adopt the key-set signature a payload reply carried (flat `keysSig`). This is the whole cadence:
+/// a signature that agrees with ours is proof the set is current, a different one is the only
+/// routine reason to spend a fetch, and NO signature — an older worker — means no change.
+async fn apply_keys_reply(rt: &Rt, body: &serde_json::Value) {
+    let sig = crate::key_sync::parse_keys_sig(body);
+    let now = now_ms();
+    let due = {
+        let mut ks = rt.key_sync.lock().await;
+        ks.note_reply_sig(sig.as_deref(), now);
+        ks.due(now).is_some()
+    };
+    if due {
+        rt.key_wake.notify_one();
+    }
+}
+
+/// The LAN door met a key the set does not contain. A member whose key was just minted or rotated
+/// looks exactly like this, so the set is worth refreshing early — but so does someone trying keys
+/// at the door, which is why it is rate-limited (key_sync::DOOR_MISS_GAP_MS) rather than per request.
+async fn note_unknown_key(rt: &Rt) {
+    let rang = rt.key_sync.lock().await.note_door_miss(now_ms());
+    if rang {
+        crate::hlog!("hub: an unknown key was presented - refreshing the member keys");
+        rt.key_wake.notify_one();
     }
 }
 
@@ -4463,6 +4597,222 @@ mod tests {
         // caller keeps the previous key set.
         let miss = fetch_member_keys(&client, &format!("http://{addr}/nope"), &seeded_cfg()).await;
         assert!(miss.is_err());
+    }
+
+    // ── Key-sync CADENCE (key_sync.rs) ───────────────────────────────────────────────────────────
+    //
+    // The pure gate is exhaustively tested in key_sync.rs. These drive the real loop body against a
+    // real HTTP worker, so the wiring — what is actually REQUESTED, what is applied, what survives a
+    // failure — is measured rather than asserted about.
+
+    /// A `/api/hub/keys` stub: counts every request, honours `If-None-Match` with the set's own
+    /// signature (the ETag the hub endpoint does not send yet — see `fetch_member_keys_conditional`),
+    /// serves whatever set it currently holds, and can be told to fail.
+    #[derive(Default)]
+    struct KeyStub {
+        hits: usize,
+        conditional_hits: usize,
+        keys: Vec<MemberKey>,
+        etag: bool,
+        fail: bool,
+    }
+
+    async fn stub_key_worker(state: Arc<std::sync::Mutex<KeyStub>>) -> String {
+        let s = state.clone();
+        let app = Router::new().route(
+            "/api/hub/keys",
+            get(move |headers: HeaderMap| {
+                let s = s.clone();
+                async move {
+                    let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    let (keys, etag, fail) = {
+                        let mut g = s.lock().unwrap();
+                        g.hits += 1;
+                        if !inm.is_empty() {
+                            g.conditional_hits += 1;
+                        }
+                        (g.keys.clone(), g.etag, g.fail)
+                    };
+                    if fail {
+                        return Response::builder().status(503).body(axum::body::Body::empty()).unwrap();
+                    }
+                    let sig = crate::key_sync::member_set_sig(&keys);
+                    if inm == format!("\"{sig}\"") {
+                        return Response::builder().status(304).body(axum::body::Body::empty()).unwrap();
+                    }
+                    let body = serde_json::json!({ "status": "ok", "keys": keys }).to_string();
+                    let mut b = Response::builder().status(200).header("content-type", "application/json");
+                    if etag {
+                        b = b.header("etag", format!("\"{sig}\""));
+                    }
+                    b.body(axum::body::Body::from(body)).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// The hub the cadence tests drive: a registered hub pointed at the stub, with nothing synced.
+    async fn key_sync_rt(tag: &str, worker: String) -> (Shared, HubConfig, PathBuf) {
+        let base = temp_base(tag);
+        let cfg = seeded_cfg();
+        hub_config::write_config_in(&base, &cfg).unwrap();
+        (new_rt(base.clone(), worker), cfg, base)
+    }
+
+    #[tokio::test]
+    async fn boot_syncs_once_and_an_unchanged_signature_then_costs_nothing() {
+        let stub = Arc::new(std::sync::Mutex::new(KeyStub { keys: vec![key("owner"), key("monitor")], etag: true, ..Default::default() }));
+        let (rt, cfg, base) = key_sync_rt("keysig-quiet", stub_key_worker(stub.clone()).await).await;
+        let client = reqwest::Client::new();
+
+        // (4) Boot still syncs once — the gate says Boot is due, and the set lands and persists.
+        let reason = rt.key_sync.lock().await.due(now_ms()).expect("boot is due");
+        assert_eq!(reason, crate::key_sync::Reason::Boot);
+        sync_member_keys(&rt, &client, &cfg, reason).await;
+        assert_eq!(stub.lock().unwrap().hits, 1);
+        assert_eq!(rt.keys.read().await.len(), 2);
+        let sig = hub_config::read_config_in(&base).member_keys_sig;
+        assert!(crate::key_sync::valid_sig(&sig), "the signature is persisted next to the set: {sig:?}");
+        assert_eq!(sig, crate::key_sync::member_set_sig(&rt.keys.read().await), "and it signs the set we hold");
+
+        // (1) A DAY of check-in replies carrying that same signature: not one further request.
+        for _ in 0..96 {
+            apply_keys_reply(&rt, &serde_json::json!({ "status": "ok", "keysSig": sig })).await;
+            assert!(rt.key_sync.lock().await.due(now_ms()).is_none(), "an unchanged signature is never a reason to fetch");
+        }
+        assert_eq!(stub.lock().unwrap().hits, 1, "288 fetches a day became one");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_changed_signature_costs_exactly_one_fetch_and_applies_the_new_set() {
+        let stub = Arc::new(std::sync::Mutex::new(KeyStub { keys: vec![key("owner")], etag: true, ..Default::default() }));
+        let (rt, cfg, base) = key_sync_rt("keysig-changed", stub_key_worker(stub.clone()).await).await;
+        let client = reqwest::Client::new();
+        let reason = rt.key_sync.lock().await.due(now_ms()).unwrap();
+        sync_member_keys(&rt, &client, &cfg, reason).await;
+        assert_eq!(rt.keys.read().await.len(), 1);
+
+        // A member is added on the cloud; the next reply advertises the new signature.
+        stub.lock().unwrap().keys = vec![key("owner"), key("control")];
+        let next = crate::key_sync::member_set_sig(&stub.lock().unwrap().keys.clone());
+        apply_keys_reply(&rt, &serde_json::json!({ "keysSig": next })).await;
+        let reason = rt.key_sync.lock().await.due(now_ms()).expect("a changed signature is due");
+        assert_eq!(reason, crate::key_sync::Reason::Signature);
+        sync_member_keys(&rt, &client, &cfg, reason).await;
+        assert_eq!(stub.lock().unwrap().hits, 2, "exactly one fetch");
+        assert_eq!(rt.keys.read().await.len(), 2, "and the new set is live");
+        assert_eq!(hub_config::read_config_in(&base).member_keys_sig, next, "the advertised signature is what we now hold");
+        assert!(authorize(&rt.keys.read().await, &key("control").key).is_some(), "the added member is admitted");
+
+        // And the reply that follows agrees again, so the traffic stops.
+        apply_keys_reply(&rt, &serde_json::json!({ "keysSig": next })).await;
+        assert!(rt.key_sync.lock().await.due(now_ms()).is_none());
+        assert_eq!(stub.lock().unwrap().hits, 2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_no_signature_is_no_change_and_the_lan_door_is_the_early_path() {
+        // An OLDER WORKER sends no `keysSig` at all. That must not reintroduce a poll (see the
+        // key_sync.rs header) — the daily refresh is the whole fallback, and an unknown key at the
+        // door is the one thing that may ask early.
+        let stub = Arc::new(std::sync::Mutex::new(KeyStub { keys: vec![key("owner")], ..Default::default() }));
+        let (rt, cfg, base) = key_sync_rt("keysig-nosig", stub_key_worker(stub.clone()).await).await;
+        let client = reqwest::Client::new();
+        let reason = rt.key_sync.lock().await.due(now_ms()).unwrap();
+        sync_member_keys(&rt, &client, &cfg, reason).await;
+        assert_eq!(stub.lock().unwrap().hits, 1);
+        // No ETag either, so the set is signed locally — and that is what the next reply agrees with.
+        assert_eq!(
+            hub_config::read_config_in(&base).member_keys_sig,
+            crate::key_sync::member_set_sig(&[key("owner")]),
+        );
+
+        for _ in 0..96 {
+            apply_keys_reply(&rt, &serde_json::json!({ "status": "ok", "processed": 3 })).await;
+        }
+        assert!(rt.key_sync.lock().await.due(now_ms()).is_none(), "silence is not a reason to ask");
+        assert_eq!(stub.lock().unwrap().hits, 1, "a day of unsigned replies costs nothing");
+
+        // A key we have never seen shows up at the LAN door: ask once, and not again straight away.
+        let mut h = HeaderMap::new();
+        h.insert(KEY_HEADER, "key-someone-new".parse().unwrap());
+        for _ in 0..25 {
+            assert!(caller_from_headers(&rt, &h).await.is_none(), "an unknown key authenticates nothing");
+        }
+        let reason = rt.key_sync.lock().await.due(now_ms()).expect("the door asked");
+        assert_eq!(reason, crate::key_sync::Reason::DoorMiss);
+        sync_member_keys(&rt, &client, &cfg, reason).await;
+        assert_eq!(stub.lock().unwrap().hits, 2, "25 unknown keys at the door bought ONE refresh");
+        assert!(rt.key_sync.lock().await.due(now_ms()).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_304_changes_nothing_and_a_failure_keeps_the_last_known_set() {
+        let stub = Arc::new(std::sync::Mutex::new(KeyStub { keys: vec![key("owner"), key("monitor")], etag: true, ..Default::default() }));
+        let (rt, cfg, base) = key_sync_rt("keysig-304", stub_key_worker(stub.clone()).await).await;
+        let client = reqwest::Client::new();
+        let reason = rt.key_sync.lock().await.due(now_ms()).unwrap();
+        sync_member_keys(&rt, &client, &cfg, reason).await;
+        let held = rt.keys.read().await.clone();
+        let sig = hub_config::read_config_in(&base).member_keys_sig;
+
+        // (2) A conditional GET whose signature still matches: 304, and nothing moves.
+        sync_member_keys(&rt, &client, &cfg, crate::key_sync::Reason::Safety).await;
+        assert_eq!(stub.lock().unwrap().conditional_hits, 1, "the stored signature IS offered");
+        assert_eq!(*rt.keys.read().await, held, "a 304 changes nothing");
+        assert_eq!(hub_config::read_config_in(&base).member_keys_sig, sig);
+        assert!(rt.key_sync.lock().await.due(now_ms()).is_none(), "and it counts as confirmation");
+
+        // (3) The safety property: a refused or failed fetch keeps the last known set, so a network
+        // drop can never lock the owner out of a hub that is otherwise fine.
+        stub.lock().unwrap().fail = true;
+        apply_keys_reply(&rt, &serde_json::json!({ "keysSig": "c".repeat(64) })).await;
+        let reason = rt.key_sync.lock().await.due(now_ms()).unwrap();
+        sync_member_keys(&rt, &client, &cfg, reason).await;
+        assert_eq!(*rt.keys.read().await, held, "the owner's key still opens the door");
+        assert_eq!(hub_config::read_config_in(&base).member_keys, held, "and survives a reboot");
+        assert!(authorize(&rt.keys.read().await, &key("owner").key).is_some());
+        // And it backs off rather than retrying on the loop's tick.
+        assert!(rt.key_sync.lock().await.due(now_ms()).is_none(), "a failure waits before the next attempt");
+        assert!(
+            rt.key_sync.lock().await.due(now_ms() + crate::key_sync::BACKOFF_START_SECS * 1000).is_some(),
+            "and then tries again for the same reason",
+        );
+        let hits_before = stub.lock().unwrap().hits;
+        for _ in 0..30 {
+            if let Some(r) = rt.key_sync.lock().await.due(now_ms()) {
+                sync_member_keys(&rt, &client, &cfg, r).await;
+            }
+        }
+        assert_eq!(stub.lock().unwrap().hits, hits_before, "30 ticks of a dead worker cost nothing");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_pushed_set_is_signed_so_the_reply_that_follows_costs_no_fetch() {
+        // The socket push (hub_relay.rs) is the FAST path for a revocation; this only checks it
+        // leaves the cadence in a state where the cloud's own signature agrees with what we hold.
+        let stub = Arc::new(std::sync::Mutex::new(KeyStub { keys: vec![key("owner")], etag: true, ..Default::default() }));
+        let (rt, cfg, base) = key_sync_rt("keysig-push", stub_key_worker(stub.clone()).await).await;
+        let client = reqwest::Client::new();
+        let reason = rt.key_sync.lock().await.due(now_ms()).unwrap();
+        sync_member_keys(&rt, &client, &cfg, reason).await;
+
+        let pushed = vec![key("owner"), key("admin")];
+        let sig = crate::key_sync::member_set_sig(&pushed);
+        rt.key_sync.lock().await.note_pushed(sig.clone(), now_ms());
+        *rt.keys.write().await = pushed.clone();
+        apply_keys_reply(&rt, &serde_json::json!({ "keysSig": sig })).await;
+        assert!(rt.key_sync.lock().await.due(now_ms()).is_none(), "a pushed set needs no confirming fetch");
+        assert_eq!(stub.lock().unwrap().hits, 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A stub worker that records every `/api/agent/batch` post (query + body) and answers `reply`.

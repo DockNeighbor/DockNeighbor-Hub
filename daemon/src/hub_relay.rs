@@ -163,10 +163,16 @@ fn hello_frame(cfg: &HubConfig, lan_ips: &[String], web_version: Option<&str>) -
 /// Apply a pushed key set: live for the running server, and persisted so a reboot with no internet
 /// still authenticates known members.
 async fn apply_keys(rt: &Shared, keys: Vec<MemberKey>) {
+    // Sign the pushed set ourselves (key_sync::member_set_sig is the cloud's own algorithm), so the
+    // NEXT payload reply's `keysSig` agrees with what we hold and costs no fetch. A push is also
+    // proof of freshness: it restarts the daily safety clock.
+    let sig = crate::key_sync::member_set_sig(&keys);
+    rt.key_sync.lock().await.note_pushed(sig.clone(), crate::hub_server::now_ms());
     *rt.keys.write().await = keys.clone();
     let _g = rt.store.lock().await;
     let mut cfg = hub_config::read_config_in(&rt.base);
     cfg.member_keys = keys;
+    cfg.member_keys_sig = sig;
     if let Err(e) = hub_config::write_config_in(&rt.base, &cfg) {
         crate::hlog!("hub: could not persist pushed member keys: {e}");
     }
