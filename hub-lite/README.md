@@ -177,11 +177,19 @@ If the app shows no position from the router, the order to check is: does `/dev/
 
 ## Behavior
 
-- **Cadence (0.17.0, owner D6 and the 2026-09-15 ruling of ~100-200 hub->cloud updates a day).** One
-  dedicated check-in, `GET /api/agent?event=hub.checkin`, every **15 min** while nobody watches and
-  every **1 min** while the reply carries a watch lease (`lease`/`leaseUntil`/`checkinSec`/`live`,
-  flat). The newest modem sample, the idle LinkTap readings and the spool ride it; so do the
-  member-key set and the management key (L4). While `live` is 1 a background child holds the live
+- **Cadence (0.18.0, owner D6 and the 2026-09-15 ruling of ~100-200 hub->cloud updates a day).** One
+  check-in every **15 min** while nobody watches and every **1 min** while the reply carries a watch
+  lease (`lease`/`leaseUntil`/`checkinSec`/`live`, flat), sent as a **single**
+  `POST /api/agent/batch?...&anchorsig=<sig>` carrying a `hub.checkin` item, the newest modem sample
+  **on that same item**, the idle LinkTap readings and anything spooled. The reply answers the lease,
+  the commands, the `anchor` config delta and `keysSig` — the same fields the `/api/agent` reply
+  carried, read the same way. 0.17.0 spent two GETs per idle tick (the check-in, then a separate
+  `modem.measurement`) because only `/api/agent` carried the lease fields and did WAN KB accounting;
+  DockNeighbor-Cloud #327 moved both onto the batch, so a quiet 24 h now costs **96 requests instead
+  of 192**. The batch is always `kind: "delta"` — see the note in `drain_relay` for why no hub-lite
+  item can honestly claim to be a keyframe. A worker that predates #327 refuses the endpoint; the
+  hub-lite falls back to the 0.17.0 two-GET path and re-probes hourly. The member-key set and the
+  management key still ride the check-in (L4). While `live` is 1 a background child holds the live
   link (`GET /api/agent/live/poll` + `POST /api/agent/live/result`) and runs relayed calls through the
   same `/api/hub` door and role gate as the LAN; it closes when the lease does. Nothing is queued.
 - `GPS_INTERVAL` (default 120 s, floor 30) and `MODEM_INTERVAL` (default 600 s, floor 60) are

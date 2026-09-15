@@ -2046,38 +2046,171 @@ check "cadence: 15 min unwatched" "900" "$(checkin_interval 0 0 1000 1)"
 check "cadence: 1 min while a lease is live" "60" "$(checkin_interval 1 2000 1000 1)"
 check "cadence: a lease that has run out is unwatched" "900" "$(checkin_interval 1 999 1000 1)"
 check "cadence: a failed check-in retries within 2 min" "120" "$(checkin_interval 0 0 1000 0)"
+
+# --- 0.18.0: the check-in IS the batch (one POST /api/agent/batch per tick, not two GETs) --------
+# A curl stand-in that can answer BOTH shapes, so one stub covers the batch path and the fallback:
+#   POST (drain_relay: -o <file> -w %{http_code} -d <body> <url>) → logs "POST <url>", records the
+#     body, writes $C17/reply into the -o file and prints $BATCH_CODE (default 200) as the status;
+#   GET  (send_event: -fsS <url>)                                  → logs "GET <url>", prints the reply.
+batch_curl() {
+  _bc_o=""; _bc_body=""; _bc_p=""
+  for _a in "$@"; do
+    [ "$_bc_p" = "-o" ] && _bc_o="$_a"
+    [ "$_bc_p" = "-d" ] && _bc_body="$_a"
+    _bc_p="$_a"
+  done
+  _bc_url=$(eval "echo \"\${$#}\"")
+  if [ -n "$_bc_body" ]; then
+    echo "POST $_bc_url" >> "$C17/urls"
+    printf '%s\n' "$_bc_body" >> "$C17/bodies"
+    [ -n "$_bc_o" ] && cat "$C17/reply" > "$_bc_o" 2>/dev/null
+    printf '%s' "${BATCH_CODE:-200}"
+    return 0
+  fi
+  echo "GET $_bc_url" >> "$C17/urls"
+  cat "$C17/reply" 2>/dev/null
+}
+# The batch replies the worker now sends (DockNeighbor-Cloud agentBatchRoute.ts): the summary, plus
+# the SAME four flat lease fields, `keysSig`, `anchor` and `linktap` the /api/agent reply carried.
+B_KEYSIG=$(printf 'c%.0s' $(seq 1 64))
+B_KEYSIG2=$(printf 'd%.0s' $(seq 1 64))
+B_NOLEASE='{"status":"ok","processed":1,"failed":0,"touched":0,"skipped":0,"lease":0,"leaseUntil":0,"checkinSec":900,"live":0,"keysSig":"'"$B_KEYSIG"'"}'
+B_ROTATED='{"status":"ok","processed":1,"failed":0,"touched":0,"skipped":0,"lease":0,"leaseUntil":0,"checkinSec":900,"live":0,"keysSig":"'"$B_KEYSIG2"'"}'
+B_LEASE='{"status":"ok","processed":1,"failed":0,"touched":0,"skipped":0,"lease":1,"leaseUntil":4102444800,"checkinSec":60,"live":1,"keysSig":"'"$B_KEYSIG"'","anchor":{"sig":1757750400000,"lat":41.492907,"lon":-81.694361,"radiusM":60,"warnM":45,"hbSec":300,"sampleSec":30}}'
 (
   hl17
-  : > "$C17/urls"
-  curl() { agent_curl "$@"; }
-  drain_relay() { echo drain >> "$C17/ci.log"; }
+  : > "$C17/urls"; : > "$C17/bodies"; : > "$C17/ci.log"
+  curl() { batch_curl "$@"; }
   live_link_manage() { echo "manage lease=$LIVE_LEASE live=$LIVE_OK" >> "$C17/ci.log"; }
   fetch_member_keys() { echo keys >> "$C17/ci.log"; }
   fetch_mgmt_key() { :; }
-  : > "$C17/ci.log"
-  MODEM_P="up=1&rssi=-70"; MODEM_PENDING=1
-  printf '%s' "$NOLEASE_REPLY" > "$C17/reply"
+  # Not a param of MODEM_P: collect_wan_usage appends its own `wanSrc` on a real router, and the wire
+  # contract has no duplicate keys.
+  MODEM_P="up=1&rssi=-70&sinr=12&dataMb=1234"; MODEM_PENDING=1
+  printf '%s' "$B_NOLEASE" > "$C17/reply"
   do_checkin 10000
-  echo "idle=$(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" 10000 "$CHECKIN_OK")" > "$C17/ci"
-  printf '%s' "$LEASE_REPLY" > "$C17/reply"
+  echo "idle=$(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" 10000 "$CHECKIN_OK") reqs=$(wc -l < "$C17/urls" | tr -d ' ')" > "$C17/ci"
+  printf '%s' "$B_LEASE" > "$C17/reply"
+  MODEM_PENDING=1
   do_checkin 10060
-  echo "leased=$(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" 10060 "$CHECKIN_OK")" >> "$C17/ci"
-  printf '{"status":"ok","event":"hub.checkin"}' > "$C17/reply"
+  echo "leased=$(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" 10060 "$CHECKIN_OK") anchor=$(anchor_sig)" >> "$C17/ci"
+  printf '{"status":"ok","processed":1}' > "$C17/reply"
   do_checkin 10120
   echo "switch-off=$(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" 10120 "$CHECKIN_OK")" >> "$C17/ci"
-  cp "$C17/urls" "$C17/urls.ci"
+  cp "$C17/urls" "$C17/urls.ci"; cp "$C17/bodies" "$C17/bodies.ci"
   DEVICE_TOKEN=""; : > "$C17/urls"; do_checkin 10180
-  echo "legacy=$(grep -c 'hub.checkin' "$C17/urls")" >> "$C17/ci"
+  echo "legacy=$(grep -c 'hub.checkin' "$C17/urls") reqs=$(wc -l < "$C17/urls" | tr -d ' ')" >> "$C17/ci"
 )
-check "check-in: 900 s after a reply with no lease" "idle=900" "$(sed -n 1p "$C17/ci")"
-check "check-in: switches to 60 s when the reply carries a lease" "leased=60" "$(sed -n 2p "$C17/ci")"
-check "check-in: back to 900 s when a check-in reply stops carrying the lease" "switch-off=900" "$(sed -n 3p "$C17/ci")"
-check "check-in: never on the legacy VEHICLE_KEY path (/api/shelly would alert every 15 min)" "legacy=0" "$(sed -n 4p "$C17/ci")"
-check "check-in: three check-ins, each GET /api/agent event=hub.checkin with the version and the watch signature" "3" \
-  "$(grep -c '^https://api.example.test/api/agent?vid=v_test&device=brv_net_test&event=hub.checkin&t=tok_SECRET_0123456789&av=[0-9.]*&anchorsig=0$' "$C17/urls.ci")"
-check "check-in: the pending modem sample rides the FIRST check-in only (once per sample)" "1" "$(grep -c 'event=modem.measurement&.*up=1&rssi=-70&av=' "$C17/urls.ci")"
-check "check-in: every check-in drains the spool and settles the link" "drain|manage lease=0 live=0|drain|manage lease=1 live=1|drain|manage lease=0 live=0" \
-  "$(grep -v keys "$C17/ci.log" | tr '\n' '|' | sed 's/|$//')"
+check "check-in: 900 s after a batch reply with no lease, and it cost ONE request (0.17.0 spent two)" "idle=900 reqs=1" "$(sed -n 1p "$C17/ci")"
+check "check-in: the batch reply's lease switches the cadence to 60 s, and its anchor is adopted" "leased=60 anchor=1757750400000" "$(sed -n 2p "$C17/ci")"
+check "check-in: back to 900 s when a batch reply stops carrying the lease" "switch-off=900" "$(sed -n 3p "$C17/ci")"
+check "check-in: never on the legacy VEHICLE_KEY path (/api/shelly would alert every 15 min)" "legacy=0 reqs=0" "$(sed -n 4p "$C17/ci")"
+check "check-in: three check-ins, three POSTs to /api/agent/batch and no GET at all" "3 0" \
+  "$(grep -c '^POST' "$C17/urls.ci") $(grep -c '^GET' "$C17/urls.ci")"
+check "check-in: the watch signature rides the batch URL — agentBatchRoute reads ?anchorsig=, never the item's param" "3" \
+  "$(grep -c '^POST https://api.example.test/api/agent/batch?vid=v_test&device=brv_net_test&t=tok_SECRET_0123456789&anchorsig=[0-9]*$' "$C17/urls.ci")"
+check "check-in: the hub.checkin item carries the modem sample — the cloud stores it as modem.measurement" "2" \
+  "$(grep -c '"device":"brv_net_test","event":"hub.checkin","params":{"up":"1","rssi":"-70","sinr":"12","dataMb":"1234","av":"0\.18\.0"' "$C17/bodies.ci")"
+check "check-in: with no sample pending the item is a PLAIN check-in (av alone is not a reading)" "1" \
+  "$(grep -c '"event":"hub.checkin","params":{"av":"0\.18\.0"}' "$C17/bodies.ci")"
+check "check-in: the pending modem sample rides ONE check-in only (once per sample, as in 0.17.0)" "2" \
+  "$(grep -c '"rssi":"-70"' "$C17/bodies.ci")"
+check "check-in: the check-in batch is kind delta — a conditionally-built modem sample is not a keyframe" "3" \
+  "$(grep -c '"kind":"delta"' "$C17/bodies.ci")"
+check "check-in: every check-in still settles the link" "manage lease=0 live=0|manage lease=1 live=1|manage lease=0 live=0" \
+  "$(grep manage "$C17/ci.log" | tr '\n' '|' | sed 's/|$//')"
+
+# The member-key signature is read off the BATCH reply exactly as it was off the /api/agent reply.
+(
+  hl17
+  : > "$C17/urls"; : > "$C17/bodies"; : > "$C17/k2.log"
+  curl() { batch_curl "$@"; }
+  live_link_manage() { :; }
+  fetch_mgmt_key() { :; }
+  fetch_member_keys() { echo members >> "$C17/k2.log"; }
+  printf 'sig %s\n' "$B_KEYSIG" > "$MEMBER_KEYS_FILE"
+  printf '%s' "$B_NOLEASE" > "$C17/reply"          # keysSig == what we hold
+  do_checkin 20000
+  echo "same=$(grep -c members "$C17/k2.log")" > "$C17/k2"
+  printf '%s' "$B_ROTATED" > "$C17/reply"
+  do_checkin 20060
+  echo "changed=$(grep -c members "$C17/k2.log")" >> "$C17/k2"
+)
+check "check-in: keysSig on the BATCH reply — the member set is not re-fetched while it matches" "same=0" "$(sed -n 1p "$C17/k2")"
+check "check-in: a changed keysSig on the batch reply fetches the set, with no extra poll in between" "changed=1" "$(sed -n 2p "$C17/k2")"
+
+# The idle valves and anything else spooled ride the SAME single POST as the check-in.
+(
+  hl17
+  : > "$C17/urls"; : > "$C17/bodies"
+  curl() { batch_curl "$@"; }
+  live_link_manage() { :; }; fetch_mgmt_key() { :; }; fetch_member_keys() { :; }
+  printf '%s' "$B_NOLEASE" > "$C17/reply"
+  printf '1\tshellyht-b2\thumidity.change\trh=60\n' > "$RELAY_SPOOL"
+  printf '2\tlt_AAAA\tlinktap.measurement\twatering=0&vol_l=0.00\n' >> "$RELAY_SPOOL"
+  MODEM_P="up=1&rssi=-70"; MODEM_PENDING=1
+  do_checkin 30000
+  echo "reqs=$(wc -l < "$C17/urls" | tr -d ' ') items=$(grep -o '"device":"' "$C17/bodies" | wc -l | tr -d ' ')" > "$C17/mix"
+)
+check "check-in: the check-in, the modem, a valve and a relayed sensor leave in ONE post, as three items" "reqs=1 items=3" "$(sed -n 1p "$C17/mix")"
+
+# FALLBACK (rule 5): a worker that predates the batch endpoint answers 404. The check-in is not
+# optional, so the tick finishes on the 0.17.0 single-event path and stays there until the re-probe.
+(
+  hl17
+  : > "$C17/urls"; : > "$C17/bodies"
+  curl() { batch_curl "$@"; }
+  live_link_manage() { :; }; fetch_mgmt_key() { :; }; fetch_member_keys() { :; }
+  printf '%s' "$NOLEASE_REPLY" > "$C17/reply"
+  BATCH_CODE=404
+  MODEM_P="up=1&rssi=-70"; MODEM_PENDING=1
+  do_checkin 40000
+  echo "first=$(grep -c '^POST' "$C17/urls")post/$(grep -c '^GET' "$C17/urls")get ok=$CHECKIN_OK" > "$C17/fb"
+  echo "checkin=$(grep -c 'event=hub.checkin' "$C17/urls") modem=$(grep -c 'event=modem.measurement' "$C17/urls")" >> "$C17/fb"
+  : > "$C17/urls"
+  MODEM_P="up=1&rssi=-70"; MODEM_PENDING=1
+  do_checkin 40900
+  echo "next=$(grep -c '^POST' "$C17/urls")post/$(grep -c '^GET' "$C17/urls")get" >> "$C17/fb"
+  : > "$C17/urls"
+  BATCH_CODE=200; printf '%s' "$B_NOLEASE" > "$C17/reply"
+  MODEM_P="up=1&rssi=-70"; MODEM_PENDING=1
+  do_checkin $(( 40000 + BATCH_REPROBE_SEC ))
+  echo "reprobe=$(grep -c '^POST' "$C17/urls")post/$(grep -c '^GET' "$C17/urls")get refused=$BATCH_REFUSED_AT" >> "$C17/fb"
+)
+check "fallback: a 404 from /api/agent/batch still delivers the check-in, down the 0.17.0 path" "first=1post/2get ok=1" "$(sed -n 1p "$C17/fb")"
+check "fallback: and that is the check-in GET plus the modem GET, exactly as 0.17.0 sent them" "checkin=1 modem=1" "$(sed -n 2p "$C17/fb")"
+check "fallback: the next tick does not re-ask an endpoint the cloud just refused" "next=0post/2get" "$(sed -n 3p "$C17/fb")"
+check "fallback: after the re-probe window a working batch endpoint is adopted again" "reprobe=1post/0get refused=0" "$(sed -n 4p "$C17/fb")"
+
+# The whole point, counted: a quiet 24 h at the 15-minute idle cadence. Both numbers are MEASURED by
+# running the same code twice — once on the batch path, once forced onto the 0.17.0 path.
+(
+  hl17
+  LINKTAP_HOST=""; LINKTAP_GW_ID=""; LINKTAP_DEV_IDS=""     # a box with no valve: the check-in alone
+  curl() { batch_curl "$@"; }
+  live_link_manage() { :; }; fetch_mgmt_key() { :; }; fetch_member_keys() { :; }
+  printf '%s' "$B_NOLEASE" > "$C17/reply"
+  : > "$C17/urls"; : > "$C17/bodies"
+  _t=0
+  while [ "$_t" -lt 96 ]; do
+    MODEM_P="up=1&rssi=-70"; MODEM_PENDING=1
+    do_checkin $(( 50000 + _t * 900 ))
+    _t=$(( _t + 1 ))
+  done
+  echo "after=$(wc -l < "$C17/urls" | tr -d ' ')" > "$C17/day"
+  : > "$C17/urls"
+  # Forced onto the single-event path: a refusal far in the future is never within the re-probe window.
+  BATCH_REFUSED_AT=$(( 50000 + 96 * 900 )); printf '%s' "$NOLEASE_REPLY" > "$C17/reply"
+  _t=0
+  while [ "$_t" -lt 96 ]; do
+    MODEM_P="up=1&rssi=-70"; MODEM_PENDING=1
+    do_checkin $(( 50000 + _t * 900 ))
+    _t=$(( _t + 1 ))
+  done
+  echo "before=$(wc -l < "$C17/urls" | tr -d ' ')" >> "$C17/day"
+)
+check "24 h idle, 0.17.0: 96 check-ins cost 192 requests (a check-in GET and a modem GET each)" "before=192" "$(sed -n 2p "$C17/day")"
+check "24 h idle, 0.18.0: the same 96 check-ins cost 96 — one POST each, modem included" "after=96" "$(sed -n 1p "$C17/day")"
 
 # --- L4: keys ride the check-in ---
 (

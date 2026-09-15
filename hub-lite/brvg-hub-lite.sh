@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.17.0"
+HUB_LITE_VERSION="0.18.0"
 HUB_LITE_BACKUP="/etc/brvg-hub-lite.prev"
 
 # The LAST telemetry this hub-lite composed, as JSON, for the LAN management door to serve
@@ -357,6 +357,43 @@ build_batch_json() {
   printf '{"v":1,"seq":%s,"boot":"%s","kind":"%s","items":%s,"ok":%s,"agent":{"av":"%s","tier":"hub-lite"}}'     "$1" "$5" "$2" "${3:-[]}" "$_ok" "$HUB_LITE_VERSION"
 }
 
+# --- The check-in rides the batch (0.18.0) -----------------------------------------------------
+# 0.17.0 spent TWO GETs on an idle tick: `/api/agent?event=hub.checkin` for the lease fields, then a
+# second `/api/agent?event=modem.measurement` — because when it was written only the `/api/agent`
+# reply carried `lease`/`leaseUntil`/`checkinSec`/`live` and only that path did WAN KB accounting.
+# DockNeighbor-Cloud #327 moved BOTH onto the batch: `agentBatchRoute.ts` answers a batch whose items
+# include a `hub.checkin` with the same four lease fields, `keysSig`, `commands` and `anchor`, and
+# `liveLink.ts acceptHubCheckin` stores a check-in's modem params (`rssi`, `sinr`, `rsrp`, `rsrq`,
+# `wan`/`wanSrc`, `up`, `mode`, `carrier`, `sim`, `dataMb`, `wanKb_*`) as that router's
+# `modem.measurement`, WAN deltas accounted exactly as on `/api/agent`.
+#
+# So the check-in is now ONE POST that carries the check-in item, the modem sample, the idle valves
+# and anything else spooled. `drain_relay` is the one sender: `CHECKIN_ITEM` is the check-in's params
+# while a drain is a check-in drain, and empty for every other drain (the USR1 alarm poke, the valve
+# tick, the 30 s retry) — those stay exactly what they were.
+CHECKIN_ITEM=""
+
+# 🔴 `anchorsig` RIDES THE URL, NOT THE ITEM. agentBatchRoute.ts reads the watch signature from
+# `url.searchParams.get('anchorsig')` or from a `hub.status` item's param — never from a
+# `hub.checkin` item's params, where `checkinModemParams` strips it before storage. Putting it only
+# in the item would silently stop the `anchor` config delta from ever coming back.
+
+# Set when the cloud REFUSED the batch endpoint on a check-in — an older worker that predates #327
+# answers 404. Re-probed after BATCH_REPROBE_SEC so a worker deploy is picked up without restarting
+# the hub-lite, and every tick in between goes the 0.17.0 single-event way.
+BATCH_REFUSED_AT=0
+BATCH_REPROBE_SEC="${BRVG_BATCH_REPROBE_SEC:-3600}"
+# Set by drain_relay when THIS drain's batch was refused and it carried the check-in. A plain flag,
+# not a timestamp: do_checkin stamps it with the same `now` it does everything else with, so the
+# re-probe window is on one clock and testable without a real one.
+BATCH_REFUSED=0
+
+# PURE: may this check-in go as a batch? $1 now.
+batch_checkin_ready() {
+  [ "${BATCH_REFUSED_AT:-0}" = "0" ] && return 0
+  [ $(( $1 - BATCH_REFUSED_AT )) -ge "$BATCH_REPROBE_SEC" ]
+}
+
 RELAY_SPOOL="${BRVG_RELAY_SPOOL:-/tmp/brvg-relay.spool}"
 
 # The most lines the spool (and, separately, a failed batch waiting in .sending) may hold. The
@@ -451,14 +488,18 @@ drain_relay() {
   # on the bench 2026-08-13: checking only the live spool meant a failed batch was never retried
   # until NEW telemetry arrived — on a quiet vessel, never.
   _sending="$RELAY_SPOOL.sending"
-  [ -s "$RELAY_SPOOL" ] || [ -s "$_sending" ] || return 0
+  # A check-in drain ALWAYS posts, even with nothing spooled: the check-in item is the payload, and
+  # an empty envelope is still what tells the cloud this router is alive and picks up a lease.
+  [ -s "$RELAY_SPOOL" ] || [ -s "$_sending" ] || [ -n "${CHECKIN_ITEM:-}" ] || return 0
   # A previous failed drain left a .sending file — retry it first, oldest data wins.
   # The batch endpoint authenticates with the per-device token; a legacy VEHICLE_KEY-only box has no
   # way to send one, so its spool is bounded and left in place rather than posted and refused.
   [ -n "${DEVICE_TOKEN:-}" ] || { spool_cap "$RELAY_SPOOL"; return 0; }
   if [ ! -s "$_sending" ]; then
     spool_cap "$RELAY_SPOOL"
-    mv "$RELAY_SPOOL" "$_sending" 2>/dev/null || return 0
+    # `|| : > "$_sending"`, not `|| return 0`: with nothing spooled the mv fails and there is still a
+    # check-in to post (the guard above already refused the no-spool, no-check-in case).
+    mv "$RELAY_SPOOL" "$_sending" 2>/dev/null || : > "$_sending"
   fi
   mkdir -p "$RELAY_STATE_DIR"
   _seq=$( (cat "$RELAY_SEQ_FILE" 2>/dev/null || echo 0) | tr -cd '0-9' )
@@ -467,16 +508,28 @@ drain_relay() {
   # Split: a device whose newest spooled line matches its last-SENT line has nothing new — it goes
   # in `ok` (freshness only). Everything else ships as items. Every Nth drain resends all.
   #
-  # ⚠️ ALWAYS kind "delta", EVEN ON THE RESEND-ALL ROUND (0.17.0). The cloud's consolidated-payload
-  # contract (DockNeighbor-Cloud agentBatch.ts, 2026-09-15) makes "keyframe" mean EVERY item is a
-  # device's COMPLETE reading, stored over sensorState with no merge. A spooled Shelly
-  # `humidity.change` carries only `rh`, so a hub-lite "keyframe" would wipe that sensor's other fields.
+  # ⚠️ ALWAYS kind "delta", EVEN ON THE RESEND-ALL ROUND AND EVEN ON THE CHECK-IN BATCH (0.18.0).
+  # The cloud's consolidated-payload contract (DockNeighbor-Cloud agentBatch.ts, 2026-09-15) makes
+  # "keyframe" mean EVERY item is a device's COMPLETE reading, stored over sensorState with NO merge.
+  # Nothing a hub-lite sends can promise that, item by item:
+  #   * the `hub.checkin`/modem item — sample_modem builds its params CONDITIONALLY, one `[ -n .. ]`
+  #     per metric, so one AT read that times out drops `rssi`/`sinr`/`rsrq` from a single sample; a
+  #     keyframe would wipe the values the app is drawing rather than carry the last good ones;
+  #   * `linktap.measurement` — `mode`/`dur_s`/`cap_l`/`remain_s`/`prov` ride only WHILE RUNNING and
+  #     the flow rate only while watering, because the app deliberately draws a finished run's
+  #     numbers from the carried-forward fields (lt_measurement_params); a keyframe erases them the
+  #     instant a cycle ends;
+  #   * a relayed Shelly item is partial BY CONSTRUCTION — a `humidity.change` carries only `rh`.
   # The resend-all round is a hub-lite bookkeeping choice, not a promise that each item is complete.
   _kind="delta"
   _resend=0
   [ $(( _seq % ${KEYFRAME_EVERY:-6} )) -eq 0 ] && _resend=1
   _items_src="$_sending.items"
   : > "$_items_src"
+  # The check-in is ALWAYS an item, never an `ok` mention and never deduped against the last-sent
+  # state: it is the request that carries the lease question, so a tick that "changed nothing" still
+  # has to ask it. Written in spool-line shape so spool_to_items does the one escaping pass.
+  [ -n "${CHECKIN_ITEM:-}" ] && printf '%s\t%s\t%s\t%s\n' "$_seq" "$DEVICE_ID" "hub.checkin" "$CHECKIN_ITEM" >> "$_items_src"
   _ok_ids=""
   while IFS= read -r _dev; do
     _newest=$(awk -F'	' -v d="$_dev" '$2 == d' "$_sending" | tail -1)
@@ -497,6 +550,10 @@ EOF_DEVS
   # Same command piggyback + ack as send_event: the batch reply carries pending verbs, and the
   # request that delivers acks is the next one out — whichever path (event or batch) goes first.
   [ -n "$PENDING_ACK" ] && _url="${_url}&ack=${PENDING_ACK}"
+  # The watch signature we are running, on the URL — see the CHECKIN_ITEM block above for why it
+  # cannot ride the item. Without it the cloud has nothing to compare and never sends the `anchor`
+  # delta back, so an arm from the app would never reach this router.
+  [ -n "${CHECKIN_ITEM:-}" ] && _url="${_url}&anchorsig=$(anchor_sig)"
   # The status code is read rather than `-f`'s exit status, because a refusal and an outage need
   # opposite handling (classify_http): retrying a 401 forever wedges the spool behind a batch the
   # cloud will never accept, and dropping a 503 loses an alarm to a blip.
@@ -510,6 +567,13 @@ EOF_DEVS
     echo "$_seq" > "$RELAY_SEQ_FILE"
     rm -f "$_sending" "$_items_src"
     log "relay: batch seq=$_seq REFUSED by the cloud (HTTP $_code) - dropped; resending cannot help"
+    # A worker that predates Cloud #327 has no /api/agent/batch at all (404). The check-in is not
+    # optional, so stop asking for a while and let do_checkin fall back to the 0.17.0 single-event
+    # path — a hub-lite ahead of its worker keeps working, it just costs two requests again.
+    if [ -n "${CHECKIN_ITEM:-}" ]; then
+      BATCH_REFUSED=1
+      log "check-in: the cloud refused /api/agent/batch (HTTP $_code) - using the single-event path for ${BATCH_REPROBE_SEC}s"
+    fi
     return 0
   fi
   if [ "$_verdict" = "sent" ]; then
@@ -523,9 +587,25 @@ EOF_DEVS
 $(spool_devices < "$_sending")
 EOF_DEVS2
     rm -f "$_sending" "$_items_src"
-    log "relay: drained batch seq=$_seq ($([ "$_resend" = 1 ] && echo resend-all || echo delta))"
+    log "relay: drained batch seq=$_seq ($([ "$_resend" = 1 ] && echo resend-all || echo delta)${CHECKIN_ITEM:+, check-in})"
+    LAST_REPLY="$_resp"
     _cmds=$(printf '%s' "$_resp" | parse_commands)
     [ -n "$_cmds" ] && run_commands "$_cmds"
+    # A CHECK-IN batch: everything 0.17.0 read off the /api/agent reply is read off THIS reply
+    # instead — the same fields, the same shapes, the same rules (agentBatchRoute.ts builds its
+    # reply from the very functions /api/agent uses: agentReplyWatchFields, agentReplyLiveLinkFields,
+    # agentReplyKeysSig). Same order as send_event: commands, watch, lease, then the keys.
+    if [ -n "${CHECKIN_ITEM:-}" ]; then
+      CHECKIN_OK=1
+      BATCH_REFUSED_AT=0             # the re-probe worked: back on the batch path for good
+      MODEM_PENDING=0                # the sample rode this batch; one send per sample, as before
+      case "$_resp" in
+        *'"anchor"'*) apply_watch "$(printf '%s' "$_resp" | parse_anchor)" "$(printf '%s' "$_resp" | parse_zone)" ;;
+      esac
+      # Absent fields mean no lease (the `config/liveLink` switch is off): drop any we held.
+      apply_live_fields "$(printf '%s' "$_resp" | parse_live_fields)"
+      keys_on_checkin "$(date +%s)"
+    fi
     # Config-as-state rides the same reply (cloud-server #100) — apply after commands so a
     # profile edit and a verb in one reply behave like the TS hub: verb runs, state lands.
     printf '%s' "$_resp" | lt_parse_profiles | lt_apply_profiles
@@ -1927,16 +2007,25 @@ sample_modem() {
   write_state "modem.measurement" "$_p&av=$HUB_LITE_VERSION"
 }
 
+# The newest sample AS IT GOES ON THE WIRE. Report which hub-lite version is running, plus
+# per-source WAN usage. Staged rollout and rollback are unmanageable without the version: you cannot
+# decide who to update next if you cannot see what is deployed.
+#
+# 🔴 CALL THIS EXACTLY ONCE PER SEND. collect_wan_usage is DESTRUCTIVE — it advances each interface's
+# byte baseline — so a second call in the same tick reports zero and the first call's bytes are gone
+# if that send never happened. Both senders (the batch check-in and the legacy GET) go through here
+# so the deltas are read at SEND time and can never be read twice or dropped with an unsent sample.
+modem_send_params() {
+  _msp="$MODEM_P&av=$HUB_LITE_VERSION$(collect_wan_usage)"
+  # The daemon's heartbeat `update`: the newer feed version, when there is one (update_check).
+  _msp_u=$(cat "$HUB_LITE_UPDATE" 2>/dev/null | tr -cd '0-9.')
+  [ -n "$_msp_u" ] && _msp="$_msp&update=$_msp_u"
+  printf '%s' "$_msp"
+}
+
 send_modem() {
   [ "$MODEM_PENDING" = "1" ] && [ -n "$MODEM_P" ] || return 0
-  # Report which hub-lite version is running, plus per-source WAN usage. Staged rollout and rollback
-  # are unmanageable without the version: you cannot decide who to update next if you cannot see
-  # what is deployed. The WAN deltas are read HERE, at send time, so bytes that moved between two
-  # samples are never read and dropped by a sample that was not sent.
-  _p="$MODEM_P&av=$HUB_LITE_VERSION$(collect_wan_usage)"
-  # The daemon's heartbeat `update`: the newer feed version, when there is one (update_check).
-  _upd=$(cat "$HUB_LITE_UPDATE" 2>/dev/null | tr -cd '0-9.')
-  [ -n "$_upd" ] && _p="$_p&update=$_upd"
+  _p=$(modem_send_params)
   write_state "modem.measurement" "$_p"
   send_event "modem.measurement" "$_p" && MODEM_PENDING=0
 }
@@ -2855,14 +2944,30 @@ keys_on_checkin() {
   KEYS_ASKED_AT=$1
 }
 
-# One check-in: the hub.checkin itself, then what rides it — the newest modem sample (L1), the idle
-# valves' readings and anything else spooled (one batch), the keys (L4), the link (D6).
-# Echoes nothing; sets CHECKIN_OK. $1 now.
-do_checkin() {
-  CHECKIN_OK=0
-  # The legacy VEHICLE_KEY path posts to /api/shelly, which does NOT intercept hub.checkin: it would
-  # alert the crew every 15 minutes. No token, no check-in (that box reports GPS/modem as before).
-  [ -n "${DEVICE_TOKEN:-}" ] || return 0
+# The hub.checkin item's params (0.18.0). WITH a modem sample pending the check-in IS the modem
+# report — Cloud #327's acceptHubCheckin stores a check-in carrying modem fields as that router's
+# `modem.measurement`, WAN KB accounted the same way, so a hub-lite needs no second request per tick.
+# WITHOUT one it is a plain liveness check-in carrying nothing but the version, which the cloud must
+# not mistake for a reading: `checkinModemParams` classifies it as a measurement only when at least
+# one of CHECKIN_MODEM_FIELDS is present, and `av` alone is not one of them.
+#
+# `anchorsig` is deliberately absent — it goes on the batch URL (see drain_relay).
+checkin_item_params() {
+  if [ "${MODEM_PENDING:-0}" = "1" ] && [ -n "${MODEM_P:-}" ]; then
+    _cip=$(modem_send_params)
+    # The LAN door's copy, exactly as send_modem writes it: what this router says about itself must
+    # be the same through both doors, and the LAN door is the one that still works with the WAN down.
+    write_state "modem.measurement" "$_cip"
+    printf '%s' "$_cip"
+    return 0
+  fi
+  printf 'av=%s' "$HUB_LITE_VERSION"
+}
+
+# The 0.17.0 path, kept verbatim for the fallback (rule 5): the check-in as its own GET, then the
+# modem sample as a second GET, then the spool. Used when the cloud has refused /api/agent/batch —
+# an older worker that predates Cloud #327 — so a hub-lite ahead of its worker keeps working. $1 now.
+checkin_legacy() {
   if send_event "hub.checkin" "av=$HUB_LITE_VERSION&anchorsig=$(anchor_sig)"; then
     CHECKIN_OK=1
     # Absent fields on a check-in reply mean no lease (the switch is off): drop any we held.
@@ -2870,8 +2975,33 @@ do_checkin() {
     keys_on_checkin "$1"
   fi
   send_modem
-  lt_checkin_spool "$1"
   drain_relay
+}
+
+# One check-in: ONE POST /api/agent/batch carrying the hub.checkin item (with the newest modem
+# sample on it — L1), the idle valves' readings and anything else spooled. The reply answers the
+# lease (D6), the watch, the commands and the member-key signature (L4) — the same fields the
+# /api/agent reply carried, read the same way. Echoes nothing; sets CHECKIN_OK. $1 now.
+do_checkin() {
+  CHECKIN_OK=0
+  # The legacy VEHICLE_KEY path posts to /api/shelly, which does NOT intercept hub.checkin: it would
+  # alert the crew every 15 minutes. No token, no check-in (that box reports GPS/modem as before).
+  [ -n "${DEVICE_TOKEN:-}" ] || return 0
+  # Before the drain either path runs, so the idle valves ride whichever batch goes out.
+  lt_checkin_spool "$1"
+  _dc_batched=0
+  if batch_checkin_ready "$1"; then
+    _dc_batched=1
+    BATCH_REFUSED=0
+    CHECKIN_ITEM=$(checkin_item_params)
+    drain_relay              # sets CHECKIN_OK, or BATCH_REFUSED if the endpoint is not there
+    CHECKIN_ITEM=""
+    [ "$BATCH_REFUSED" = "1" ] && { BATCH_REFUSED_AT=$1; _dc_batched=0; }
+  fi
+  # No batch (refused now, or refused within the re-probe window): the check-in is not optional, so
+  # this tick finishes the 0.17.0 way. A retryable failure (an outage) does NOT come here — a second
+  # doomed request helps nobody, and checkin_interval already retries a failed check-in within 2 min.
+  [ "$_dc_batched" = "1" ] || checkin_legacy "$1"
   live_link_manage "$(date +%s)"
   # Managed routers (routers.sh) report on the same cadence: their poll is a sample clock too.
   [ -n "${RT_DIR:-}" ] && [ -d "$RT_DIR" ] && checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" 1 > "$RT_DIR/cadence" 2>/dev/null
@@ -3129,9 +3259,10 @@ main() {
       watch_hub
       _next_modem=$(( $(date +%s) + MODEM_INTERVAL ))
     fi
-    # 5. THE CHECK-IN (D6): 15 min unwatched, 1 min while a lease is live. The modem sample, the idle
-    #    valves, the spool (🔴 not gated on HUB_LITE_ENABLED — LinkTap telemetry, cycle ends, flood-close
-    #    records and the plan gate all travel through the drain), the keys and the link ride it.
+    # 5. THE CHECK-IN (D6): 15 min unwatched, 1 min while a lease is live — and since 0.18.0 ONE POST
+    #    /api/agent/batch, not a check-in GET plus a modem GET. The modem sample, the idle valves, the
+    #    spool (🔴 not gated on HUB_LITE_ENABLED — LinkTap telemetry, cycle ends, flood-close records
+    #    and the plan gate all travel through the drain), the keys and the link ride it.
     if [ "$(date +%s)" -ge "$_next_checkin" ]; then
       do_checkin "$(date +%s)"
       _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK") ))
