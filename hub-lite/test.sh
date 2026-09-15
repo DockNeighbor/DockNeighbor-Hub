@@ -1844,10 +1844,10 @@ hl17() {
 agent_curl() { eval "echo \"\${$#}\"" >> "$C17/urls"; cat "$C17/reply" 2>/dev/null; }
 
 # --- the flat v2 `anchor` object: the shared fixture's three cases, plus a zone-only arm ---
-FX_ARMED='{"status":"ok","anchor":{"sig":1757750400000,"lat":41.492907,"lon":-81.694361,"radiusM":60,"warnM":45,"hbSec":60,"sampleSec":30}}'
+FX_ARMED='{"status":"ok","anchor":{"sig":1757750400000,"lat":41.492907,"lon":-81.694361,"radiusM":60,"warnM":45,"hbSec":300,"sampleSec":30}}'
 FX_DISARM='{"status":"ok","anchor":{"sig":0}}'
-FX_EXTRAS='{"status":"ok","anchor":{"sig":3515501400000,"lat":41.492907,"lon":-81.694361,"radiusM":60,"warnM":45,"zoneCy":41.4929,"zoneCx":-81.6944,"zoneR":40,"zoneStreak":3,"hbSec":60,"sampleSec":30}}'
-FX_ZONE='{"status":"ok","anchor":{"sig":1757751000000,"zoneCy":41.4929,"zoneCx":-81.6944,"zoneR":40,"zoneStreak":3,"hbSec":60,"sampleSec":30},"lease":0,"leaseUntil":0,"checkinSec":900,"live":0}'
+FX_EXTRAS='{"status":"ok","anchor":{"sig":3515501400000,"lat":41.492907,"lon":-81.694361,"radiusM":60,"warnM":45,"zoneCy":41.4929,"zoneCx":-81.6944,"zoneR":40,"zoneStreak":3,"hbSec":300,"sampleSec":30}}'
+FX_ZONE='{"status":"ok","anchor":{"sig":1757751000000,"zoneCy":41.4929,"zoneCx":-81.6944,"zoneR":40,"zoneStreak":3,"hbSec":300,"sampleSec":30},"lease":0,"leaseUntil":0,"checkinSec":900,"live":0}'
 check "fixture v2 armed: hubLiteParse" "1757750400000 41.492907 -81.694361 60 45" "$(printf '%s' "$FX_ARMED" | parse_anchor)"
 check "fixture v2 armed: no zone" "" "$(printf '%s' "$FX_ARMED" | parse_zone)"
 check "fixture v2 disarm: hubLiteParse" "0" "$(printf '%s' "$FX_DISARM" | parse_anchor)"
