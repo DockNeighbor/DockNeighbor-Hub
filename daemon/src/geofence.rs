@@ -14,7 +14,9 @@
 // What decides a SEND (the cloud position), per GPS device:
 //   * leased (a member is watching)      → every sample (the quality gate flags, never suppresses)
 //   * a final fix owed after a disarm    → that one sample
-//   * underway                           → every sample (the voyage track; sampled at 30 s)
+//   * underway                           → one position every UNDERWAY_SEND_SECS (5 min — owner ruling
+//                                          2026-09-15), plus one on entry and one on stopping; still
+//                                          SAMPLED at 30 s so exit detection keeps its resolution
 //   * ANCHOR WATCH armed                 → only while a drag is confirmed (every 30 s tick outside);
 //                                          liveness is the 60 s `gps.heartbeat`
 //   * unarmed, or only a SECURITY ZONE   → moved ≥ 50 m (floor 25 m) AND > 2 × acc from the last SENT
@@ -52,6 +54,10 @@ pub const UNDERWAY_ENTER_STREAK: u32 = 2;
 pub const UNDERWAY_EXIT_SOG_KN: f64 = 0.5;
 pub const UNDERWAY_EXIT_NET_M: f64 = 25.0;
 pub const UNDERWAY_EXIT_MS: i64 = 5 * 60_000;
+/// Underway: how often the voyage track sends a `gps.measurement` (owner ruling, Jonathan 2026-09-15:
+/// "Underway: GPS goes every 5 minutes."). Entry/exit detection and the 30 s sampling are unchanged;
+/// a lease (someone has the app open) still sends every sample.
+pub const UNDERWAY_SEND_SECS: u64 = 300;
 /// The quality gate (cloud gpsFeed.ts UNRELIABLE_* — same numbers on both sides).
 pub const UNRELIABLE_HDOP: f64 = 5.0;
 pub const UNRELIABLE_MIN_SATS: u32 = 4;
@@ -227,6 +233,8 @@ pub struct Geofence {
     underway: bool,
     enter_streak: u32,
     slow_since: Option<(i64, f64, f64)>,
+    /// When the underway track last sent a position.
+    underway_sent_ms: Option<i64>,
     last: Option<Observed>,
 }
 
@@ -391,8 +399,19 @@ impl Geofence {
         } else if self.final_fix_owed {
             self.final_fix_owed = false;
             true
-        } else if self.underway || d.underway_changed == Some(false) {
+        } else if d.underway_changed.is_some() {
+            // Entering (the track's first point) or stopping (where the boat came to rest).
+            self.underway_sent_ms = if self.underway { Some(now_ms) } else { None };
             true
+        } else if self.underway {
+            let due = match self.underway_sent_ms {
+                None => true,
+                Some(t) => now_ms - t >= UNDERWAY_SEND_SECS as i64 * 1000,
+            };
+            if due {
+                self.underway_sent_ms = Some(now_ms);
+            }
+            due || (self.anchor_armed && anchor_breach)
         } else if self.anchor_armed {
             anchor_breach
         } else {
@@ -689,8 +708,9 @@ mod tests {
         let d = g.observe(None, &s, 30_000, false);
         assert_eq!(d.underway_changed, Some(true));
         assert!(d.send_position && g.underway() && g.wants_fast_sampling());
-        // Still moving: every sample sent.
-        assert!(g.observe(None, &s, 60_000, false).send_position);
+        // Still moving: sampled at 30 s, but the next position is not due for 5 minutes.
+        assert!(!g.observe(None, &s, 60_000, false).send_position);
+        assert!(g.observe(None, &s, 60_000, true).send_position, "a lease still sends every sample");
         // Stopped: 4 min 30 s is not enough.
         let mut stop = at(41.0 + north(3.0), -81.0);
         stop.sog_kn = Some(0.1);
@@ -703,6 +723,39 @@ mod tests {
         assert_eq!(d.underway_changed, Some(false));
         assert!(d.send_position, "the stop position goes out");
         assert!(!g.underway());
+    }
+
+    #[test]
+    fn an_underway_hour_sends_about_twelve_positions() {
+        // Owner ruling 2026-09-15: "Underway: GPS goes every 5 minutes." One hour at 6 kn, sampled
+        // every 30 s (120 samples), nobody watching.
+        let mut g = Geofence::default();
+        let (mut lat, lon) = (41.0, -81.0);
+        g.mark_sent(lat, lon);
+        let mut sends = 0;
+        for k in 0..120i64 {
+            lat += north(92.6); // 6 kn for 30 s
+            let mut s = at(lat, lon);
+            s.sog_kn = Some(6.0);
+            let d = g.observe(None, &s, k * 30_000, false);
+            if d.send_position {
+                sends += 1;
+                g.mark_sent(s.lat, s.lon);
+            }
+        }
+        assert!(g.underway());
+        assert!((12..=13).contains(&sends), "about 12 positions an hour underway, got {sends}");
+        // The same hour with the app open: every sample.
+        let mut w = Geofence::default();
+        let mut leased_sends = 0;
+        for k in 0..120i64 {
+            let mut s = at(41.0 + north(92.6 * k as f64), lon);
+            s.sog_kn = Some(6.0);
+            if w.observe(None, &s, k * 30_000, true).send_position {
+                leased_sends += 1;
+            }
+        }
+        assert_eq!(leased_sends, 120);
     }
 
     #[test]
