@@ -726,13 +726,24 @@ rt_poll_report() {
   fi
   if [ -s "$_rterrf" ] && [ "$(cat "$_rterrf")" != "no agent token" ]; then rt_log "$RT_HOST '$RT_NAME' - reachable again"; fi
   rm -f "$_rterrf"
+  # 🔴 0.17.0: THE POLL IS A SAMPLE CLOCK. The snapshot (what /api/hub/routers serves on the LAN) is
+  # refreshed every poll; `modem.measurement` goes to the cloud at the CHECK-IN cadence the main loop
+  # writes to $RT_DIR/cadence (900 s unwatched, 60 s while a member watches), plus the first poll after
+  # a start. The byte-counter baseline moves only when a report is SENT, so the KB delta covers every
+  # poll since the last report rather than only the last one.
+  _rtnow=$(date +%s)
+  _rtdue=1
+  _rtlast=$(cat "$RT_DIR/$RT_ID.sent" 2>/dev/null | tr -cd '0-9')
+  _rtcad=$(cat "$RT_DIR/cadence" 2>/dev/null | tr -cd '0-9')
+  [ -n "$_rtlast" ] && [ $(( _rtnow - _rtlast )) -lt $(( ${_rtcad:-900} - 5 )) ] && _rtdue=0
   _rtctr=$(awk -F "$RT_TAB" '$1 == "m.txBytes" { t = $2 } $1 == "m.rxBytes" { r = $2 } END { if (t != "" && r != "") print t " " r }' "$RT_DIR/$RT_ID.snap")
   _rtkb=""
-  if [ -n "$_rtctr" ]; then
+  if [ -n "$_rtctr" ] && [ "$_rtdue" = 1 ]; then
     _rtkb=$(rt_kb_delta "$(cat "$RT_DIR/$RT_ID.ctr" 2>/dev/null)" "$_rtctr")
     echo "$_rtctr" > "$RT_DIR/$RT_ID.ctr"
   fi
-  _rtq=$(rt_params "$_rtkb" < "$RT_DIR/$RT_ID.snap")
+  _rtq=""
+  [ "$_rtdue" = 1 ] && _rtq=$(rt_params "$_rtkb" < "$RT_DIR/$RT_ID.snap")
   if [ -n "$_rtq" ]; then
     if [ -z "$RT_TOKEN" ]; then
       [ -s "$RT_DIR/$RT_ID.tok" ] || { rt_log "$RT_HOST '$RT_NAME' - no agent token; status is local only until the app enrolls it"; echo 1 > "$RT_DIR/$RT_ID.tok"; }
@@ -743,18 +754,35 @@ rt_poll_report() {
       (
         # shellcheck disable=SC2030
         DEVICE_ID="$RT_ID"; DEVICE_TOKEN="$RT_TOKEN"; PENDING_ACK=""
-        run_commands() { :; }; apply_anchor() { :; }; lt_apply_profiles() { cat >/dev/null; }; lt_apply_allowed() { :; }
-        send_event modem.measurement "$_rtq"
+        run_commands() { :; }; apply_anchor() { :; }; apply_watch() { :; }; apply_live_fields() { :; }
+        lt_apply_profiles() { cat >/dev/null; }; lt_apply_allowed() { :; }
+        send_event modem.measurement "$_rtq" && echo "$_rtnow" > "$RT_DIR/$RT_ID.sent"
       ) || true
     fi
   fi
   if [ "$RT_GPS" = 1 ] && [ -n "$RT_GPSDEV" ]; then
     _rtg=$(awk -F "$RT_TAB" '{ S[$1] = $2 } END { if ("f.lat" in S) { printf "lat=%.6f&lon=%.6f", S["f.lat"], S["f.lon"]; if ("f.acc" in S) printf "&acc=%.1f", S["f.acc"] } }' "$RT_DIR/$RT_ID.snap")
-    if [ -n "$_rtg" ]; then
+    # The fix by exception (0.17.0, §A7.2): every poll while a member watches (the cadence file says
+    # 60), otherwise only the first fix and a move past the deadband (floor 25 m) that is also more
+    # than twice the fix's accuracy — the hub-lite's own GPS rule, gps_should_send.
+    if [ -n "$_rtg" ] && rt_gps_due "$_rtg" "${_rtcad:-900}"; then
       lt_spool "$RT_GPSDEV" gps.measurement "$_rtg"
+      printf '%s\n' "$_rtg" > "$RT_DIR/$RT_ID.gpssent"
       : > "$RT_DIR/drain"
     fi
   fi
+}
+
+# Should this managed-router fix be spooled? $1 "lat=..&lon=..[&acc=..]" $2 the check-in cadence.
+rt_gps_due() {
+  [ "$2" -le 60 ] 2>/dev/null && return 0
+  _rgl=$(cat "$RT_DIR/$RT_ID.gpssent" 2>/dev/null)
+  [ -n "$_rgl" ] || return 0
+  _rgv() { printf '%s' "$1" | tr '&' '\n' | sed -n "s/^$2=//p"; }
+  (
+    GPS_LAST_LAT=$(_rgv "$_rgl" lat); GPS_LAST_LON=$(_rgv "$_rgl" lon)
+    gps_should_send "$(_rgv "$1" lat)" "$(_rgv "$1" lon)" "$(_rgv "$1" acc)" 0 0 0 0
+  )
 }
 
 # The main loop's hook. Cheap and never blocking: a router that has stopped answering costs 15 s

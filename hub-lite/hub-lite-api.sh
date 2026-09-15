@@ -147,6 +147,27 @@ authorize() {
     monitor|control|configure|administer) : ;;
     *) fail 500 "unknown access level" ;;
   esac
+  # A CALL RELAYED OVER THE LIVE LINK (0.17.0, D6). The worker authenticated the caller and resolved
+  # their live role; the collector's live-link child (brvg-hub-lite.sh live_run_call) runs this door
+  # as a plain child process with that role in BRVG_RELAY_ROLE — the daemon's relay `call` frame, in
+  # shell. The gate below is then applied to it exactly as to a LAN key.
+  #
+  # 🔴 UNFORGEABLE FROM THE LAN BY CONSTRUCTION: uhttpd builds a CGI's environment itself — request
+  # headers only ever become HTTP_* variables — and always sets GATEWAY_INTERFACE and REMOTE_ADDR,
+  # which the collector's child unsets. A request through uhttpd therefore never reaches this branch.
+  if [ -n "${BRVG_RELAY_ROLE:-}" ] && [ -z "${GATEWAY_INTERFACE:-}" ] && [ -z "${REMOTE_ADDR:-}" ]; then
+    case "$BRVG_RELAY_ROLE" in
+      owner|coowner|admin|control|monitor|monitor_quiet) ROLE="$BRVG_RELAY_ROLE" ;;
+      *) fail 403 "this caller has no role on this vessel" ;;
+    esac
+    role_may "$ROLE" "$1" && return 0
+    case "$1" in
+      control)    fail 403 "operating the hub's devices needs control access or above" ;;
+      configure)  fail 403 "changing the hub's settings needs an admin, co-owner or owner" ;;
+      administer) fail 403 "rotating or removing the hub needs a co-owner or the owner" ;;
+      *)          fail 403 "this key may not read this hub" ;;
+    esac
+  fi
   if [ -z "${MGMT_KEY:-}" ] && [ ! -s "$KEYS_FILE" ]; then
     fail 503 "this hub-lite has no management keys yet"
   fi
@@ -467,6 +488,27 @@ case "$method:$verb" in
     conf_set "$@" || fail 500 "this router cannot write its own configuration"
     reload_conf
     reply 200 "$(status_json)"
+    ;;
+
+  # ---- gps/live (0.17.0, telemetry design §A7.11a) ---------------------------------------------
+  # The last GPS SAMPLE and what the collector made of it — position, fix quality, watch state — as
+  # JSON, for the app aboard (Anchor Watch / Zone / Away / Underway take their dot from it). Served
+  # verbatim from the collector's tmpfs file (brvg-hub-lite.sh gps_write_state), never re-read from
+  # the GPS here. Also reachable as /cgi-bin/gps. Reading it marks the collector to sample at 30 s
+  # for the next 120 s.
+  #
+  # A READ ENDPOINT, NOT A WEB PAGE (owner ruling D1: no local web page on the GL.iNet). It is keyed
+  # like /status (a boat's position is the crew's), serves no HTML, and `webUiEnabled` stays false:
+  # a hub-lite has no local web interface to switch on, and POST /config still refuses the toggle.
+  # NO LONG POLL, for the uhttpd reason given at linktap/state; the app polls it.
+  GET:/gps/live)
+    authorize monitor
+    date +%s > "${BRVG_HUB_LITE_GPS_HIT:-/tmp/brvg-hub-lite.gps-hit}" 2>/dev/null
+    _gl=$(cat "${BRVG_HUB_LITE_GPS:-/tmp/brvg-hub-lite.gps}" 2>/dev/null | tr -d '\n')
+    case "$_gl" in
+      '{"v":1,'*'}') reply 200 "$_gl" ;;
+      *) reply 200 '{"v":1,"state":"unknown","fixValid":false}' ;;
+    esac
     ;;
 
   # ---- gps (the daemon's own route, same body as config.gps) ------------------------------------

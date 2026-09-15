@@ -177,14 +177,36 @@ If the app shows no position from the router, the order to check is: does `/dev/
 
 ## Behavior
 
-- GPS every `GPS_INTERVAL` (default 120 s, floor 30), modem every `MODEM_INTERVAL` (default
-  600 s, floor 60). One small HTTPS GET per report — this rides the customer's metered link.
-- GPS **report-by-exception**: the fix is collected and the anchor drag check run every
-  `GPS_INTERVAL`, but the cloud SEND is skipped while parked — unless the fix moved past
-  `GPS_DEADBAND_M` (default 50 m), an anchor watch is armed (always sends), or `GPS_LIVENESS_SECS`
-  (default 1200 s / 20 min) has elapsed. `GPS_DEADBAND_M=0` disables it (send every tick). Keep the
-  liveness floor under the vehicle's offline threshold (default 60 min) so a parked hub never reads
-  as offline; a drag beyond the deadband, or an armed watch, always reports at full cadence.
+- **Cadence (0.17.0, owner D6 and the 2026-09-15 ruling of ~100-200 hub->cloud updates a day).** One
+  dedicated check-in, `GET /api/agent?event=hub.checkin`, every **15 min** while nobody watches and
+  every **1 min** while the reply carries a watch lease (`lease`/`leaseUntil`/`checkinSec`/`live`,
+  flat). The newest modem sample, the idle LinkTap readings and the spool ride it; so do the
+  member-key set and the management key (L4). While `live` is 1 a background child holds the live
+  link (`GET /api/agent/live/poll` + `POST /api/agent/live/result`) and runs relayed calls through the
+  same `/api/hub` door and role gate as the LAN; it closes when the lease does. Nothing is queued.
+- `GPS_INTERVAL` (default 120 s, floor 30) and `MODEM_INTERVAL` (default 600 s, floor 60) are
+  **sample** clocks, not send clocks. Managed routers (`routers.sh`) poll on their own clock but
+  report at the check-in cadence.
+- GPS **report-by-exception** (telemetry design §A7.2): local drag, zone and underway detection run
+  on every sample; a position is SENT only when unarmed and it moved `GPS_DEADBAND_M` (default 50 m,
+  floor 25 m) from the last sent one and more than twice its accuracy; every sample while leased;
+  one position every 5 min (`UW_SEND_SEC`, owner ruling 2026-09-15) while underway (SOG >= 1.5 kn
+  or >= 50 m on 2 fixes; ends after 5 min under 0.5 kn and 25 m; still sampled at 30 s); every sample while outside an armed ring; one final fix on disarm. There is no liveness
+  send any more — the check-in is the liveness.
+- **Anchor watch armed:** 30 s samples; `gps.heartbeat` (`fixValid sats hdop fixAgeS inside
+  distFromCenterM streak unreliable anchorsig`, no position) 300 s after the last successful report
+  while inside the radius (`GPS_HEARTBEAT_INSIDE_SEC`, owner 2026-09-15), 60 s while outside, at once
+  for a new watch, and a failed one retried after 30 s then every 60 s; breach = 2 reliable samples
+  outside by more than their accuracy. **Security zone armed:** detected locally (streak 3,
+  `zone.motion` sent at once) with **no heartbeat** — owner, 2026-09-15: "Security zone is 15 min
+  checkin, not faster like the anchorwatch." The quality gate (hdop > 5, sats < 4, fix older than 3
+  samples) never advances or clears a streak.
+- **LinkTap:** `linktap.measurement` only on a watering or RF-link transition and on each poll while
+  watering; an idle valve's reading rides the check-in. The poll itself (the volume cutoff) keeps
+  `LINKTAP_POLL`, and the local flood close is unchanged.
+- **LAN GPS read:** `GET /api/hub/gps/live` (also `/cgi-bin/gps`), member-key gated like `/status`:
+  the last sample as JSON. A read endpoint, not a web page (owner D1); reading it samples at 30 s for
+  120 s.
 - No fix → nothing sent (the cloud keeps last-known; "no fix" is diagnosed by the app's
   Health Check, not by telemetry spam). Failed sends are dropped; the next tick retries.
   Phase A is telemetry, not store-and-forward.
@@ -210,7 +232,7 @@ bench session (2026-08-06) plus standard NMEA/gpsd shapes. Runs in CI (`hub-lite
 `HUB_LITE_ENABLED=1` in `/etc/brvg-hub-lite.conf` turns this hub-lite into the **hub-lite tier** of the hub
 architecture: a LAN-only uhttpd instance serves
 `hub-lite-cgi.sh` at `http://<router>:8722/cgi-bin/report`, the Shellys' webhooks are re-registered
-against it, and the hub-lite drains the spool into ONE `/api/agent/batch` report per modem interval.
+against it, and the hub-lite drains the spool into ONE `/api/agent/batch` report per check-in (alarms go at once).
 
 Why: the metered link pays per TLS handshake, not per byte — one roll-up connection replaces one
 connection per device per event. And once no sensor talks to the internet directly, lockdown's
@@ -223,8 +245,9 @@ Rules that hold regardless of settings:
   spooled for the next drain — never both, so an alarm is never double-reported.
 - Devices whose newest values are UNCHANGED since the last successful report ride the `ok` list
   ("all my devices are good, except these") — a freshness touch, not data.
-- Every `KEYFRAME_EVERY`th drain is a full keyframe, bounding how long a lost delta can
-  leave the cloud's view stale.
+- Every `KEYFRAME_EVERY`th drain resends every device, bounding how long a lost delta can
+  leave the cloud's view stale. It is still sent as `kind: "delta"`: to the cloud a keyframe means
+  every item is a device's complete reading, which a spooled partial Shelly report is not.
 - A failed drain retries with the SAME sequence number, so the cloud can drop a replay whole
   instead of re-firing its alerts.
 

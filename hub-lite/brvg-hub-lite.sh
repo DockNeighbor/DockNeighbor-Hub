@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.16.0"
+HUB_LITE_VERSION="0.17.0"
 HUB_LITE_BACKUP="/etc/brvg-hub-lite.prev"
 
 # The LAST telemetry this hub-lite composed, as JSON, for the LAN management door to serve
@@ -186,6 +186,83 @@ parse_cradlepoint_gps() {
         if (lat == 0 && lon == 0) exit
         printf "%.5f %.5f\n", lat, lon
       }'
+}
+
+# --- Fix quality (0.17.0, telemetry design §A7.2 "Fix quality") --------------------------------
+# The position parsers above keep their exact output ("lat lon [acc]"); these read the SAME raw text
+# a second time for the quality gate: "sats hdop sogKn", "-" for anything the source does not say.
+# A missing field is unknown, never zero — zero satellites would read as an unreliable fix.
+
+# AT+QGPSLOC=2 → "sats hdop sogKn". Fields: UTC,lat,lon,hdop,alt,fix,cog,spkm,spkn,date,nsat.
+parse_qgpsloc_quality() {
+  awk -F'[:,]' '/\+QGPSLOC/ {
+    gsub(/\r/, "")
+    lat = $3 + 0; lon = $4 + 0
+    if (lat == 0 && lon == 0) exit
+    ns = ($12 ~ /^[ ]*[0-9]+$/) ? $12 + 0 : "-"
+    hd = ($5 + 0 > 0) ? $5 + 0 : "-"
+    sk = ($10 ~ /^[ ]*[0-9.]+$/) ? $10 + 0 : "-"
+    print ns, hd, sk
+    exit
+  }'
+}
+
+# NMEA → "sats hdop sogKn": sats and HDOP from the last valid GGA, speed over ground from the last
+# valid RMC (field 7, knots). The checksum rule is parse_nmea_rmc's, for the same torn-line reason.
+parse_nmea_quality() {
+  awk '
+    BEGIN { for (i = 32; i < 127; i++) ord[sprintf("%c", i)] = i; HEX = "0123456789ABCDEF"; ns = "-"; hd = "-"; sk = "-" }
+    function xor8(a, b,  r, bit, i) {
+      r = 0; bit = 1
+      for (i = 0; i < 8; i++) { if ((a % 2) != (b % 2)) r += bit; a = int(a / 2); b = int(b / 2); bit *= 2 }
+      return r
+    }
+    function sum_ok(line,  star, i, c, hx) {
+      star = 0
+      for (i = length(line); i > 1; i--) if (substr(line, i, 1) == "*") { star = i; break }
+      if (star == 0) return 1
+      c = 0
+      for (i = 2; i < star; i++) c = xor8(c, ord[substr(line, i, 1)] + 0)
+      hx = toupper(substr(line, star + 1, 2))
+      if (hx !~ /^[0-9A-F][0-9A-F]$/) return 0
+      return (index(HEX, substr(hx, 1, 1)) - 1) * 16 + index(HEX, substr(hx, 2, 1)) - 1 == c
+    }
+    {
+      line = $0; gsub(/[\r\n]/, "", line); sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+      if (substr(line, 1, 1) != "$" || !sum_ok(line)) next
+      body = line; sub(/\*.*$/, "", body)
+      n = split(body, f, ",")
+      tag = substr(f[1], length(f[1]) - 2)
+      if (tag == "RMC" && n >= 8 && f[3] == "A") {
+        sk = (f[8] ~ /^[0-9.]+$/) ? f[8] + 0 : "-"
+      } else if (tag == "GGA" && n >= 9 && (f[7] + 0) > 0) {
+        ns = (f[8] ~ /^[0-9]+$/) ? f[8] + 0 : "-"
+        hd = (f[9] + 0 > 0) ? f[9] + 0 : "-"
+      }
+    }
+    END { print ns, hd, sk }'
+}
+
+# gpsd TPV → "sats hdop sogKn". TPV carries speed (m/s) but neither sats nor HDOP (those are SKY).
+parse_gpsd_quality() {
+  awk '/"class":"TPV"/ && /"mode":[23]/ {
+    sk = "-"
+    if (match($0, /"speed":[0-9.]+/)) sk = sprintf("%.1f", substr($0, RSTART + 8, RLENGTH - 8) * 1.943844)
+    out = "- - " sk
+  } END { if (out != "") print out }'
+}
+
+# PURE: one sample line "lat lon acc sats hdop sogKn" out of a position line and a quality line,
+# "-" for every unknown field. Empty when there is no position.
+gps_join() {
+  [ -n "$1" ] || return 0
+  _gj_q="${2:-- - -}"
+  # shellcheck disable=SC2086
+  set -- $1
+  _gj_la=$1; _gj_lo=$2; _gj_ac=${3:--}
+  # shellcheck disable=SC2086
+  set -- $_gj_q
+  printf '%s %s %s %s %s %s' "$_gj_la" "$_gj_lo" "$_gj_ac" "${1:--}" "${2:--}" "${3:--}"
 }
 
 # gpsd TPV JSON (gpspipe -w) → "lat lon [acc]" from the last 2D/3D fix.
@@ -388,9 +465,16 @@ drain_relay() {
   _seq=$(( ${_seq:-0} + 1 ))
 
   # Split: a device whose newest spooled line matches its last-SENT line has nothing new — it goes
-  # in `ok` (freshness only). Everything else ships as items. Keyframe every Nth drain resends all.
+  # in `ok` (freshness only). Everything else ships as items. Every Nth drain resends all.
+  #
+  # ⚠️ ALWAYS kind "delta", EVEN ON THE RESEND-ALL ROUND (0.17.0). The cloud's consolidated-payload
+  # contract (DockNeighbor-Cloud agentBatch.ts, 2026-09-15) makes "keyframe" mean EVERY item is a
+  # device's COMPLETE reading, stored over sensorState with no merge. A spooled Shelly
+  # `humidity.change` carries only `rh`, so a hub-lite "keyframe" would wipe that sensor's other fields.
+  # The resend-all round is a hub-lite bookkeeping choice, not a promise that each item is complete.
   _kind="delta"
-  [ $(( _seq % ${KEYFRAME_EVERY:-6} )) -eq 0 ] && _kind="keyframe"
+  _resend=0
+  [ $(( _seq % ${KEYFRAME_EVERY:-6} )) -eq 0 ] && _resend=1
   _items_src="$_sending.items"
   : > "$_items_src"
   _ok_ids=""
@@ -398,7 +482,7 @@ drain_relay() {
     _newest=$(awk -F'	' -v d="$_dev" '$2 == d' "$_sending" | tail -1)
     _sig=$(printf '%s' "$_newest" | cut -f3-)
     _state="$RELAY_STATE_DIR/$_dev.last"
-    if [ "$_kind" = "delta" ] && [ -f "$_state" ] && [ "$(cat "$_state")" = "$_sig" ]; then
+    if [ "$_resend" = "0" ] && [ -f "$_state" ] && [ "$(cat "$_state")" = "$_sig" ]; then
       _ok_ids="${_ok_ids:+$_ok_ids }$_dev"
     else
       awk -F'	' -v d="$_dev" '$2 == d' "$_sending" >> "$_items_src"
@@ -430,6 +514,7 @@ EOF_DEVS
   fi
   if [ "$_verdict" = "sent" ]; then
     PENDING_ACK=""
+    LAST_REPORT_OK_AT=$(date +%s)
     echo "$_seq" > "$RELAY_SEQ_FILE"
     # Persist last-sent per device so the next delta knows what "unchanged" means.
     while IFS= read -r _dev; do
@@ -438,7 +523,7 @@ EOF_DEVS
 $(spool_devices < "$_sending")
 EOF_DEVS2
     rm -f "$_sending" "$_items_src"
-    log "relay: drained batch seq=$_seq ($_kind)"
+    log "relay: drained batch seq=$_seq ($([ "$_resend" = 1 ] && echo resend-all || echo delta))"
     _cmds=$(printf '%s' "$_resp" | parse_commands)
     [ -n "$_cmds" ] && run_commands "$_cmds"
     # Config-as-state rides the same reply (cloud-server #100) — apply after commands so a
@@ -465,15 +550,15 @@ load_config() {
   MODEM_INTERVAL="${MODEM_INTERVAL:-600}"
   [ "$GPS_INTERVAL" -lt 30 ] && GPS_INTERVAL=30       # floors: a metered link is not a firehose
   [ "$MODEM_INTERVAL" -lt 60 ] && MODEM_INTERVAL=60
-  # Report-by-exception for GPS (scanning redesign, Phase 3). The fix is COLLECTED and the anchor
-  # drag check RUN every GPS_INTERVAL regardless; these only gate the cloud SEND, to spare a metered
-  # link when a boat is parked and unarmed. A fix is still sent whenever it moves past the deadband,
-  # whenever an anchor watch is armed (always — the safety case), or once the liveness floor elapses
-  # (so the cloud's offline detection and away-watch never go stale).
-  GPS_DEADBAND_M="${GPS_DEADBAND_M:-50}"              # metres of movement before an unarmed send; 0 disables RBE
-  GPS_LIVENESS_SECS="${GPS_LIVENESS_SECS:-1200}"      # a send at least this often (20 min < the 60-min offline default)
-  [ "$GPS_DEADBAND_M" -lt 0 ] && GPS_DEADBAND_M=0
-  [ "$GPS_LIVENESS_SECS" -lt 60 ] && GPS_LIVENESS_SECS=60
+  # 🔴 0.17.0: GPS_INTERVAL AND MODEM_INTERVAL ARE SAMPLE CLOCKS, NOT SEND CLOCKS. What reaches the
+  # cloud is decided by the check-in (hub.checkin, 15 min / 1 min leased — owner D6 and the
+  # 2026-09-15 ruling of ~100-200 hub->cloud updates a day) and by the GPS geofence below, never by
+  # how often a value is read. Report-by-exception for GPS (telemetry design §A7.2, G1 approved):
+  # unarmed, a position is sent only when it moved GPS_DEADBAND_M from the last SENT one (floor 25 m)
+  # AND more than twice its own accuracy. The 20-minute liveness send is gone: the check-in is the
+  # liveness now.
+  GPS_DEADBAND_M="${GPS_DEADBAND_M:-50}"              # metres of movement before an unarmed send
+  [ "$GPS_DEADBAND_M" -lt "$GPS_DEADBAND_FLOOR_M" ] 2>/dev/null && GPS_DEADBAND_M=$GPS_DEADBAND_FLOOR_M
   AT_PORT="${AT_PORT:-/dev/ttyUSB2}"                  # GL-X750; X3000-class PCIe modems differ — see README
   GPS_SOURCE="${GPS_SOURCE:-auto}"                    # auto | at | gpsd | nmea
   GPS_DEVICE="${GPS_DEVICE:-}"                        # serial NMEA dongle for GPS_SOURCE=nmea
@@ -582,22 +667,26 @@ find_nmea_device() {
   return 1
 }
 
-read_nmea_device() {
+read_nmea_raw() {
   _dev=$(find_nmea_device) || return 1
   # head -c bounds the read on a device that streams forever; timeout guards a silent one.
-  timeout 6 head -c 4096 "$_dev" 2>/dev/null | parse_nmea_rmc
+  timeout 6 head -c 4096 "$_dev" 2>/dev/null
 }
+
+read_nmea_device() { read_nmea_raw | parse_nmea_rmc; }
 
 # NMEA over TCP — a chartplotter, AIS, gpsd, or a router serving NMEA on the LAN (GPS parity with
 # the hub's NMEA_HOST source; owner sprint 2026-08-17). The hub-lite is always the CLIENT.
 # ⚠️ BENCH-VERIFY before shipping to customers: busybox `nc` on FACTORY-STOCK GL.iNet firmware.
 # The bench box has extra packages installed, so it proves nothing about a stock router — the same
 # trap that made hand-installed Lua look like a working dependency.
-read_gps_tcp() {
+read_gps_tcp_raw() {
   [ -n "$GPS_HOST" ] || return 1
   command -v nc >/dev/null 2>&1 || { log "GPS_SOURCE=tcp needs nc (not found)"; return 1; }
-  nc -w 8 "$GPS_HOST" "${GPS_PORT:-10110}" 2>/dev/null | head -n 40 | parse_nmea_rmc
+  nc -w 8 "$GPS_HOST" "${GPS_PORT:-10110}" 2>/dev/null | head -n 40
 }
+
+read_gps_tcp() { read_gps_tcp_raw | parse_nmea_rmc; }
 
 # Cradlepoint NCOS local HTTP poll (the hub's CRADLEPOINT_HOST source, in shell): the router is
 # POLLED, never configured to send anywhere (owner ruling 2026-08-17).
@@ -628,25 +717,33 @@ read_gps_cradlepoint() {
     "$_cp_url" 2>/dev/null | parse_cradlepoint_gps
 }
 
+# One raw read, parsed twice (position + quality) into "lat lon acc sats hdop sogKn" ("-" unknown).
+# Reading the source once matters: a second AT or TCP read per sample doubles the modem/port time.
+gps_from_at()   { _gr=$(at_cmd 'AT+QGPSLOC=2' 3); gps_join "$(printf '%s\n' "$_gr" | parse_qgpsloc)" "$(printf '%s\n' "$_gr" | parse_qgpsloc_quality)"; }
+gps_from_nmea() { gps_join "$(printf '%s\n' "$1" | parse_nmea_rmc)" "$(printf '%s\n' "$1" | parse_nmea_quality)"; }
+gps_from_gpsd() {
+  command -v gpspipe >/dev/null 2>&1 || return 0
+  _gr=$(gpspipe -w -n 8 2>/dev/null)
+  gps_join "$(printf '%s\n' "$_gr" | parse_gpsd_tpv)" "$(printf '%s\n' "$_gr" | parse_gpsd_quality)"
+}
+
 collect_gps() {
   case "$GPS_SOURCE" in
-    at) at_cmd 'AT+QGPSLOC=2' 3 | parse_qgpsloc ;;
-    gpsd) command -v gpspipe >/dev/null 2>&1 && gpspipe -w -n 8 2>/dev/null | parse_gpsd_tpv ;;
-    nmea) read_nmea_device ;;
-    tcp) read_gps_tcp ;;
-    cradlepoint) read_gps_cradlepoint ;;
+    at) gps_from_at ;;
+    gpsd) gps_from_gpsd ;;
+    nmea) gps_from_nmea "$(read_nmea_raw)" ;;
+    tcp) gps_from_nmea "$(read_gps_tcp_raw)" ;;
+    cradlepoint) gps_join "$(read_gps_cradlepoint)" "" ;;
     auto)
       # Modem GNSS first (no extra hardware), then a USB dongle, then gpsd. The fallback ORDER is
       # the point: a router with no GPS antenna port answers the AT read forever with "no fix",
       # so the dongle has to be tried even when the modem is present and healthy.
       _fix=""
       if [ "$(detect_platform)" = "glinet" ]; then
-        _fix=$(at_cmd 'AT+QGPSLOC=2' 3 | parse_qgpsloc)
+        _fix=$(gps_from_at)
       fi
-      if [ -z "$_fix" ]; then _fix=$(read_nmea_device); fi
-      if [ -z "$_fix" ] && command -v gpspipe >/dev/null 2>&1; then
-        _fix=$(gpspipe -w -n 8 2>/dev/null | parse_gpsd_tpv)
-      fi
+      if [ -z "$_fix" ]; then _fix=$(gps_from_nmea "$(read_nmea_raw)"); fi
+      if [ -z "$_fix" ]; then _fix=$(gps_from_gpsd); fi
       [ -n "$_fix" ] && echo "$_fix" ;;
   esac
 }
@@ -678,12 +775,27 @@ ANCHOR_ALERTED="${BRVG_ANCHOR_ALERTED:-/tmp/brvg-anchor.alerted}" # sig whose AL
 ANCHOR_WARNED="${BRVG_ANCHOR_WARNED:-/tmp/brvg-anchor.warned}"    # sig whose WARNING already fired
 ANCHOR_STREAK="${BRVG_ANCHOR_STREAK:-/tmp/brvg-anchor.streak}"    # consecutive alarm-breach fixes
 ANCHOR_WSTREAK="${BRVG_ANCHOR_WSTREAK:-/tmp/brvg-anchor.wstreak}" # consecutive warn-breach fixes
+# The SECURITY ZONE (0.17.0, §A7.2): "sig cy cx radiusM streak". Same episode rules as the anchor, a
+# streak of 3 (the reply's zoneStreak) and its own latch. Arrives in the same flat `anchor` object.
+# Detection is local and its breach is sent at once; a zone gets NO 60 s heartbeat (owner, 2026-09-15:
+# "Security zone is 15 min checkin, not faster like the anchorwatch").
+ZONE_STATE="${BRVG_ZONE_STATE:-/tmp/brvg-zone.state}"
+ZONE_ALERTED="${BRVG_ZONE_ALERTED:-/tmp/brvg-zone.alerted}"
+ZONE_STREAK="${BRVG_ZONE_STREAK:-/tmp/brvg-zone.streak}"
 
-# The signature of the watch we are running; "0" when disarmed. Reported on every gps tick.
+# The signature of the watch we are running; "0" when disarmed. Echoed on every report as anchorsig.
+# A zone-only arm has no anchor state, so its signature comes from the zone file.
 anchor_sig() {
   set -- $(cat "$ANCHOR_STATE" 2>/dev/null)
+  [ -n "${1:-}" ] || set -- $(cat "$ZONE_STATE" 2>/dev/null)
   printf '%s' "${1:-0}"
 }
+
+# The last evaluation of each ring, for the heartbeat and the send rule: distance in metres ("" = not
+# evaluated) and whether the sample was OUTSIDE by more than its own accuracy.
+ANCHOR_D=""; ANCHOR_OUT=0; ZONE_D=""; ZONE_OUT=0
+# Set when a watch is taken down: the next sample sends one final position (§A7.2 "on disarm").
+GPS_FORCE_NEXT=0
 
 # Pure: great-circle distance in whole meters (haversine; busybox awk has the trig).
 anchor_distance() {
@@ -714,16 +826,38 @@ parse_anchor() {
   printf '%s %s %s %s %s' "$_sig" "$_la" "$_lo" "$_ra" "${_wa:-0}"
 }
 
+# Pure: the security zone out of the same flat v2 `anchor` object → "sig cy cx radiusM streak".
+# Empty when the object carries no zone (absent zone keys mean no zone is armed). zoneStreak
+# defaults to 3, the approved number, when the cloud omits it.
+parse_zone() {
+  _zin=$(tr -d ' \n' | sed -n 's/.*"anchor":{\([^}]*\)}.*/\1/p')
+  [ -z "$_zin" ] && return 0
+  _zsig=$(printf '%s' "$_zin" | sed -n 's/.*"sig":\([0-9][0-9]*\).*/\1/p')
+  _zcy=$(printf '%s' "$_zin" | sed -n 's/.*"zoneCy":\(-\{0,1\}[0-9.][0-9.]*\).*/\1/p')
+  _zcx=$(printf '%s' "$_zin" | sed -n 's/.*"zoneCx":\(-\{0,1\}[0-9.][0-9.]*\).*/\1/p')
+  _zr=$(printf '%s' "$_zin" | sed -n 's/.*"zoneR":\([0-9][0-9]*\).*/\1/p')
+  _zst=$(printf '%s' "$_zin" | sed -n 's/.*"zoneStreak":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$_zsig" ] || [ "$_zsig" = "0" ] || [ -z "$_zcy" ] || [ -z "$_zcx" ] || [ -z "$_zr" ] && return 0
+  [ "${_zst:-0}" -ge 1 ] 2>/dev/null || _zst=3
+  printf '%s %s %s %s %s' "$_zsig" "$_zcy" "$_zcx" "$_zr" "$_zst"
+}
+
 # Adopt a config from the reply. A changed signature is a NEW EPISODE by construction: latches and
 # streaks reset, exactly like the cloud sweep's re-arm semantics.
 apply_anchor() {
   _new_sig="${1:-}"
   [ -z "$_new_sig" ] && return 0
   _cur=$(anchor_sig)
-  [ "$_new_sig" = "$_cur" ] && return 0
-  rm -f "$ANCHOR_ALERTED" "$ANCHOR_WARNED" "$ANCHOR_STREAK" "$ANCHOR_WSTREAK" 2>/dev/null
+  if [ "$_new_sig" = "$_cur" ]; then
+    # The same signature is the same watch — unless it is a zone-only arm's signature arriving with
+    # anchor keys, which cannot happen (adding the anchor changes the sum), but must not be lost if it did.
+    [ "$_new_sig" = "0" ] && return 0
+    [ -s "$ANCHOR_STATE" ] && return 0
+  fi
+  rm -f "$ANCHOR_ALERTED" "$ANCHOR_WARNED" "$ANCHOR_STREAK" "$ANCHOR_WSTREAK" "$ZONE_ALERTED" "$ZONE_STREAK" 2>/dev/null
   if [ "$_new_sig" = "0" ]; then
-    rm -f "$ANCHOR_STATE" 2>/dev/null
+    rm -f "$ANCHOR_STATE" "$ZONE_STATE" 2>/dev/null
+    [ "$_cur" != "0" ] && GPS_FORCE_NEXT=1
     log "anchor watch: disarmed by cloud config"
   else
     printf '%s %s %s %s %s' "$_new_sig" "$2" "$3" "$4" "${5:-0}" > "$ANCHOR_STATE"
@@ -731,13 +865,36 @@ apply_anchor() {
   fi
 }
 
-# One ring's two-consecutive-fixes rule. $1 streak-file $2 latch-file $3 sig $4 dist $5 limit
-# $6 event $7 extra-params. Fires at most once per episode; recovery inside the ring clears both.
+# Adopt the whole watch from one reply: the anchor (parse_anchor's line) and the zone (parse_zone's).
+# A reply with a zone but no anchor keys is a ZONE-ONLY arm; an armed reply without zone keys means
+# no zone. Both files carry the same signature, which is what the hub echoes.
+apply_watch() {
+  _aw_a="$1"; _aw_z="$2"
+  if [ -n "$_aw_a" ]; then
+    # shellcheck disable=SC2086
+    apply_anchor $_aw_a
+    [ "$_aw_a" = "0" ] && return 0
+    if [ -n "$_aw_z" ]; then
+      [ "$(cat "$ZONE_STATE" 2>/dev/null)" = "$_aw_z" ] || { printf '%s' "$_aw_z" > "$ZONE_STATE"; log "security zone: armed (radius $(echo "$_aw_z" | cut -d' ' -f4)m)"; }
+    elif [ -s "$ZONE_STATE" ]; then
+      rm -f "$ZONE_STATE" "$ZONE_ALERTED" "$ZONE_STREAK" 2>/dev/null
+    fi
+  elif [ -n "$_aw_z" ]; then
+    [ "$(cat "$ZONE_STATE" 2>/dev/null)" = "$_aw_z" ] && [ ! -s "$ANCHOR_STATE" ] && return 0
+    rm -f "$ANCHOR_STATE" "$ANCHOR_ALERTED" "$ANCHOR_WARNED" "$ANCHOR_STREAK" "$ANCHOR_WSTREAK" "$ZONE_ALERTED" "$ZONE_STREAK" 2>/dev/null
+    printf '%s' "$_aw_z" > "$ZONE_STATE"
+    log "security zone: armed (radius $(echo "$_aw_z" | cut -d' ' -f4)m, no anchor watch)"
+  fi
+}
+
+# One ring's consecutive-fixes rule. $1 streak-file $2 latch-file $3 sig $4 dist $5 limit
+# $6 event $7 extra-params [$8 streak needed, default 2 — the zone passes 3]. Fires at most once per
+# episode; recovery inside the ring clears both.
 anchor_ring() {
   if [ "$4" -gt "$5" ]; then
     _n=$(( $(cat "$1" 2>/dev/null | tr -cd '0-9') + 1 ))
     echo "$_n" > "$1"
-    if [ "$_n" -ge 2 ] && [ "$(cat "$2" 2>/dev/null)" != "$3" ]; then
+    if [ "$_n" -ge "${8:-2}" ] && [ "$(cat "$2" 2>/dev/null)" != "$3" ]; then
       log "anchor watch: $6 at ${4}m (limit ${5}m)"
       send_event "$6" "$7"
       echo "$3" > "$2"
@@ -748,14 +905,22 @@ anchor_ring() {
   fi
 }
 
-# Evaluate one fix against the armed watch. $1 lat $2 lon $3 acc (may be empty → 0).
+# Evaluate one fix against the armed watch. $1 lat $2 lon $3 acc (empty or "-" → 0)
+# [$4 unreliable 0/1]. An UNRELIABLE fix (the quality gate, §A7.2) is measured for the heartbeat but
+# never advances or clears a streak: it is the third state, neither OK nor breach.
 check_anchor() {
+  ANCHOR_D=""; ANCHOR_OUT=0
   [ -s "$ANCHOR_STATE" ] || return 0
-  set -- $1 $2 ${3:-0} $(cat "$ANCHOR_STATE")
+  _cq="${4:-0}"
+  _ca="${3:-0}"; [ "$_ca" = "-" ] && _ca=0
+  set -- $1 $2 $_ca $(cat "$ANCHOR_STATE")
   _flat=$1; _flon=$2; _facc=$3; _sig=$4; _alat=$5; _alon=$6; _rad=$7; _warn=${8:-0}
   _d=$(anchor_distance "$_alat" "$_alon" "$_flat" "$_flon")
   # Beyond-accuracy rule per ring: the fix must be outside by MORE than its own error bar.
   _acc_i=$(printf '%s' "$_facc" | cut -d. -f1); _acc_i=${_acc_i:-0}
+  ANCHOR_D=$_d
+  [ "$_d" -gt $(( _rad + _acc_i )) ] && ANCHOR_OUT=1
+  [ "$_cq" = "1" ] && return 0
   anchor_ring "$ANCHOR_STREAK" "$ANCHOR_ALERTED" "$_sig" "$_d" $(( _rad + _acc_i )) \
     "anchor.motion" "dist=$_d&limit=$_rad"
   # Warning ring: only while the ALARM ring holds — the drag alarm says everything the warning
@@ -764,6 +929,24 @@ check_anchor() {
     anchor_ring "$ANCHOR_WSTREAK" "$ANCHOR_WARNED" "$_sig" "$_d" $(( _warn + _acc_i )) \
       "anchor.warn.motion" "dist=$_d&limit=$_warn"
   fi
+}
+
+# The security zone, the same way: outside the zone radius by more than the fix's accuracy on
+# `streak` (3) consecutive reliable samples ⇒ `zone.motion`, once per episode. The event name is the
+# cloud sweep's own (positionSweep.ts), so it classifies as security_zone with no cloud change.
+# $1 lat $2 lon $3 acc [$4 unreliable].
+check_zone() {
+  ZONE_D=""; ZONE_OUT=0
+  [ -s "$ZONE_STATE" ] || return 0
+  _zq="${4:-0}"
+  _za="${3:-0}"; [ "$_za" = "-" ] && _za=0
+  set -- $1 $2 $_za $(cat "$ZONE_STATE")
+  _zd=$(anchor_distance "$5" "$6" "$1" "$2")
+  _zacc=$(printf '%s' "$3" | cut -d. -f1); _zacc=${_zacc:-0}
+  ZONE_D=$_zd
+  [ "$_zd" -gt $(( $7 + _zacc )) ] && ZONE_OUT=1
+  [ "$_zq" = "1" ] && return 0
+  anchor_ring "$ZONE_STREAK" "$ZONE_ALERTED" "$4" "$_zd" $(( $7 + _zacc )) "zone.motion" "dist=$_zd&limit=$7" "${8:-3}"
 }
 
 # --- Push --------------------------------------------------------------------------------------
@@ -936,10 +1119,18 @@ send_event() {
     return 1
   fi
   PENDING_ACK=""   # the worker saw our acks; anything still queued comes back below
+  LAST_REPORT_OK_AT=$(date +%s)   # any successful report resets the anchor heartbeat clock
+  LAST_REPLY="$_resp"
   _cmds=$(printf '%s' "$_resp" | parse_commands)
   [ -n "$_cmds" ] && run_commands "$_cmds"
-  _anch=$(printf '%s' "$_resp" | parse_anchor)
-  [ -n "$_anch" ] && apply_anchor $_anch
+  # The watch (anchor + zone, flat v2) rides EVERY /api/agent reply while our anchorsig is stale.
+  case "$_resp" in
+    *'"anchor"'*) apply_watch "$(printf '%s' "$_resp" | parse_anchor)" "$(printf '%s' "$_resp" | parse_zone)" ;;
+  esac
+  # The watch lease (D6) rides every /api/agent reply too; adopt it wherever it shows up.
+  case "$_resp" in
+    *'"lease"'*) apply_live_fields "$(printf '%s' "$_resp" | parse_live_fields)" ;;
+  esac
   # LinkTap config-as-state, when this reply carries it. Today the worker attaches the blob to
   # /api/agent replies for hub_ devices only and to EVERY batch reply, so on a router it normally
   # arrives through drain_relay; reading it here too costs a substring test and means a cloud that
@@ -1323,42 +1514,277 @@ watch_hub() {
   esac
 }
 
-# Pure-ish: should this fix be SENT to the cloud? (Reads the last-sent globals below.) Report-by-
-# exception, Phase 3: skip a send only when the boat is unarmed, hasn't moved past the deadband, and
-# the liveness floor hasn't elapsed. NEVER gates the local drag check — the caller runs that anyway.
-#   $1 lat  $2 lon  $3 anchor sig ("0" = unarmed)
-gps_should_send() {
-  [ "$3" != "0" ] && return 0                         # armed ⇒ always send (the safety case)
-  [ -z "$GPS_LAST_LAT" ] && return 0                  # first fix of this run ⇒ establish the baseline
-  _now=$(date +%s)
-  [ $(( _now - ${GPS_LAST_SENT:-0} )) -ge "$GPS_LIVENESS_SECS" ] && return 0   # liveness floor
-  [ "$GPS_DEADBAND_M" -le 0 ] && return 0             # RBE disabled ⇒ send every tick
-  _moved=$(anchor_distance "$GPS_LAST_LAT" "$GPS_LAST_LON" "$1" "$2")
-  [ "${_moved:-0}" -ge "$GPS_DEADBAND_M" ] && return 0
-  return 1
+# --- GPS by exception, the armed heartbeat, underway (0.17.0; telemetry design §A7.2/§A7.3) -------
+# Numbers are the approved G1 set and the cloud's gpsFeed.ts constants; keep them equal.
+GPS_DEADBAND_FLOOR_M=25        # unarmed deadband floor (§A7.2: wander is 5-15 m, so never below 25)
+GPS_ARMED_SAMPLE_SEC=30        # sample interval while armed, underway, leased or read on the LAN
+GPS_HEARTBEAT_SEC=60           # `gps.heartbeat` while an ANCHOR WATCH is armed and the boat is OUTSIDE
+GPS_HEARTBEAT_INSIDE_SEC=300   # ...and while it is INSIDE the watch radius (owner ruling 2026-09-15)
+GPS_HEARTBEAT_RETRY_SEC=30     # a failed heartbeat is retried after 30 s, backing off to at most
+GPS_HEARTBEAT_RETRY_MAX_SEC=60 #   60 s: the cloud's lost-device alarm fires after 10 min without a report
+GPS_UNRELIABLE_HDOP=5          # the quality gate: hdop > 5, sats < 4, or a fix older than 3 samples
+GPS_UNRELIABLE_MIN_SATS=4
+UW_ENTER_SOG_KN=1.5            # underway: SOG >= 1.5 kn, or >= 50 m from the last SENT position,
+UW_ENTER_MOVE_M=50             #   on 2 consecutive fixes
+UW_EXIT_SOG_KN=0.5             # exit after 5 min below 0.5 kn and under 25 m net movement
+UW_EXIT_NET_M=25
+UW_EXIT_SECS=300
+# While underway (and nobody watching), a position is SENT at most this often. Owner ruling
+# 2026-09-15: "Underway: GPS goes every 5 minutes." Sampling stays at 30 s, so entry/exit detection,
+# the anchor drag and zone breach checks are unchanged; a lease still sends every sample.
+UW_SEND_SEC=300
+# The last SAMPLE, for the LAN read (cgi-bin/gps, /api/hub/gps/live). tmpfs; the collector writes it.
+HUB_LITE_GPS="${BRVG_HUB_LITE_GPS:-/tmp/brvg-hub-lite.gps}"
+# Epoch of the last LAN read of that file: while it was read in the last 120 s, sample at 30 s (§A7.11a).
+HUB_LITE_GPS_HIT="${BRVG_HUB_LITE_GPS_HIT:-/tmp/brvg-hub-lite.gps-hit}"
+
+GPS_LAST_LAT=""; GPS_LAST_LON=""; GPS_LAST_SENT=0
+GPS_FIX_AT=0; GPS_CUR=""; GPS_HAD_FIX=0; GPS_UNRELIABLE=1
+UW=0; UW_ENTER_N=0; UW_SLOW_SINCE=""; UW_SLOW_LAT=""; UW_SLOW_LON=""
+
+# PURE: is this sample unreliable? $1 had a fix this sample (0/1)  $2 sats  $3 hdop  $4 fix age secs
+# $5 sample interval. "-" = the source did not say, which is never counted against the fix.
+gps_unreliable() {
+  [ "$1" = "1" ] || { echo 1; return 0; }
+  awk -v s="$2" -v h="$3" -v a="$4" -v i="$5" -v mh="$GPS_UNRELIABLE_HDOP" -v ms="$GPS_UNRELIABLE_MIN_SATS" 'BEGIN {
+    u = 0
+    if (h != "-" && h != "" && h + 0 > mh) u = 1
+    if (s != "-" && s != "" && s + 0 < ms) u = 1
+    if (a != "" && i != "" && a + 0 > 3 * i) u = 1
+    print u
+  }'
 }
 
-# $1 = "force" to bypass the deadband (a command follow-up / report_now wants a fresh line out).
-push_gps() {
-  _force="${1:-}"
-  set -- $(collect_gps)
-  [ -z "$1" ] && { log "no GPS fix this tick"; return 0; }
-  _glat=$1; _glon=$2; _gacc=${3:-}
-  # anchorsig on EVERY report (the worker replies with the config when we're stale — including
-  # the stand-down); anchorwatch=1 only while armed, which is what tells the cloud sweep a local
-  # watcher owns the anchor logic and it should yield.
-  _asig=$(anchor_sig)
-  if [ "$_force" = "force" ] || gps_should_send "$_glat" "$_glon" "$_asig"; then
-    _p="lat=$_glat&lon=$_glon"
-    [ -n "$_gacc" ] && _p="$_p&acc=$_gacc"
-    _p="$_p&anchorsig=$_asig"
-    [ "$_asig" != "0" ] && _p="$_p&anchorwatch=1"
-    send_event "gps.measurement" "$_p"
-    GPS_LAST_LAT=$_glat; GPS_LAST_LON=$_glon; GPS_LAST_SENT=$(date +%s)
+# PURE: SOG comparison. $1 sog ("-" = unknown) $2 op (ge|lt) $3 threshold. Unknown is never true.
+sog_is() {
+  case "$1" in ''|-) return 1 ;; esac
+  awk -v s="$1" -v o="$2" -v t="$3" 'BEGIN { exit !((o == "ge") ? (s + 0 >= t + 0) : (s + 0 < t + 0)) }'
+}
+
+# Is a watch lease live right now? (D6: set from the check-in reply.)
+lease_active() { [ "${LIVE_LEASE:-0}" = "1" ] && [ "${LIVE_UNTIL:-0}" -gt "${1:-$(date +%s)}" ] 2>/dev/null; }
+
+# How often to SAMPLE the GPS: 30 s while armed, underway, leased or read on the LAN in the last
+# 120 s; GPS_INTERVAL otherwise. $1 now.
+gps_sample_secs() {
+  if [ "$(anchor_sig)" != "0" ] || [ "$UW" = "1" ] || lease_active "$1"; then echo "$GPS_ARMED_SAMPLE_SEC"; return 0; fi
+  _gh=$(cat "$HUB_LITE_GPS_HIT" 2>/dev/null | tr -cd '0-9')
+  if [ -n "$_gh" ] && [ $(( $1 - _gh )) -le 120 ]; then echo "$GPS_ARMED_SAMPLE_SEC"; return 0; fi
+  echo "$GPS_INTERVAL"
+}
+
+# Pure-ish: should this fix be SENT to the cloud? (Reads the last-sent globals.) NEVER gates local
+# detection — the caller runs that first, whatever this says.
+#   $1 lat  $2 lon  $3 acc ("-" = unknown)  $4 armed (0/1)  $5 outside a watch ring (0/1)
+#   $6 leased (0/1)  $7 underway (0/1)  $8 "force"
+# While leased: every sample (a member is looking, §A7.11b). Underway: one position every
+# UW_SEND_SEC (300 s, owner ruling 2026-09-15) — never on the deadband, which a moving boat crosses
+# every sample. Armed: only while OUTSIDE (breach positions every tick) — a boat swinging inside its circle
+# sends nothing but heartbeats. Unarmed: the first fix of the run, then only a move of at least
+# GPS_DEADBAND_M (floor 25 m) from the last SENT position that is also more than twice its accuracy.
+gps_should_send() {
+  [ "${8:-}" = "force" ] && return 0
+  [ "${6:-0}" = "1" ] && return 0
+  [ "${4:-0}" = "1" ] && [ "${5:-0}" = "1" ] && return 0
+  if [ "${7:-0}" = "1" ]; then
+    [ $(( $(date +%s) - ${GPS_LAST_SENT:-0} )) -ge "$UW_SEND_SEC" ]; return
   fi
-  # ALWAYS, whether or not we sent: local drag detection must never depend on the network. A config
-  # adopted from a send's reply (when there was one) evaluates against this same fix.
-  check_anchor "$_glat" "$_glon" "$_gacc"
+  if [ "${4:-0}" = "1" ]; then return 1; fi
+  [ -z "$GPS_LAST_LAT" ] && return 0
+  _db="${GPS_DEADBAND_M:-50}"; [ "$_db" -lt "$GPS_DEADBAND_FLOOR_M" ] 2>/dev/null && _db=$GPS_DEADBAND_FLOOR_M
+  _moved=$(anchor_distance "$GPS_LAST_LAT" "$GPS_LAST_LON" "$1" "$2")
+  [ "${_moved:-0}" -ge "$_db" ] || return 1
+  _ga="${3:-0}"; [ "$_ga" = "-" ] && _ga=0
+  _ga=$(printf '%s' "$_ga" | cut -d. -f1)
+  [ "${_moved:-0}" -gt $(( ${_ga:-0} * 2 )) ]
+}
+
+# Underway detection (§A7.2, projects-08). One step per RELIABLE fix; an unreliable one never starts or
+# ends a trip. $1 now  $2 lat  $3 lon  $4 sogKn ("-")  $5 metres from the last SENT position
+# $6 unreliable  $7 armed. While a watch is armed the displacement rule is off: a boat swinging on
+# its anchor wanders far from its last sent position without going anywhere, and the watch rings
+# own that case. Updates UW (and its bookkeeping) and says when it changed.
+underway_step() {
+  [ "$6" = "1" ] && return 0
+  if [ "$UW" != "1" ]; then
+    _uc=0
+    sog_is "$4" ge "$UW_ENTER_SOG_KN" && _uc=1
+    [ "$7" != "1" ] && [ "${5:-0}" -ge "$UW_ENTER_MOVE_M" ] 2>/dev/null && _uc=1
+    if [ "$_uc" = "1" ]; then
+      UW_ENTER_N=$(( UW_ENTER_N + 1 ))
+      if [ "$UW_ENTER_N" -ge 2 ]; then
+        UW=1; UW_ENTER_N=0; UW_SLOW_SINCE=""
+        log "gps: underway (sampling every ${GPS_ARMED_SAMPLE_SEC}s, a position sent every ${UW_SEND_SEC}s)"
+      fi
+    else
+      UW_ENTER_N=0
+    fi
+    return 0
+  fi
+  # Underway. "Slow" is SOG under 0.5 kn — or no SOG at all, where only the net movement can tell.
+  _slow=1
+  case "$4" in ''|-) : ;; *) sog_is "$4" lt "$UW_EXIT_SOG_KN" || _slow=0 ;; esac
+  if [ "$_slow" = "0" ]; then UW_SLOW_SINCE=""; return 0; fi
+  if [ -z "$UW_SLOW_SINCE" ]; then
+    UW_SLOW_SINCE=$1; UW_SLOW_LAT=$2; UW_SLOW_LON=$3; return 0
+  fi
+  _unet=$(anchor_distance "$UW_SLOW_LAT" "$UW_SLOW_LON" "$2" "$3")
+  if [ "${_unet:-0}" -ge "$UW_EXIT_NET_M" ]; then
+    UW_SLOW_SINCE=$1; UW_SLOW_LAT=$2; UW_SLOW_LON=$3; return 0
+  fi
+  if [ $(( $1 - UW_SLOW_SINCE )) -ge "$UW_EXIT_SECS" ]; then
+    UW=0; UW_SLOW_SINCE=""; UW_ENTER_N=0
+    log "gps: stopped - no longer underway"
+  fi
+}
+
+# Is the armed heartbeat due at all? ONLY while an ANCHOR WATCH is armed. Owner ruling 2026-09-15:
+# "Security zone is 15 min checkin, not faster like the anchorwatch." A zone on its own is watched
+# locally (streak 3, zone.motion sent the moment it fires) and otherwise rides the normal check-in
+# (15 min, 1 min under a lease).
+hb_armed() { [ -s "$ANCHOR_STATE" ]; }
+
+# PURE-ish (reads the evaluation globals): the `gps.heartbeat` params — "everything checks in OK",
+# no position (§A7.3, G4). Only sent while an anchor watch is armed, so the ring is the anchor's.
+gps_heartbeat_params() {
+  _hn=${1:-$(date +%s)}
+  _hp="fixValid=${GPS_HAD_FIX:-0}"
+  if [ -n "$GPS_CUR" ]; then
+    # shellcheck disable=SC2086
+    set -- $GPS_CUR
+    case "${4:-}" in ''|-) : ;; *) _hp="$_hp&sats=$4" ;; esac
+    case "${5:-}" in ''|-) : ;; *) _hp="$_hp&hdop=$5" ;; esac
+    [ "${GPS_FIX_AT:-0}" -gt 0 ] && _hp="$_hp&fixAgeS=$(( _hn - GPS_FIX_AT ))"
+  fi
+  if [ -s "$ANCHOR_STATE" ] && [ -n "$ANCHOR_D" ]; then
+    _hin=1; [ "$ANCHOR_OUT" = "1" ] && _hin=0
+    _hp="$_hp&inside=$_hin&distFromCenterM=$ANCHOR_D&streak=$(cat "$ANCHOR_STREAK" 2>/dev/null | tr -cd '0-9')"
+  fi
+  case "$_hp" in *'&streak=') _hp="${_hp}0" ;; esac
+  printf '%s&unreliable=%s&anchorsig=%s' "$_hp" "${GPS_UNRELIABLE:-1}" "$(anchor_sig)"
+}
+
+# One heartbeat. The legacy VEHICLE_KEY path posts to /api/shelly, which does NOT intercept
+# gps.heartbeat — it would be an alert every minute — so a token is required. Returns the send's
+# status, so the caller can schedule a retry.
+gps_heartbeat() {
+  [ -n "${DEVICE_TOKEN:-}" ] || return 0
+  hb_armed || return 0
+  send_event "gps.heartbeat" "$(gps_heartbeat_params "$1")" || return 1
+  HB_SENT_SIG=$(anchor_sig)
+}
+
+# The heartbeat clock (owner ruling 2026-09-15): "the anchor-watch gps.heartbeat goes every 5 minutes
+# while the boat is INSIDE the geofence."
+#   * Inside: GPS_HEARTBEAT_INSIDE_SEC (300 s) after the last SUCCESSFUL report of any kind — a
+#     check-in, an event, a batch or a heartbeat all prove the hub is alive, so each resets the clock.
+#   * Outside the radius: GPS_HEARTBEAT_SEC (60 s); breach positions go every 30 s sample anyway.
+#   * A newly adopted watch (a signature no heartbeat has carried yet): due at once, so the cloud
+#     sweep sees this hub running THIS watch as soon as possible.
+#   * A failed heartbeat: retried after GPS_HEARTBEAT_RETRY_SEC, backing off to
+#     GPS_HEARTBEAT_RETRY_MAX_SEC, until one succeeds.
+LAST_REPORT_OK_AT=0; HB_SENT_SIG=""; HB_FAILS=0; HB_RETRY_AT=0
+
+# PURE-ish (reads the clock globals): epoch seconds at which the next heartbeat is due. $1 now.
+hb_due_at() {
+  [ "$(anchor_sig)" != "${HB_SENT_SIG:-}" ] && { echo "$1"; return 0; }
+  _hbi=$GPS_HEARTBEAT_INSIDE_SEC; [ "${ANCHOR_OUT:-0}" = "1" ] && _hbi=$GPS_HEARTBEAT_SEC
+  _hbd=$(( ${LAST_REPORT_OK_AT:-0} + _hbi ))
+  [ "${HB_FAILS:-0}" -gt 0 ] && [ "${HB_RETRY_AT:-0}" -gt "$_hbd" ] && _hbd=$HB_RETRY_AT
+  echo "$_hbd"
+}
+
+# PURE: seconds to wait after the Nth consecutive heartbeat failure (30, then 60, never more).
+hb_retry_secs() {
+  _hr=$(( GPS_HEARTBEAT_RETRY_SEC * ${1:-1} ))
+  [ "$_hr" -gt "$GPS_HEARTBEAT_RETRY_MAX_SEC" ] && _hr=$GPS_HEARTBEAT_RETRY_MAX_SEC
+  echo "$_hr"
+}
+
+# Send the heartbeat if it is due, and schedule the retry when it fails. $1 now.
+hb_tick() {
+  hb_armed || { HB_SENT_SIG=""; HB_FAILS=0; HB_RETRY_AT=0; return 0; }
+  [ "$1" -ge "$(hb_due_at "$1")" ] || return 0
+  if gps_heartbeat "$1"; then
+    HB_FAILS=0; HB_RETRY_AT=0
+  else
+    HB_FAILS=$(( HB_FAILS + 1 )); HB_RETRY_AT=$(( $1 + $(hb_retry_secs "$HB_FAILS") ))
+    log "gps.heartbeat failed - retrying in $(( HB_RETRY_AT - $1 ))s"
+  fi
+}
+
+# The LAN read's file: the last sample and what the hub made of it. JSON with plain numbers only.
+gps_write_state() {
+  _gn=$1; _gsf="${HUB_LITE_GPS}.$$"
+  _gstate=unarmed; [ "$(anchor_sig)" != "0" ] && _gstate=armed; [ "$UW" = "1" ] && _gstate=underway
+  _gleased=false; lease_active "$_gn" && _gleased=true
+  {
+    printf '{"v":1,"ts":%s,"state":"%s","leased":%s,"anchorsig":"%s","fixValid":%s,"unreliable":%s' \
+      "$_gn" "$_gstate" "$_gleased" "$(anchor_sig)" "$([ "$GPS_HAD_FIX" = 1 ] && echo true || echo false)" \
+      "$([ "$GPS_UNRELIABLE" = 1 ] && echo true || echo false)"
+    if [ -n "$GPS_CUR" ]; then
+      # shellcheck disable=SC2086
+      set -- $GPS_CUR
+      printf ',"fixAt":%s,"fixAgeS":%s,"lat":%s,"lon":%s' "$GPS_FIX_AT" "$(( _gn - GPS_FIX_AT ))" "$1" "$2"
+      for _gkv in "acc:$3" "sats:$4" "hdop:$5" "sogKn:$6"; do
+        case "${_gkv#*:}" in ''|-|*[!0-9.]*) : ;; *) printf ',"%s":%s' "${_gkv%%:*}" "${_gkv#*:}" ;; esac
+      done
+    fi
+    if [ -n "$ANCHOR_D" ]; then printf ',"inside":%s,"distFromCenterM":%s' "$([ "$ANCHOR_OUT" = 1 ] && echo false || echo true)" "$ANCHOR_D"
+    elif [ -n "$ZONE_D" ]; then printf ',"inside":%s,"distFromCenterM":%s' "$([ "$ZONE_OUT" = 1 ] && echo false || echo true)" "$ZONE_D"
+    fi
+    printf '}\n'
+  } > "$_gsf" 2>/dev/null && mv "$_gsf" "$HUB_LITE_GPS" 2>/dev/null
+  rm -f "$_gsf" 2>/dev/null
+}
+
+# One GPS sample: read, detect locally, decide what (if anything) goes to the cloud, publish to the
+# LAN. $1 = "force" when a command follow-up wants a fresh position whatever the rules say.
+gps_tick() {
+  _gforce="${1:-}"
+  _gt_now=$(date +%s)
+  _gsample=$(collect_gps)
+  _gint=$(gps_sample_secs "$_gt_now")
+  if [ -z "$_gsample" ]; then
+    GPS_HAD_FIX=0
+    _gage=""; [ "$GPS_FIX_AT" -gt 0 ] && _gage=$(( _gt_now - GPS_FIX_AT ))
+    GPS_UNRELIABLE=1
+    # No fix: nothing to measure, so nothing advances or clears a streak (the quality gate).
+    ANCHOR_D=""; ZONE_D=""; ANCHOR_OUT=0; ZONE_OUT=0
+    gps_write_state "$_gt_now"
+    [ -n "$_gage" ] || log "no GPS fix this tick"
+    return 0
+  fi
+  GPS_CUR="$_gsample"; GPS_FIX_AT=$_gt_now; GPS_HAD_FIX=1
+  # shellcheck disable=SC2086
+  set -- $_gsample
+  _glat=$1; _glon=$2; _gacc=$3; _gsog=$6
+  GPS_UNRELIABLE=$(gps_unreliable 1 "$4" "$5" 0 "$_gint")
+  _asig=$(anchor_sig); _garmed=0; [ "$_asig" != "0" ] && _garmed=1
+  # 1. LOCAL DETECTION FIRST, ALWAYS: drag, zone and motion must never depend on the network.
+  check_anchor "$_glat" "$_glon" "$_gacc" "$GPS_UNRELIABLE"
+  check_zone "$_glat" "$_glon" "$_gacc" "$GPS_UNRELIABLE"
+  _gout=0; { [ "$ANCHOR_OUT" = "1" ] || [ "$ZONE_OUT" = "1" ]; } && _gout=1
+  _gmoved=0
+  [ -n "$GPS_LAST_LAT" ] && _gmoved=$(anchor_distance "$GPS_LAST_LAT" "$GPS_LAST_LON" "$_glat" "$_glon")
+  underway_step "$_gt_now" "$_glat" "$_glon" "$_gsog" "$_gmoved" "$GPS_UNRELIABLE" "$_garmed"
+  # 2. The send decision. A disarm asks for one final position.
+  [ "$GPS_FORCE_NEXT" = "1" ] && { _gforce=force; GPS_FORCE_NEXT=0; }
+  _gleased=0; lease_active "$_gt_now" && _gleased=1
+  if gps_should_send "$_glat" "$_glon" "$_gacc" "$_garmed" "$_gout" "$_gleased" "$UW" "$_gforce"; then
+    # anchorsig on every report (the worker replies with the config when it is stale, stand-down
+    # included); anchorwatch=1 only while armed, which tells the cloud sweep a local watcher owns it.
+    _p="lat=$_glat&lon=$_glon"
+    [ "$_gacc" != "-" ] && _p="$_p&acc=$_gacc"
+    [ "$4" != "-" ] && _p="$_p&sats=$4"
+    [ "$5" != "-" ] && _p="$_p&hdop=$5"
+    [ "$_gsog" != "-" ] && _p="$_p&sog=$_gsog"
+    _p="$_p&anchorsig=$_asig"
+    hb_armed && _p="$_p&anchorwatch=1"
+    send_event "gps.measurement" "$_p"
+    GPS_LAST_LAT=$_glat; GPS_LAST_LON=$_glon; GPS_LAST_SENT=$_gt_now
+  fi
+  gps_write_state "$_gt_now"
 }
 
 # --- WAN usage accounting -----------------------------------------------------------------------
@@ -1466,7 +1892,12 @@ collect_wan_usage() {
   printf '%s' "$_out"
 }
 
-push_modem() {
+# 0.17.0: the modem is SAMPLED every MODEM_INTERVAL (the LAN door's state file stays fresh) and the
+# newest sample is SENT on the check-in, at most once per sample. Two functions because the two clocks
+# are different; push_modem is both, for a command follow-up that wants the new state out now.
+MODEM_P=""; MODEM_PENDING=0
+
+sample_modem() {
   _m=$(collect_modem)
   [ -z "$_m" ] && return 0
   _sig=${_m%%|*}; _rest=${_m#*|}
@@ -1490,18 +1921,27 @@ push_modem() {
       _p="$_p&dataMb=$_mb"
     fi
   fi
+  MODEM_P="$_p"; MODEM_PENDING=1
+  # State at SAMPLE time: what this router knows about itself is true whether or not the WAN is up,
+  # and the LAN door is exactly the door that still works when the cloud send fails.
+  write_state "modem.measurement" "$_p&av=$HUB_LITE_VERSION"
+}
+
+send_modem() {
+  [ "$MODEM_PENDING" = "1" ] && [ -n "$MODEM_P" ] || return 0
   # Report which hub-lite version is running, plus per-source WAN usage. Staged rollout and rollback
   # are unmanageable without the version: you cannot decide who to update next if you cannot see
-  # what is deployed.
-  _p="$_p&av=$HUB_LITE_VERSION$(collect_wan_usage)"
+  # what is deployed. The WAN deltas are read HERE, at send time, so bytes that moved between two
+  # samples are never read and dropped by a sample that was not sent.
+  _p="$MODEM_P&av=$HUB_LITE_VERSION$(collect_wan_usage)"
   # The daemon's heartbeat `update`: the newer feed version, when there is one (update_check).
-  _upd=$(tr -cd '0-9.' < "$HUB_LITE_UPDATE" 2>/dev/null)
+  _upd=$(cat "$HUB_LITE_UPDATE" 2>/dev/null | tr -cd '0-9.')
   [ -n "$_upd" ] && _p="$_p&update=$_upd"
-  # State BEFORE the send: what this router knows about itself is true whether or not the WAN is
-  # up, and the LAN door is exactly the door that still works when the cloud send fails.
   write_state "modem.measurement" "$_p"
-  send_event "modem.measurement" "$_p"
+  send_event "modem.measurement" "$_p" && MODEM_PENDING=0
 }
+
+push_modem() { sample_modem; send_modem; }
 
 # --- LinkTap: local flood -> valve shutoff (hub-lite capability #1; owner 2026-08-19) -----------
 # The hub-only LinkTap model (ONSITE.md "LinkTap — hub-only, over local HTTP", 2026-08-19): the gateway lives on the LAN and this
@@ -1577,6 +2017,9 @@ lt_post() {
 # CGI and the tests set it per call.
 lt_spool() {
   printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "$3" >> "${BRVG_RELAY_SPOOL:-$RELAY_SPOOL}"
+  # The poll loop drains promptly after a tick that spooled something (0.17.0: nothing is spooled
+  # on a quiet idle poll any more, so "something was spooled" is itself the signal).
+  LT_SENT=1
 }
 
 # Ring the poll loop (the daemon's linktap_wake): a valve command or a gateway push asks for a read
@@ -2109,6 +2552,34 @@ lt_measurement_params() {
   printf '%s' "$_mp"
 }
 
+# PURE (0.17.0, L3): should this poll's linktap.measurement be sent? $1 watering now (0/1)
+# $2 the signature last SENT ("" = never) $3 this poll's signature ("w=<0|1> rf=<0|1>").
+# Every poll while watering; otherwise only when the signature changed (a transition, or the first
+# poll after a restart, when the cloud's copy is of unknown age).
+lt_should_send() {
+  [ "$1" = "1" ] && return 0
+  [ "$2" != "$3" ]
+}
+
+# The idle valves' latest readings, onto the spool for the check-in's drain (L1: LinkTap idle state
+# rides the check-in). A watering valve already sent this poll's reading, so it is skipped. Rate-
+# limited to once per idle check-in period, so a 1-minute LEASED check-in does not become a 1-minute
+# valve report. $1 now.
+lt_checkin_spool() {
+  lt_configured || return 0
+  [ -d "$LT_STATE_DIR" ] || return 0
+  _lci_last=$(cat "$LT_STATE_DIR/idle.at" 2>/dev/null | tr -cd '0-9')
+  [ -n "$_lci_last" ] && [ $(( $1 - _lci_last )) -lt $(( CHECKIN_IDLE_SEC - 30 )) ] && return 0
+  for _lci in $(printf '%s' "$LINKTAP_DEV_IDS" | tr ',' ' '); do
+    _lci=$(lt_norm_id "$_lci")
+    [ -n "$_lci" ] && [ -s "$LT_STATE_DIR/meas.$_lci" ] || continue
+    _lcm=$(cat "$LT_STATE_DIR/meas.$_lci")
+    case "$_lcm" in watering=1*) continue ;; esac
+    lt_spool "lt_${_lci}" "linktap.measurement" "$_lcm"
+  done
+  echo "$1" > "$LT_STATE_DIR/idle.at"
+}
+
 # Bump the valve-state revision the /api/hub/linktap/state door hands back as `rev`.
 lt_bump_rev() {
   _rv=$( (cat "$LT_STATE_DIR/rev" 2>/dev/null || echo 0) | tr -cd '0-9')
@@ -2214,7 +2685,16 @@ linktap_tick() {
     _run=0
     if [ -f "$_sf" ]; then lt_load_state "$_sf" "$_p_dur" "$_p_cap"; _run=1; fi
     _meas=$(lt_measurement_params "$_w" "$_volL" "$_fields" "$_speedL" "$_ldg" "$_run" "$_mode" "$_dur_eff" "$_cap_eff" "$_rem" "$_prov")
-    lt_spool "lt_${_d}" "linktap.measurement" "$_meas"
+    # 🔴 0.17.0 (L3): SENT ONLY ON A CHANGE OR WHILE WATERING. Every poll used to spool a
+    # measurement (720 a day per valve, idle or not). Now: every poll while the valve waters (the app
+    # draws flow and run progress from those), and on a transition — watering 0<->1, or the valve's
+    # RF link to the gateway lost/back. An idle valve's reading rides the check-in (lt_checkin_spool).
+    # The LAN door's copy (meas.<dev>) is still written on every poll.
+    _ltsig="w=$_w $(printf '%s' "$_fields" | tr '&' '\n' | grep '^rf=' || true)"
+    if lt_should_send "$_w" "$(cat "$LT_STATE_DIR/sent.$_d" 2>/dev/null)" "$_ltsig"; then
+      lt_spool "lt_${_d}" "linktap.measurement" "$_meas"
+      printf '%s\n' "$_ltsig" > "$LT_STATE_DIR/sent.$_d"
+    fi
     printf '%s\n' "$_meas" > "$LT_STATE_DIR/meas.$_d.$$" && mv "$LT_STATE_DIR/meas.$_d.$$" "$LT_STATE_DIR/meas.$_d"
 
     # THE REOPEN, performed after the report like the daemon's linktap_act. It always returns the
@@ -2290,6 +2770,267 @@ update_check() {
 # Managed routers (routers.sh, owner D2): a Cradlepoint or Peplink this router signs in to. Optional — absent or unparseable, the hub-lite runs without it and /status does not claim `routers`.
 RT_FILE="${BRVG_HUB_LITE_ROUTERS:-/usr/libexec/brvg-hub-lite/routers}"; [ -r "$RT_FILE" ] && sh -n "$RT_FILE" 2>/dev/null && . "$RT_FILE"
 
+# --- The check-in and the live link (0.17.0; owner D6, telemetry design §A7.11c / §A8) -------------
+# ONE dedicated check-in, `GET /api/agent?event=hub.checkin`, every 15 min while nobody watches and
+# every 1 min while the reply carries a watch lease. The worker (DockNeighbor-Cloud liveLink.ts)
+# intercepts the event — never an alert, never a reading, only the router's last-seen — and answers
+# with the flat keys `lease` (0/1), `leaseUntil` (epoch SECONDS), `checkinSec` and `live` (0/1: this
+# router may hold the vessel's link), beside the usual `anchor` and `commands`.
+#
+# 🔴 NOTHING IS QUEUED TO FIRE LATER, on either side. While `live` is 1 a background child holds a
+# long poll (GET /api/agent/live/poll, the worker answers within 25 s) and runs any relayed call it is
+# handed through the SAME /api/hub door the LAN uses, with the role the worker vouched for, then posts
+# the answer (POST /api/agent/live/result). When the lease is gone the poll is refused and the child
+# exits; the check-in returns to 15 min.
+CHECKIN_IDLE_SEC=900
+CHECKIN_LEASED_SEC=60
+LIVE_LEASE=0; LIVE_UNTIL=0; LIVE_OK=0; CHECKIN_OK=1
+LAST_REPLY=""
+# The child's lease clock (epoch s). The main loop rewrites it on every leased check-in; the child
+# exits when it is gone or has passed. tmpfs.
+LIVE_UNTIL_FILE="${BRVG_LIVE_UNTIL:-/tmp/brvg-hub-lite.live}"
+LIVE_PID_FILE="${BRVG_LIVE_PID:-/tmp/brvg-hub-lite.live.pid}"
+# The /api/hub door a relayed call runs through (uhttpd serves the same file on the LAN).
+HUB_LITE_API="${BRVG_HUB_LITE_API:-/www/brvg/api/hub}"
+# Member keys ride the check-in (L4): the last time they were asked for, so a 1-minute leased check-in
+# does not become a 1-minute key poll.
+KEYS_ASKED_AT=0
+
+# PURE: the live-link keys of an /api/agent reply → "lease leaseUntil checkinSec live", or nothing
+# when the reply carries none (the `config/liveLink` switch is off). Flat integers only, by contract.
+parse_live_fields() {
+  _lf=$(tr -d ' \n\r')
+  _lfl=$(printf '%s' "$_lf" | sed -n 's/.*"lease":\([01]\)[,}].*/\1/p')
+  [ -n "$_lfl" ] || return 0
+  _lfu=$(printf '%s' "$_lf" | sed -n 's/.*"leaseUntil":\([0-9]\{1,10\}\)[,}].*/\1/p')
+  _lfc=$(printf '%s' "$_lf" | sed -n 's/.*"checkinSec":\([0-9]\{1,6\}\)[,}].*/\1/p')
+  _lfv=$(printf '%s' "$_lf" | sed -n 's/.*"live":\([01]\)[,}].*/\1/p')
+  printf '%s %s %s %s' "$_lfl" "${_lfu:-0}" "${_lfc:-0}" "${_lfv:-0}"
+}
+
+# Adopt parse_live_fields' line. Empty = no lease (the switch is off, or this reply did not say).
+apply_live_fields() {
+  # shellcheck disable=SC2086
+  set -- ${1:-0 0 0 0}
+  _alw=$LIVE_LEASE
+  LIVE_LEASE=$1; LIVE_UNTIL=$2; LIVE_OK=$4
+  [ "$LIVE_LEASE" = "1" ] || { LIVE_UNTIL=0; LIVE_OK=0; }
+  if [ "$_alw" != "$LIVE_LEASE" ]; then
+    if [ "$LIVE_LEASE" = "1" ]; then log "check-in: a member is watching - checking in every ${CHECKIN_LEASED_SEC}s"
+    else log "check-in: nobody watching - checking in every ${CHECKIN_IDLE_SEC}s"; fi
+  fi
+}
+
+# PURE: seconds to the next check-in. $1 lease $2 leaseUntil $3 now $4 last check-in succeeded (0/1).
+# 60 while a lease is live, 900 otherwise (D6). A FAILED check-in is retried within 2 minutes rather
+# than a whole period later: a boat whose WAN just came back should pick up an arm or a lease soon,
+# and a failing request reaches no cloud at all.
+checkin_interval() {
+  _cii=$CHECKIN_IDLE_SEC
+  [ "$1" = "1" ] && [ "${2:-0}" -gt "$3" ] 2>/dev/null && _cii=$CHECKIN_LEASED_SEC
+  [ "${4:-1}" = "1" ] || { [ "$_cii" -gt 120 ] && _cii=120; }
+  echo "$_cii"
+}
+
+# PURE: the signature of the member-key set a reply announces, when the cloud sends one (a flat
+# `keysSig`, 64 hex) — nothing otherwise. See keys_on_checkin.
+parse_keys_sig() { tr -d ' \n\r' | sed -nE 's/.*"keysSig":"([0-9a-f]{64})".*/\1/p'; }
+
+# L4: the management key and the member-key set are refreshed FROM THE CHECK-IN instead of on their
+# own clocks. The worker's reply does not yet announce the set's signature, so today this is the
+# conditional member-keys GET (a 304 while nothing changed — the digest/sig check in
+# fetch_member_keys is unchanged) run right after a successful check-in, at most once per idle
+# period. A cloud that adds `keysSig` to the reply turns it into "fetch only when it changed" with no
+# hub-lite release. The LAN door's stale flag (a key it did not know) still asks early, rate-limited.
+# $1 now.
+keys_on_checkin() {
+  fetch_mgmt_key
+  _koc=$(printf '%s' "$LAST_REPLY" | parse_keys_sig)
+  if [ -n "$_koc" ]; then
+    [ "$_koc" = "$(sed -n '1s/^sig \([0-9a-f]\{64\}\)$/\1/p' "$MEMBER_KEYS_FILE" 2>/dev/null)" ] && return 0
+    fetch_member_keys; KEYS_ASKED_AT=$1; return 0
+  fi
+  [ $(( $1 - KEYS_ASKED_AT )) -ge $(( CHECKIN_IDLE_SEC - 30 )) ] || return 0
+  fetch_member_keys
+  KEYS_ASKED_AT=$1
+}
+
+# One check-in: the hub.checkin itself, then what rides it — the newest modem sample (L1), the idle
+# valves' readings and anything else spooled (one batch), the keys (L4), the link (D6).
+# Echoes nothing; sets CHECKIN_OK. $1 now.
+do_checkin() {
+  CHECKIN_OK=0
+  # The legacy VEHICLE_KEY path posts to /api/shelly, which does NOT intercept hub.checkin: it would
+  # alert the crew every 15 minutes. No token, no check-in (that box reports GPS/modem as before).
+  [ -n "${DEVICE_TOKEN:-}" ] || return 0
+  if send_event "hub.checkin" "av=$HUB_LITE_VERSION&anchorsig=$(anchor_sig)"; then
+    CHECKIN_OK=1
+    # Absent fields on a check-in reply mean no lease (the switch is off): drop any we held.
+    apply_live_fields "$(printf '%s' "$LAST_REPLY" | parse_live_fields)"
+    keys_on_checkin "$1"
+  fi
+  send_modem
+  lt_checkin_spool "$1"
+  drain_relay
+  live_link_manage "$(date +%s)"
+  # Managed routers (routers.sh) report on the same cadence: their poll is a sample clock too.
+  [ -n "${RT_DIR:-}" ] && [ -d "$RT_DIR" ] && checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" 1 > "$RT_DIR/cadence" 2>/dev/null
+  return 0
+}
+
+live_link_running() {
+  _llp=$(cat "$LIVE_PID_FILE" 2>/dev/null | tr -cd '0-9')
+  [ -n "$_llp" ] && kill -0 "$_llp" 2>/dev/null
+}
+
+# Open or close the link to match the lease. Opened only on a reply that said `live` (so a refused
+# poll is not retried every loop pass — the next leased check-in, a minute later, may try again);
+# closed as soon as the lease is gone or has run out. $1 now.
+live_link_manage() {
+  if [ "$LIVE_OK" = "1" ] && lease_active "$1" && [ -n "${DEVICE_TOKEN:-}" ]; then
+    echo "$LIVE_UNTIL" > "$LIVE_UNTIL_FILE"
+    live_link_running && return 0
+    ( live_link_loop ) </dev/null >/dev/null &
+    echo $! > "$LIVE_PID_FILE"
+    log "live link: opened (lease until $LIVE_UNTIL)"
+    return 0
+  fi
+  live_link_close
+}
+
+live_link_close() {
+  _llc=0
+  [ -f "$LIVE_UNTIL_FILE" ] && { rm -f "$LIVE_UNTIL_FILE"; _llc=1; }
+  if live_link_running; then kill "$(cat "$LIVE_PID_FILE")" 2>/dev/null; _llc=1; fi
+  rm -f "$LIVE_PID_FILE" 2>/dev/null
+  [ "$_llc" = "1" ] && log "live link: closed"
+  return 0
+}
+
+# PURE: what one poll answer means. 200 a call; 204 an empty hold (poll again); no answer, 408, 429 or
+# 5xx a retry after a pause; anything else (401 token, 403 demo/daemon, 404 switch off, 409 not
+# leased or held by another router) ends the link until the next check-in says otherwise.
+live_poll_verdict() {
+  case "$1" in
+    200) echo call ;;
+    204) echo again ;;
+    000|''|408|429|5[0-9][0-9]) echo retry ;;
+    *) echo stop ;;
+  esac
+}
+
+# PURE: a top-level string field of a relay `call` frame, JSON-unescaped. $1 field name; stdin frame.
+# The body is itself JSON text inside a string, so its quotes arrive escaped (\") and can never be
+# mistaken for a top-level `"name":"`. \uXXXX below 0x80 is decoded; anything else is kept verbatim
+# (JSON.stringify does not escape non-ASCII, so real text arrives as raw UTF-8).
+live_frame_str() {
+  awk -v key="$1" '
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+      pat = "\"" key "\":\""
+      i = index(buf, pat); if (i == 0) exit 1
+      rest = substr(buf, i + length(pat)); out = ""; n = length(rest)
+      for (j = 1; j <= n; j++) {
+        c = substr(rest, j, 1)
+        if (c == "\"") { printf "%s", out; exit 0 }
+        if (c != "\\") { out = out c; continue }
+        j++; e = substr(rest, j, 1)
+        if (e == "n") out = out "\n"
+        else if (e == "t") out = out "\t"
+        else if (e == "r") out = out "\r"
+        else if (e == "b" || e == "f") out = out
+        else if (e == "u") {
+          h = tolower(substr(rest, j + 1, 4)); v = 0; ok = (h ~ /^[0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/)
+          for (k = 1; ok && k <= 4; k++) v = v * 16 + index("0123456789abcdef", substr(h, k, 1)) - 1
+          if (ok && v > 0 && v < 128) { out = out sprintf("%c", v); j += 4 } else out = out "\\u"
+        }
+        else out = out e
+      }
+      exit 1
+    }'
+}
+
+# PURE: stdin (a reply body) → a JSON string literal's CONTENT: backslash and quote escaped, newline
+# as \n, tab as \t, other control characters dropped.
+json_escape_body() {
+  awk '
+    { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, ""); gsub(/[\001-\037]/, ""); printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }'
+}
+
+# The relayed paths this router will run: the daemon contract's routes a hub-lite actually has (the
+# worker's RELAYABLE allowlist gates first; this is the router's own, deliberately not wider).
+live_path_allowed() {
+  case "$1:$2" in
+    GET:/api/hub/status|GET:/api/hub/logs|GET:/api/hub/linktap/state|GET:/api/hub/routers|GET:/api/hub/gps/live) return 0 ;;
+    POST:/api/hub/config|POST:/api/hub/token|POST:/api/hub/clear|POST:/api/hub/update|POST:/api/hub/linktap/valve|POST:/api/hub/routers|POST:/api/hub/gps) return 0 ;;
+  esac
+  return 1
+}
+
+# Run one relayed call through the /api/hub door. stdin: the call frame. stdout: the result frame.
+# The role is the one the WORKER resolved for the caller (never anything the body says); the door
+# applies its own role gate to it exactly as it does to a LAN key (D3: control crew may open a valve,
+# monitor may not). The door is run as a plain child, not through uhttpd, which is what makes the
+# vouched role unforgeable from the LAN (see authorize in hub-lite-api.sh).
+live_run_call() {
+  _lrf=$(cat)
+  _lr_id=$(printf '%s' "$_lrf" | live_frame_str id | tr -cd 'A-Za-z0-9_-' | cut -c1-64)
+  [ -n "$_lr_id" ] || return 1
+  _lr_role=$(printf '%s' "$_lrf" | live_frame_str role)
+  _lr_m=$(printf '%s' "$_lrf" | live_frame_str method)
+  _lr_p=$(printf '%s' "$_lrf" | live_frame_str path)
+  _lr_b=$(printf '%s' "$_lrf" | live_frame_str body || true)
+  _lr_out="${TMPDIR:-/tmp}/brvg-live-call.$$"
+  if ! live_path_allowed "$_lr_m" "$_lr_p"; then
+    printf 'Status: 404 Not Found\r\n\r\n{"error":"no such hub endpoint"}\r\n' > "$_lr_out"
+  else
+    case "$_lr_role" in owner|coowner|admin|control|monitor|monitor_quiet) : ;; *) _lr_role=none ;; esac
+    log "live link: relayed $_lr_m $_lr_p (role $_lr_role)"
+    _lr_len=$(printf '%s' "$_lr_b" | wc -c | tr -cd '0-9')
+    printf '%s' "$_lr_b" | (
+      unset GATEWAY_INTERFACE REMOTE_ADDR HTTP_AUTHORIZATION QUERY_STRING
+      REQUEST_METHOD="$_lr_m" PATH_INFO="${_lr_p#/api/hub}" CONTENT_LENGTH="${_lr_len:-0}" \
+        BRVG_RELAY_ROLE="$_lr_role" sh "$HUB_LITE_API"
+    ) > "$_lr_out" 2>/dev/null
+  fi
+  _lr_st=$(sed -n '1s/^Status: \([0-9][0-9][0-9]\).*/\1/p' "$_lr_out" | tr -d '\r')
+  printf '{"type":"result","id":"%s","status":%s,"body":"%s"}' "$_lr_id" "${_lr_st:-502}" \
+    "$(tr -d '\r' < "$_lr_out" | sed '1,/^$/d' | json_escape_body)"
+  rm -f "$_lr_out"
+}
+
+# The background child: hold the poll while the lease lives, run what it hands over, answer.
+live_link_loop() {
+  _ll_fail=0
+  _ll_q="vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}"
+  while :; do
+    _ll_until=$(cat "$LIVE_UNTIL_FILE" 2>/dev/null | tr -cd '0-9')
+    [ -n "$_ll_until" ] && [ "$(date +%s)" -lt "$_ll_until" ] || return 0
+    _ll_f="${TMPDIR:-/tmp}/brvg-live-poll.$$"
+    _ll_code=$(curl -sS --max-time 40 -o "$_ll_f" -w '%{http_code}' "${WORKER_URL}/api/agent/live/poll?${_ll_q}" 2>/dev/null)
+    case "$(live_poll_verdict "$_ll_code")" in
+      call)
+        _ll_fail=0
+        _ll_res=$(live_run_call < "$_ll_f")
+        if [ -n "$_ll_res" ]; then
+          printf '%s' "$_ll_res" > "$_ll_f.res"
+          curl -sS --max-time 20 -o /dev/null -X POST -H 'Content-Type: application/json' \
+            --data-binary "@$_ll_f.res" "${WORKER_URL}/api/agent/live/result?${_ll_q}" 2>/dev/null || true
+          rm -f "$_ll_f.res"
+        fi ;;
+      again) _ll_fail=0 ;;
+      stop)
+        rm -f "$_ll_f" "$LIVE_UNTIL_FILE"
+        log "live link: the cloud ended it (HTTP $_ll_code)"
+        return 0 ;;
+      *)
+        _ll_fail=$(( _ll_fail + 1 ))
+        sleep $(( _ll_fail < 6 ? _ll_fail * 5 : 30 )) ;;
+    esac
+    rm -f "$_ll_f"
+  done
+}
+
 # --- Main loop ---------------------------------------------------------------------------------
 
 # PURE: how long to sleep before the next piece of due work. $1 now, then due epochs (empty = none).
@@ -2325,13 +3066,16 @@ main() {
     sleep 30
   done
   load_config
-  log "starting (platform=$(detect_platform), gps every ${GPS_INTERVAL}s, modem every ${MODEM_INTERVAL}s)"
+  log "starting (platform=$(detect_platform), check-in every ${CHECKIN_IDLE_SEC}s unwatched / ${CHECKIN_LEASED_SEC}s watched; gps sampled every ${GPS_INTERVAL}s, modem every ${MODEM_INTERVAL}s)"
   # Small random start offset so a fleet doesn't tick in lockstep after a regional power event.
   sleep $(( $$ % 20 ))
   # An urgent webhook (alarm) pokes the drain immediately — aggregation must never delay one that
   # the CGI failed to deliver directly. Not gated on HUB_LITE_ENABLED any more: see drain below.
   trap drain_relay USR1
-  _next_gps=0; _next_modem=0; _next_lt=0; _next_update=0
+  # A link child from a previous run of this service must not outlive it; the first check-in (now)
+  # decides afresh whether anyone is watching.
+  rm -f "$LIVE_UNTIL_FILE" 2>/dev/null
+  _next_gps=0; _next_modem=0; _next_lt=0; _next_update=0; _next_checkin=0
   while :; do
     _now=$(date +%s)
     # A CGI rewrote the conf (/api/hub/config, /token, /bootstrap, /clear): read it again now.
@@ -2340,15 +3084,23 @@ main() {
       VID=""
       # shellcheck disable=SC1090
       [ -f "$CONF" ] && . "$CONF"
-      if [ -z "$VID" ]; then log "vehicle removed from this router - stopping reporting"; exec "$0"; fi
+      if [ -z "$VID" ]; then log "vehicle removed from this router - stopping reporting"; live_link_close; exec "$0"; fi
       load_config
-      log "configuration reloaded (gps every ${GPS_INTERVAL}s, modem every ${MODEM_INTERVAL}s)"
-      _next_gps=0; _next_modem=0
+      log "configuration reloaded (gps sampled every ${GPS_INTERVAL}s, modem every ${MODEM_INTERVAL}s)"
+      _next_gps=0; _next_modem=0; _next_checkin=0
     fi
+    # 1. GPS: a SAMPLE clock (30 s armed/underway/leased, GPS_INTERVAL otherwise). Local detection runs
+    #    on every sample; what is sent is gps_should_send's decision, not this clock's.
     if [ "$_now" -ge "$_next_gps" ]; then
-      push_gps
-      _next_gps=$(( $(date +%s) + GPS_INTERVAL ))
+      gps_tick
+      _next_gps=$(( $(date +%s) + $(gps_sample_secs "$(date +%s)") ))
     fi
+    # 2. The armed heartbeat, ONLY while an ANCHOR WATCH is armed (a security zone alone stays on the
+    #    check-in): 300 s after the last successful report while inside, 60 s while outside, at once
+    #    for a new watch, failures retried within 60 s (hb_due_at). Owner rulings 2026-09-15.
+    hb_tick "$(date +%s)"
+    # 3. LinkTap: the poll is the valve's safety loop (the volume cutoff), so it keeps its own clock.
+    #    Its REPORTS are by exception (L3): a tick that spooled something drains at once.
     if lt_configured; then
       LT_NAP_SLICE=5
       _woken=0
@@ -2357,44 +3109,43 @@ main() {
         # A command just landed at the gateway: let it apply before reading it back (the daemon's
         # LINKTAP_WAKE_SETTLE).
         [ "$_woken" = "1" ] && sleep 2
+        LT_SENT=0
         linktap_tick
         _next_lt=$(( $(date +%s) + ${LINKTAP_POLL:-120} ))
         _hint=$(lt_poll_hint "$(date +%s)")
         [ -n "$_hint" ] && [ $(( $(date +%s) + _hint )) -lt "$_next_lt" ] && _next_lt=$(( $(date +%s) + _hint ))
-        # Valve telemetry reaches the cloud promptly after a command, not on the next modem tick.
-        [ "$_woken" = "1" ] && drain_relay
+        # A transition, a watering reading or a cycle end reaches the cloud now, not at the check-in.
+        [ "$LT_SENT" = "1" ] && drain_relay
       fi
     else
       # No valve to be woken for, but a CGI's follow-up or reload flag should still land within half
-      # a minute rather than a whole GPS interval (which a Cloud Update Schedule can make 30 min).
+      # a minute rather than a whole GPS interval.
       LT_NAP_SLICE=30
     fi
+    # 4. The modem: a SAMPLE clock. The newest sample goes out on the next check-in (send_modem).
     if [ "$(date +%s)" -ge "$_next_modem" ]; then
-      push_modem
-      # No-op once we have a key. Here rather than at startup so a box that boots with no WAN still
-      # collects one the moment the uplink comes back. NOT gated on HUB_LITE_ENABLED: that flag is
-      # the RELAY TIER, and the management door is not part of it.
-      fetch_mgmt_key
-      # The member set rides the same tick; a 304 is a few hundred bytes (D3).
-      fetch_member_keys
-      _next_keys=$(( $(date +%s) + 60 ))
-      # 🔴 NOT GATED ON HUB_LITE_ENABLED ANY MORE. LinkTap telemetry, cycle ends, flood-close
-      # records AND the plan gate + valve profiles all travel through this drain; gating it on the
-      # relay tier meant a router with the tier off never reported a valve, never learned its
-      # profiles, and grew its spool in RAM without bound. The drain is a no-op on an empty spool.
-      drain_relay
+      sample_modem
+      # The hub watchdog is a LAN probe; it only sends when it releases or recovers.
       watch_hub
       _next_modem=$(( $(date +%s) + MODEM_INTERVAL ))
+    fi
+    # 5. THE CHECK-IN (D6): 15 min unwatched, 1 min while a lease is live. The modem sample, the idle
+    #    valves, the spool (🔴 not gated on HUB_LITE_ENABLED — LinkTap telemetry, cycle ends, flood-close
+    #    records and the plan gate all travel through the drain), the keys and the link ride it.
+    if [ "$(date +%s)" -ge "$_next_checkin" ]; then
+      do_checkin "$(date +%s)"
+      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK") ))
     elif relay_needs_retry; then
-      # A failed batch or an undelivered alarm is retried on this loop's short cadence rather than
-      # waiting out MODEM_INTERVAL (the daemon's shelly_retry_loop). Bounded by the loop's own
-      # period, and a no-op while the spool is empty.
+      # A failed batch or an undelivered alarm is retried on a short cadence rather than waiting out
+      # the check-in (the daemon's shelly_retry_loop). A no-op while the spool is empty.
       if [ "$(date +%s)" -ge "${_next_retry:-0}" ]; then
         drain_relay
         _next_retry=$(( $(date +%s) + 30 ))
       fi
     fi
-    # The door saw a key it did not know: maybe a member who joined or rotated since the last tick.
+    # The lease ran out between check-ins: close the link now rather than at the next check-in.
+    if [ -f "$LIVE_UNTIL_FILE" ] && ! lease_active "$(date +%s)"; then live_link_close; fi
+    # The door saw a key it did not know: maybe a member who joined or rotated since the last sync.
     if [ -f "$MEMBER_KEYS_STALE" ] && [ "$(date +%s)" -ge "${_next_keys:-0}" ]; then
       rm -f "$MEMBER_KEYS_STALE"
       fetch_member_keys
@@ -2412,21 +3163,25 @@ main() {
       FOLLOWUP_REPORT=1
     fi
     # A command ran during the sends above. Its effect is NOT in the report that carried it — that
-    # payload was built first — so report again before sleeping. Cleared before sending, so a
-    # command arriving in the follow-up is handled by the next pass rather than looping here; at
-    # most one extra pair of sends per iteration, whatever the queue does.
+    # payload was built first — so report again before sleeping: a fresh position, a fresh modem
+    # sample, and a check-in to carry it. Cleared before sending, so a command arriving in the
+    # follow-up is handled by the next pass rather than looping here.
     if [ "$FOLLOWUP_REPORT" = "1" ]; then
       FOLLOWUP_REPORT=0
       log "command follow-up: reporting the new state"
-      push_gps force   # a follow-up / report_now wants a fresh line, deadband notwithstanding
-      push_modem
-      _next_gps=$(( $(date +%s) + GPS_INTERVAL ))
+      gps_tick force   # a follow-up / report_now wants a fresh line, deadband notwithstanding
+      sample_modem
+      do_checkin "$(date +%s)"
+      _next_gps=$(( $(date +%s) + $(gps_sample_secs "$(date +%s)") ))
       _next_modem=$(( $(date +%s) + MODEM_INTERVAL ))
+      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK") ))
     fi
     command -v rt_tick >/dev/null 2>&1 && rt_tick   # managed routers: due reads run in the background (routers.sh)
     _lt_due=""
     lt_configured && _lt_due=$_next_lt
-    sleep "$(next_nap "$(date +%s)" "$_next_gps" "$_next_modem" "$_lt_due")"
+    _hb_due=""
+    hb_armed && _hb_due=$(hb_due_at "$(date +%s)")
+    sleep "$(next_nap "$(date +%s)" "$_next_gps" "$_next_modem" "$_next_checkin" "$_hb_due" "$_lt_due")"
   done
 }
 
