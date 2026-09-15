@@ -2030,8 +2030,12 @@ check "heartbeat clock: retry backoff 30, 60, never above 60" "backoff=30 60 60"
   echo "breach: motion=$(grep -c 'event=anchor.motion' "$C17/urls") positions=$(grep -c 'event=gps.measurement' "$C17/urls") heartbeat-due=$(( $(hb_due_at "$(date +%s)") - LAST_REPORT_OK_AT ))" > "$C17/hbb"
   # Curl fails (-f exit 22) on a real send: send_event reports failure and the retry is scheduled.
   curl() { return 22; }
-  HB_SENT_SIG=999; LAST_REPORT_OK_AT=$(( $(date +%s) - 400 )); ANCHOR_OUT=0; hb_tick "$(date +%s)"
-  echo "fail: fails=$HB_FAILS retry-in=$(( HB_RETRY_AT - $(date +%s) ))" >> "$C17/hbb"
+  # ONE clock read for the whole step: hb_tick sets HB_RETRY_AT to (its argument + 30), so reading
+  # the clock again for the arithmetic below prints 29 whenever the second read lands in the next
+  # second. Both the argument and the subtrahend must be the same instant.
+  _hbnow=$(date +%s)
+  HB_SENT_SIG=999; LAST_REPORT_OK_AT=$(( _hbnow - 400 )); ANCHOR_OUT=0; hb_tick "$_hbnow"
+  echo "fail: fails=$HB_FAILS retry-in=$(( HB_RETRY_AT - _hbnow ))" >> "$C17/hbb"
 )
 check "breach: the drag alarm on the 2nd outside sample and a position on each, with no wait for any clock" "breach: motion=1 positions=2 heartbeat-due=60" "$(sed -n 1p "$C17/hbb")"
 check "retry: a real failed heartbeat send (curl error) schedules the retry within 60 s" "fail: fails=1 retry-in=30" "$(sed -n 2p "$C17/hbb")"
