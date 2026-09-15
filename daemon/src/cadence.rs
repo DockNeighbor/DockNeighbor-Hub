@@ -48,6 +48,64 @@ pub fn refresh_should_ring(last_ring_ms: i64, now_ms: i64) -> bool {
     last_ring_ms <= 0 || now_ms - last_ring_ms >= REFRESH_COALESCE_MS
 }
 
+// ── The anchor-watch heartbeat clock ──────────────────────────────────────────────────────────────
+
+/// First retry after a failed heartbeat post; doubles, capped at HEARTBEAT_RETRY_MAX_SECS.
+pub const HEARTBEAT_RETRY_SECS: u64 = 30;
+pub const HEARTBEAT_RETRY_MAX_SECS: u64 = 60;
+
+/// PURE: the heartbeat interval for an armed anchor watch — 5 min while every GPS source is inside the
+/// circle, 60 s while a drag is in progress (owner ruling 2026-09-15).
+pub fn anchor_heartbeat_secs(breaching: bool) -> u64 {
+    if breaching {
+        geofence::HEARTBEAT_SECS
+    } else {
+        geofence::HEARTBEAT_INSIDE_SECS
+    }
+}
+
+/// When the next anchor-watch heartbeat is due.
+///
+/// ANY delivered post to the cloud (a heartbeat, an immediate event, a keyframe) is a check-in and
+/// restarts the interval. A failed heartbeat is retried after 30 s, then every 60 s, until a post lands
+/// — so one lost beat can never age the vessel past the cloud's 10-minute lost-device alarm. A new
+/// watch signature is due at once, so the cloud sees this arm's first beat without waiting 5 minutes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeartbeatClock {
+    /// The signature the last delivered heartbeat carried.
+    sent_sig: u64,
+    failures: u32,
+    failed_at_ms: i64,
+    retry_at_ms: i64,
+}
+
+impl HeartbeatClock {
+    /// `last_ok_ms` = the last delivered post of any kind.
+    pub fn due(&self, sig: u64, last_ok_ms: i64, now_ms: i64, interval_secs: u64) -> bool {
+        if sig != self.sent_sig {
+            return true;
+        }
+        if self.failures > 0 && last_ok_ms <= self.failed_at_ms {
+            return now_ms >= self.retry_at_ms;
+        }
+        now_ms - last_ok_ms >= interval_secs as i64 * 1000
+    }
+    pub fn delivered(&mut self, sig: u64) {
+        self.sent_sig = sig;
+        self.failures = 0;
+    }
+    pub fn failed(&mut self, now_ms: i64) {
+        self.failures += 1;
+        let backoff = (HEARTBEAT_RETRY_SECS << (self.failures - 1).min(4)).min(HEARTBEAT_RETRY_MAX_SECS);
+        self.failed_at_ms = now_ms;
+        self.retry_at_ms = now_ms + backoff as i64 * 1000;
+    }
+    /// Disarmed: the next arm starts fresh.
+    pub fn reset(&mut self) {
+        *self = HeartbeatClock::default();
+    }
+}
+
 // ── Numeric change gates (§2.2) ───────────────────────────────────────────────────────────────────
 
 /// A change-since-last-SENT gate with direction hysteresis: a move in the same direction as the last
@@ -311,6 +369,63 @@ mod tests {
 
     fn p(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn an_armed_hour_inside_the_circle_checks_in_about_twelve_times() {
+        // Owner ruling 2026-09-15: heartbeat every 5 min while inside. Every delivered post counts, so
+        // the 4 keyframes in the hour replace the heartbeats they coincide with.
+        let sig = 1757750400000;
+        let run = |with_keyframes: bool| {
+            let mut c = HeartbeatClock::default();
+            let (mut last_ok, mut beats, mut keyframes) = (-1_000_000_000i64, 0, 0);
+            for t in 0..3600i64 {
+                let now = t * 1000;
+                if with_keyframes && t % CHECKIN_SECS as i64 == 0 {
+                    keyframes += 1;
+                    last_ok = now;
+                }
+                if c.due(sig, last_ok, now, anchor_heartbeat_secs(false)) {
+                    beats += 1;
+                    c.delivered(sig);
+                    last_ok = now;
+                }
+            }
+            (beats, keyframes)
+        };
+        let (beats, _) = run(false);
+        assert_eq!(beats, 12, "one heartbeat every 5 minutes, the first at once for the new arm");
+        let (beats, keyframes) = run(true);
+        assert_eq!(keyframes, 4);
+        assert!((8..=9).contains(&beats), "keyframes count as check-ins, got {beats}");
+        assert!((12..=13).contains(&(beats + keyframes)), "about 12 check-ins an armed hour");
+        assert_eq!(anchor_heartbeat_secs(true), 60, "a drag in progress beats every 60 s");
+    }
+
+    #[test]
+    fn a_failed_heartbeat_retries_within_sixty_seconds_until_a_post_lands() {
+        let sig = 9;
+        let mut c = HeartbeatClock::default();
+        assert!(c.due(sig, 0, 0, 300), "a new arm is due at once");
+        c.delivered(sig);
+        assert!(!c.due(sig, 0, 299_000, 300));
+        assert!(c.due(sig, 0, 300_000, 300));
+        c.failed(300_000);
+        assert!(!c.due(sig, 0, 329_000, 300));
+        assert!(c.due(sig, 0, 330_000, 300), "first retry after 30 s");
+        c.failed(330_000);
+        assert!(!c.due(sig, 0, 389_000, 300));
+        assert!(c.due(sig, 0, 390_000, 300), "then every 60 s, never longer");
+        c.failed(390_000);
+        assert!(c.due(sig, 0, 450_000, 300), "capped at 60 s");
+        // An immediate event landing counts as the check-in: the retry stops and the 5 min restarts.
+        assert!(!c.due(sig, 400_000, 410_000, 300));
+        assert!(c.due(sig, 400_000, 700_000, 300));
+        c.delivered(sig);
+        // Re-arm: due at once; disarm resets.
+        assert!(c.due(sig + 1, 700_000, 700_001, 300));
+        c.reset();
+        assert!(c.due(sig, 700_000, 700_001, 300));
     }
 
     #[test]

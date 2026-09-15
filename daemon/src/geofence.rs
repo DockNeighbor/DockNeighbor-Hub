@@ -18,7 +18,8 @@
 //                                          2026-09-15), plus one on entry and one on stopping; still
 //                                          SAMPLED at 30 s so exit detection keeps its resolution
 //   * ANCHOR WATCH armed                 → only while a drag is confirmed (every 30 s tick outside);
-//                                          liveness is the 60 s `gps.heartbeat`
+//                                          liveness is the `gps.heartbeat` — every 5 min while inside,
+//                                          60 s while outside (owner ruling 2026-09-15)
 //   * unarmed, or only a SECURITY ZONE   → moved ≥ 50 m (floor 25 m) AND > 2 × acc from the last SENT
 //                                          position; the keep-alive rides the 15-min keyframe
 //
@@ -38,9 +39,14 @@ pub const UNARMED_DEADBAND_M: f64 = 50.0;
 pub const DEADBAND_FLOOR_M: f64 = 25.0;
 /// Sample cadence while an ANCHOR WATCH is armed or the boat is underway (never for a zone alone).
 pub const ARMED_SAMPLE_SECS: u64 = 30;
-/// The anchor watch's "checks in OK" heartbeat (G1) — anchor only, never for a zone alone. The
-/// cloud's lost-device alarm for an anchor watch fires at 10 minutes, so this has ample margin.
+/// The anchor watch's "checks in OK" heartbeat while the boat is OUTSIDE its circle (a drag in
+/// progress, when positions also go every 30 s sample) — anchor only, never for a zone alone.
 pub const HEARTBEAT_SECS: u64 = 60;
+/// The anchor watch's heartbeat while the boat is INSIDE its circle (owner ruling, Jonathan
+/// 2026-09-15: "make it every 5 minutes, as long as its inside the geofence"). The cloud's lost-device
+/// alarm fires at 10 minutes without a report, so one lost beat is covered by the retry
+/// (cadence::HeartbeatClock) rather than by beating faster.
+pub const HEARTBEAT_INSIDE_SECS: u64 = 300;
 /// Consecutive outside samples that confirm an anchor drag (hub-lite's rule, ported unchanged).
 pub const ANCHOR_STREAK: u32 = 2;
 /// A zone's streak when the reply does not say (`zoneStreak`).
@@ -246,6 +252,10 @@ impl Geofence {
     /// Anything armed (anchor watch and/or security zone).
     pub fn armed(&self) -> bool {
         self.sig != 0
+    }
+    /// The anchor drag rule has tripped and the boat is still outside (2+ consecutive samples).
+    pub fn anchor_breaching(&self) -> bool {
+        self.anchor_armed && self.anchor_streak >= ANCHOR_STREAK
     }
     /// An ANCHOR WATCH is armed — the only state that buys 30 s sampling, the 60 s heartbeat and
     /// breach-only position sends (owner ruling 2026-09-15).

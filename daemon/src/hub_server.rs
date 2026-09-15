@@ -82,7 +82,8 @@ const HEARTBEAT_FLOOR_SECS: u64 = 15;
 // fixes, 1,440 valve polls and 720 per router. It is replaced by:
 //   * ONE keyframe every 15 min (checkin_loop): hub.status + every device's current value.
 //   * immediate `delta` posts for real changes only (cadence.rs gates, geofence.rs for GPS).
-//   * a 60 s `gps.heartbeat` only while an ANCHOR WATCH is armed (gps_heartbeat_loop) — a security
+//   * a `gps.heartbeat` only while an ANCHOR WATCH is armed (gps_heartbeat_loop): every 5 min while
+//     inside the circle, 60 s during a drag, retried within 60 s if a post fails — a security
 //     zone alone stays on the 15-minute cadence (owner ruling 2026-09-15).
 //   * every sample while a member holds the watch lease (do_watch), and the LAN live feed
 //     (/api/hub/gps/live) that costs the cloud nothing.
@@ -301,6 +302,9 @@ pub struct Rt {
     pub last_refresh_ms: AtomicI64,
     /// When the last keyframe check-in started.
     pub last_checkin_ms: AtomicI64,
+    /// When any batch post (keyframe, event or heartbeat) was last delivered — a check-in for the
+    /// anchor-watch heartbeat clock.
+    pub last_cloud_ok_ms: AtomicI64,
     /// Per-process id for the batch envelope's `boot`, so a restart's counter reset is not a replay.
     pub boot_id: String,
     /// The event queue's batch sequence (kind delta only — see batch::envelope).
@@ -411,6 +415,7 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         lease_until_ms: AtomicI64::new(0),
         last_refresh_ms: AtomicI64::new(0),
         last_checkin_ms: AtomicI64::new(0),
+        last_cloud_ok_ms: AtomicI64::new(0),
         boot_id: uuid::Uuid::new_v4().simple().to_string()[..16].to_string(),
         batch_seq: AtomicU64::new(1),
         inflight_delta: tokio::sync::Mutex::new(None),
@@ -1964,6 +1969,7 @@ async fn post_batch(
         Ok(res) => {
             let code = res.status().as_u16();
             if (200..300).contains(&code) {
+                rt.last_cloud_ok_ms.store(now_ms(), Ordering::SeqCst);
                 PostOutcome::Delivered(res.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null))
             } else if code >= 500 || code == 408 || code == 429 {
                 PostOutcome::Transient(format!("cloud answered HTTP {code}"))
@@ -2013,38 +2019,62 @@ async fn apply_watch_reply(rt: &Rt, body: &serde_json::Value) {
     rt.router_wake.notify_one();
 }
 
-/// The anchor watch's heartbeat (H5, §A7.3): every `hbSec` (60 s) while an ANCHOR WATCH is armed, ONE
+/// The anchor watch's heartbeat (H5, §A7.3): every 5 min while the boat is INSIDE its circle and 60 s
+/// while a drag is in progress (owner ruling 2026-09-15; cadence::anchor_heartbeat_secs), ONE
 /// post carrying a `gps.heartbeat` item per GPS source — fix quality, inside/distance and the running
 /// `anchorsig`, never a position. 🔴 NOT for a security zone alone (owner ruling, Jonathan 2026-09-15:
 /// "Security zone is 15 min checkin, not faster like the anchorwatch") — a zone-only hub posts nothing
 /// here and its breach goes out as an event the moment the streak confirms.
 ///
+/// Any delivered post (an immediate event, a keyframe) counts as the check-in and restarts the clock.
+/// A failed heartbeat is retried after 30 s, then every 60 s, until a post lands — the cloud raises its
+/// lost-device alarm at 10 minutes, so one lost beat must never reach it. The GPS sources keep
+/// sampling at their own rate for local drag detection; only the SEND cadence is 5 minutes.
+///
 /// Not spooled: a heartbeat that arrives late would lie about liveness,
 /// and the cloud judges freshness on arrival. Its reply carries the watch delta like any other.
 async fn gps_heartbeat_loop(rt: Shared) {
+    const TICK: Duration = Duration::from_secs(5);
     let client = http_client();
     let mut last_err: Option<String> = None;
+    let mut clock = cadence::HeartbeatClock::default();
     loop {
-        let hb_secs = rt.telemetry.lock().await.watch.as_ref().map_or(geofence::HEARTBEAT_SECS, |w| w.hb_secs);
-        tokio::time::sleep(Duration::from_secs(hb_secs)).await;
+        tokio::time::sleep(TICK).await;
         let cfg = hub_config::read_config_in(&rt.base);
         if cfg.token.is_empty() || cfg.vid.is_empty() || !cfg.enabled {
             continue;
         }
-        let items = heartbeat_items(&mut *rt.telemetry.lock().await, &cfg, now_ms());
+        let now = now_ms();
+        let (sig, breaching) = {
+            let t = rt.telemetry.lock().await;
+            match t.watch.as_ref().filter(|w| w.anchor.is_some()) {
+                None => (0, false),
+                Some(w) => (w.sig, gps_devices(&cfg).iter().any(|d| t.geofences.get(d).is_some_and(|g| g.anchor_breaching()))),
+            }
+        };
+        if sig == 0 {
+            clock.reset();
+            continue;
+        }
+        if !clock.due(sig, rt.last_cloud_ok_ms.load(Ordering::SeqCst), now, cadence::anchor_heartbeat_secs(breaching)) {
+            continue;
+        }
+        let items = heartbeat_items(&mut *rt.telemetry.lock().await, &cfg, now);
         if items.is_empty() {
             continue;
         }
         match post_batch(&rt, &client, &cfg, batch::Kind::Delta, None, &items, None).await {
             PostOutcome::Delivered(body) => {
+                clock.delivered(sig);
                 if last_err.take().is_some() {
                     crate::hlog!("watch: heartbeat delivered again");
                 }
                 handle_batch_reply(&rt, &client, &body).await;
             }
             PostOutcome::Transient(why) | PostOutcome::Refused(why) => {
+                clock.failed(now_ms());
                 if last_err.as_deref() != Some(why.as_str()) {
-                    crate::hlog!("watch: heartbeat not delivered - {why}");
+                    crate::hlog!("watch: heartbeat not delivered - {why}; retrying");
                     last_err = Some(why);
                 }
             }
@@ -4556,6 +4586,30 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!((items[0].device.as_str(), items[0].event.as_str()), ("brv_gps_a", "gps.heartbeat"));
         assert!(items[0].params.contains(&("anchorsig".to_string(), "8".to_string())));
+    }
+
+    #[tokio::test]
+    async fn an_anchor_drag_is_sent_the_moment_the_streak_trips_and_positions_follow_every_sample() {
+        let (worker, posts) = stub_batch_worker(serde_json::json!({"status": "ok"})).await;
+        let base = temp_base("drag_now");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, worker);
+        rt.telemetry.lock().await.watch = Some(geofence::Watch {
+            sig: 42, anchor: Some(geofence::Circle { lat: 41.0, lon: -81.0, radius_m: 60.0, warn_m: 0.0 }), zone: None, hb_secs: 60, sample_secs: 30,
+        });
+        let fix = |north_m: f64| crate::gps::GpsFix { lat: 41.0 + north_m / 111_195.0, lon: -81.0, acc: Some(3.0), hdop: Some(0.9), sats: Some(10), sog_kn: Some(0.3) };
+        gps_observe(&rt, "brv_gps_a", &fix(20.0)).await;
+        gps_observe(&rt, "brv_gps_a", &fix(90.0)).await;
+        assert!(posts.lock().unwrap().is_empty(), "inside, then one sample outside: nothing sent");
+        gps_observe(&rt, "brv_gps_a", &fix(95.0)).await;
+        let events: Vec<String> = posts.lock().unwrap().iter().flat_map(|(_, b)| b["items"].as_array().unwrap().iter().map(|i| i["event"].as_str().unwrap().to_string()).collect::<Vec<_>>()).collect();
+        assert!(events.contains(&"anchor.motion".to_string()), "the drag goes at once: {events:?}");
+        assert!(events.contains(&"gps.measurement".to_string()), "with the position");
+        assert!(rt.telemetry.lock().await.geofences["brv_gps_a"].anchor_breaching());
+        let before = posts.lock().unwrap().len();
+        gps_observe(&rt, "brv_gps_a", &fix(100.0)).await;
+        assert_eq!(posts.lock().unwrap().len(), before + 1, "every sample while outside");
+        assert!(rt.last_cloud_ok_ms.load(Ordering::SeqCst) > 0, "a delivered event counts as a check-in for the heartbeat clock");
     }
 
     #[tokio::test]
