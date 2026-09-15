@@ -549,7 +549,14 @@ check "gps: ARMED and inside the circle sends NO position (heartbeats only)" "sk
 check "gps: armed and OUTSIDE sends every tick (breach positions)" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 5 1 1 0 0)"
 check "gps: while LEASED every sample is sent, moved or not" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 1 0)"
 check "gps: while leased and armed inside, still every sample" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 1 0 1 0)"
-check "gps: UNDERWAY every sample is sent" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 0 1)"
+GPS_LAST_SENT=$(( $(date +%s) - 30 ))
+check "gps: UNDERWAY 30 s after the last position -> skip (owner: every 5 minutes)" "skip" "$(send_verdict "$_FAR_LAT" "$_FAR_LON" 5 0 0 0 1)"
+GPS_LAST_SENT=$(( $(date +%s) - 300 ))
+check "gps: UNDERWAY 300 s after the last position -> send" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 0 1)"
+GPS_LAST_SENT=$(date +%s)
+check "gps: underway while LEASED still sends every sample" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 1 1)"
+check "gps: underway and OUTSIDE an armed ring still sends breach positions" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 1 1 0 1)"
+check "gps: the underway send interval is 300 s" "300" "$UW_SEND_SEC"
 check "gps: force (a command follow-up, a disarm) always sends" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 1 0 0 0 force)"
 
 # (The pass/fail summary used to sit HERE, part-way down the file — so every check below it could
@@ -1954,6 +1961,8 @@ check "underway: slow but moving 100+ m restarts the 5-min clock" "drifting=1" "
   gps_tick
   echo "unarmed-unmoved=$(grep -c 'event=gps.measurement' "$C17/urls")" >> "$C17/g"
   SAMPLE="41.4095 -81.7494 5 9 0.9 2.5"; gps_tick; gps_tick; gps_tick
+  echo "underway-within-5min: underway=$UW positions=$(grep -c 'event=gps.measurement' "$C17/urls") secs=$(gps_sample_secs "$(date +%s)")" >> "$C17/g.uw"
+  GPS_LAST_SENT=$(( $(date +%s) - 301 )); gps_tick; gps_tick
   echo "underway=$UW positions=$(grep -c 'event=gps.measurement' "$C17/urls") secs=$(gps_sample_secs "$(date +%s)")" >> "$C17/g"
   DEVICE_TOKEN=""; : > "$C17/urls"; apply_anchor 55 41.4086 -81.7494 50 0; gps_heartbeat "$(date +%s)"
   echo "legacy-heartbeats=$(wc -l < "$C17/urls" | tr -d ' ')" >> "$C17/g"
@@ -1975,7 +1984,8 @@ check "lan read: the collector's JSON for cgi-bin/gps" \
   "$(sed -n 5p "$C17/g")"
 check "tick: the disarm sends one final position" "disarm-final=1" "$(sed -n 6p "$C17/g")"
 check "tick: unarmed and unmoved sends nothing" "unarmed-unmoved=1" "$(sed -n 7p "$C17/g")"
-check "tick: underway after 2 fast fixes, then every sample sent at 30 s" "underway=1 positions=3 secs=30" "$(sed -n 8p "$C17/g")"
+check "tick: underway after 2 fast fixes samples at 30 s but sends nothing inside 5 min of the last position" "underway-within-5min: underway=1 positions=1 secs=30" "$(cat "$C17/g.uw")"
+check "tick: underway sends one position once 5 min have passed, then waits again" "underway=1 positions=2 secs=30" "$(sed -n 8p "$C17/g")"
 check "heartbeat: never on the legacy /api/shelly path (it would be an alert a minute)" "legacy-heartbeats=0" "$(sed -n 9p "$C17/g")"
 check "heartbeat: a SECURITY ZONE alone gets none, and sends no position inside (owner ruling 2026-09-15)" "zone-only: due=no heartbeats=0 positions=0 sig=77" "$(sed -n 10p "$C17/g")"
 check "zone: the breach is still detected locally and sent at once; zone fixes are not tagged as an anchor watch" "zone-breach: event=1 anchorwatch-tag=0" "$(sed -n 11p "$C17/g")"

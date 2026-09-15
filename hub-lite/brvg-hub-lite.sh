@@ -1524,6 +1524,10 @@ UW_ENTER_MOVE_M=50             #   on 2 consecutive fixes
 UW_EXIT_SOG_KN=0.5             # exit after 5 min below 0.5 kn and under 25 m net movement
 UW_EXIT_NET_M=25
 UW_EXIT_SECS=300
+# While underway (and nobody watching), a position is SENT at most this often. Owner ruling
+# 2026-09-15: "Underway: GPS goes every 5 minutes." Sampling stays at 30 s, so entry/exit detection,
+# the anchor drag and zone breach checks are unchanged; a lease still sends every sample.
+UW_SEND_SEC=300
 # The last SAMPLE, for the LAN read (cgi-bin/gps, /api/hub/gps/live). tmpfs; the collector writes it.
 HUB_LITE_GPS="${BRVG_HUB_LITE_GPS:-/tmp/brvg-hub-lite.gps}"
 # Epoch of the last LAN read of that file: while it was read in the last 120 s, sample at 30 s (§A7.11a).
@@ -1568,15 +1572,19 @@ gps_sample_secs() {
 # detection — the caller runs that first, whatever this says.
 #   $1 lat  $2 lon  $3 acc ("-" = unknown)  $4 armed (0/1)  $5 outside a watch ring (0/1)
 #   $6 leased (0/1)  $7 underway (0/1)  $8 "force"
-# While leased: every sample (a member is looking, §A7.11b). Underway: every sample (the voyage
-# track). Armed: only while OUTSIDE (breach positions every tick) — a boat swinging inside its circle
+# While leased: every sample (a member is looking, §A7.11b). Underway: one position every
+# UW_SEND_SEC (300 s, owner ruling 2026-09-15) — never on the deadband, which a moving boat crosses
+# every sample. Armed: only while OUTSIDE (breach positions every tick) — a boat swinging inside its circle
 # sends nothing but heartbeats. Unarmed: the first fix of the run, then only a move of at least
 # GPS_DEADBAND_M (floor 25 m) from the last SENT position that is also more than twice its accuracy.
 gps_should_send() {
   [ "${8:-}" = "force" ] && return 0
   [ "${6:-0}" = "1" ] && return 0
-  [ "${7:-0}" = "1" ] && return 0
-  if [ "${4:-0}" = "1" ]; then [ "${5:-0}" = "1" ]; return; fi
+  [ "${4:-0}" = "1" ] && [ "${5:-0}" = "1" ] && return 0
+  if [ "${7:-0}" = "1" ]; then
+    [ $(( $(date +%s) - ${GPS_LAST_SENT:-0} )) -ge "$UW_SEND_SEC" ]; return
+  fi
+  if [ "${4:-0}" = "1" ]; then return 1; fi
   [ -z "$GPS_LAST_LAT" ] && return 0
   _db="${GPS_DEADBAND_M:-50}"; [ "$_db" -lt "$GPS_DEADBAND_FLOOR_M" ] 2>/dev/null && _db=$GPS_DEADBAND_FLOOR_M
   _moved=$(anchor_distance "$GPS_LAST_LAT" "$GPS_LAST_LON" "$1" "$2")
@@ -1601,7 +1609,7 @@ underway_step() {
       UW_ENTER_N=$(( UW_ENTER_N + 1 ))
       if [ "$UW_ENTER_N" -ge 2 ]; then
         UW=1; UW_ENTER_N=0; UW_SLOW_SINCE=""
-        log "gps: underway (sampling every ${GPS_ARMED_SAMPLE_SEC}s, every sample sent)"
+        log "gps: underway (sampling every ${GPS_ARMED_SAMPLE_SEC}s, a position sent every ${UW_SEND_SEC}s)"
       fi
     else
       UW_ENTER_N=0

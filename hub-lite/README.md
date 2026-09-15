@@ -189,9 +189,9 @@ If the app shows no position from the router, the order to check is: does `/dev/
   report at the check-in cadence.
 - GPS **report-by-exception** (telemetry design §A7.2): local drag, zone and underway detection run
   on every sample; a position is SENT only when unarmed and it moved `GPS_DEADBAND_M` (default 50 m,
-  floor 25 m) from the last sent one and more than twice its accuracy; every sample while leased or
-  underway (SOG >= 1.5 kn or >= 50 m on 2 fixes; ends after 5 min under 0.5 kn and 25 m, 30 s
-  samples); every sample while outside an armed ring; one final fix on disarm. There is no liveness
+  floor 25 m) from the last sent one and more than twice its accuracy; every sample while leased;
+  one position every 5 min (`UW_SEND_SEC`, owner ruling 2026-09-15) while underway (SOG >= 1.5 kn
+  or >= 50 m on 2 fixes; ends after 5 min under 0.5 kn and 25 m; still sampled at 30 s); every sample while outside an armed ring; one final fix on disarm. There is no liveness
   send any more — the check-in is the liveness.
 - **Anchor watch armed:** 30 s samples, `gps.heartbeat` every 60 s (`fixValid sats hdop fixAgeS
   inside distFromCenterM streak unreliable anchorsig`, no position), breach = 2 reliable samples
