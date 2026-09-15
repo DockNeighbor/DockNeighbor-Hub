@@ -27,7 +27,7 @@
         "lon": -81.694361,
         "radiusM": 60,
         "warnM": 45,
-        "hbSec": 60,
+        "hbSec": 300,
         "sampleSec": 30
       },
       "hubLiteParse": "1757750400000 41.492907 -81.694361 60 45"
@@ -59,7 +59,7 @@
         "zoneCx": -81.6944,
         "zoneR": 40,
         "zoneStreak": 3,
-        "hbSec": 60,
+        "hbSec": 300,
         "sampleSec": 30
       },
       "hubLiteParse": "3515501400000 41.492907 -81.694361 60 45"

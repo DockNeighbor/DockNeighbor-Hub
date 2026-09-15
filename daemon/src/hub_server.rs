@@ -4495,7 +4495,7 @@ mod tests {
         let reply = serde_json::json!({
             "status": "ok", "processed": 1,
             "commands": [{ "id": "c9", "cmd": "not_a_verb" }],
-            "anchor": { "sig": 1757750400000u64, "lat": 41.492907, "lon": -81.694361, "radiusM": 60, "warnM": 45, "hbSec": 60, "sampleSec": 30 },
+            "anchor": { "sig": 1757750400000u64, "lat": 41.492907, "lon": -81.694361, "radiusM": 60, "warnM": 45, "hbSec": 300, "sampleSec": 30 },
         });
         let (worker, posts) = stub_batch_worker(reply).await;
         let base = temp_base("keyframe");

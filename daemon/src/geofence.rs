@@ -536,7 +536,7 @@ mod tests {
                 let a = w.anchor.unwrap();
                 assert_eq!((a.lat, a.lon, a.radius_m, a.warn_m), (41.492907, -81.694361, 60.0, 45.0));
                 assert!(w.zone.is_none());
-                assert_eq!((w.hb_secs, w.sample_secs), (60, 30));
+                assert_eq!((w.hb_secs, w.sample_secs), (300, 30));
             }
             other => panic!("armed parsed as {other:?}"),
         }
