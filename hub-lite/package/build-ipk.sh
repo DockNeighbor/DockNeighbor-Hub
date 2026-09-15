@@ -46,7 +46,7 @@ ship() {  # $1 source, $2 destination, $3 mode
   chmod "$3" "$2"
 }
 _src_bytes=0; _ship_bytes=0
-for _f in brvg-hub-lite.sh routers.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh openwrt/etc/init.d/brvg-hub-lite; do
+for _f in brvg-hub-lite.sh routers.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-gps-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh openwrt/etc/init.d/brvg-hub-lite; do
   _src_bytes=$(( _src_bytes + $(wc -c < "$SRC/$_f") ))
 done
 
@@ -64,12 +64,14 @@ install -m 0755 "$SRC/setup-usb-gps.sh" "$WORK/data/usr/bin/brvg-setup-usb-gps"
 # Relay tier: the CGI webhook receiver (inert until HUB_LITE_ENABLED=1 in the config).
 ship "$SRC/hub-lite-cgi.sh" "$WORK/data/www/brvg/cgi-bin/report" 0755
 ship "$SRC/hub-lite-mgmt.sh" "$WORK/data/www/brvg/cgi-bin/mgmt" 0755
+# The LAN GPS read (0.17.0): routes to the /api/hub door's GET /gps/live, keyed like /status.
+ship "$SRC/hub-lite-gps-cgi.sh" "$WORK/data/www/brvg/cgi-bin/gps" 0755
 # The /api/hub/* door. Installed WITHOUT a .sh suffix and directly at api/hub, because uhttpd
 # resolves the longest existing file path and hands the rest over as PATH_INFO — so this one file
 # answers /api/hub/ping, /api/hub/status and /api/hub/linktap/state.
 ship "$SRC/hub-lite-api.sh" "$WORK/data/www/brvg/api/hub" 0755
 
-for _f in usr/bin/brvg-hub-lite usr/libexec/brvg-hub-lite/routers www/brvg/api/hub www/brvg/cgi-bin/report www/brvg/cgi-bin/mgmt usr/libexec/brvg-hub-lite/feed-setup etc/init.d/brvg-hub-lite; do
+for _f in usr/bin/brvg-hub-lite usr/libexec/brvg-hub-lite/routers www/brvg/api/hub www/brvg/cgi-bin/report www/brvg/cgi-bin/mgmt www/brvg/cgi-bin/gps usr/libexec/brvg-hub-lite/feed-setup etc/init.d/brvg-hub-lite; do
   _ship_bytes=$(( _ship_bytes + $(wc -c < "$WORK/data/$_f") ))
   # A stripped script that no longer parses must never be sealed into a package.
   sh -n "$WORK/data/$_f" || { echo "stripped $_f does not parse" >&2; exit 1; }
@@ -152,6 +154,7 @@ tar tzf "$WORK/data.tar.gz" | grep -q './usr/libexec/brvg-hub-lite/feed-setup' |
 tar tzf "$WORK/data.tar.gz" | grep -q './etc/init.d/brvg-hub-lite' || { echo "payload missing the init script" >&2; exit 1; }
 tar tzf "$WORK/data.tar.gz" | grep -q './www/brvg/cgi-bin/report' || { echo "payload missing the relay CGI" >&2; exit 1; }
 tar tzf "$WORK/data.tar.gz" | grep -q './www/brvg/cgi-bin/mgmt' || { echo "payload missing the management CGI" >&2; exit 1; }
+tar tzf "$WORK/data.tar.gz" | grep -q './www/brvg/cgi-bin/gps' || { echo "payload missing the LAN GPS read" >&2; exit 1; }
 tar tzf "$WORK/data.tar.gz" | grep -q './usr/libexec/brvg-hub-lite/routers' || { echo "payload missing the managed-routers library" >&2; exit 1; }
 tar tzf "$WORK/data.tar.gz" | grep -q './www/brvg/api/hub' || { echo "payload missing the /api/hub CGI" >&2; exit 1; }
 tar tzf "$WORK/control.tar.gz" | grep -q './control' || { echo "control archive incomplete" >&2; exit 1; }

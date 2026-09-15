@@ -16,18 +16,15 @@ VEHICLE_KEY=""
 # Hosted worker. Must be https.
 WORKER_URL="https://api.dockneighbor.com"
 
-# Cadences (seconds). Floors: GPS 30, modem 60. These ride the customer's metered link —
-# every tick is one small HTTPS GET.
+# SAMPLE clocks (seconds), not send clocks. Floors: GPS 30, modem 60. What reaches the cloud is the
+# check-in (15 min, 1 min while a member watches) plus changes: see hub-lite/README.md "Behavior".
 GPS_INTERVAL=120
 MODEM_INTERVAL=600
 
-# GPS report-by-exception. The fix is still COLLECTED and the anchor drag check RUN every
-# GPS_INTERVAL; these only gate the cloud SEND to spare a metered link when parked. A fix is sent
-# anyway when it moves past GPS_DEADBAND_M metres, whenever an anchor watch is armed (always), or
-# once GPS_LIVENESS_SECS elapses (keeps the cloud's offline + away-watch fresh — keep it under the
-# vehicle's offline threshold, default 60 min). Set GPS_DEADBAND_M=0 to disable and send every tick.
+# GPS report-by-exception: unarmed, a position is sent only when it moved GPS_DEADBAND_M metres from
+# the last one sent (floor 25) and more than twice its accuracy. Armed, underway and watched follow
+# their own rules. There is no liveness send; the check-in is the liveness.
 GPS_DEADBAND_M=50
-GPS_LIVENESS_SECS=1200
 
 # GPS source: auto (GL.iNet → modem AT; else gpsd if present; else NMEA serial), at, gpsd, nmea,
 # tcp (NMEA over the network — chartplotter/AIS/gpsd serving on a LAN port), or cradlepoint

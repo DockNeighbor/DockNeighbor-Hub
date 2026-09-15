@@ -521,27 +521,36 @@ LINKTAP_HOST="" LINKTAP_GW_ID="" LINKTAP_DEV_IDS="" BRVG_RELAY_SPOOL="$_SPOOL_T"
 check "no LinkTap config -> no-op, nothing spooled" "0" "$(wc -c < "$_SPOOL_T" | tr -d ' ')"
 rm -f "$_SPOOL_T"
 
-# --- gps_should_send (report-by-exception, Phase 3) ---
+# --- gps_should_send (report-by-exception; 0.17.0 rules, telemetry design §A7.2) ---
 # Chicago-ish anchor point; a point ~180 m away for the "moved" cases.
 _A_LAT=41.87811; _A_LON=-87.62980
 _FAR_LAT=41.87811; _FAR_LON=-87.62760   # ~180 m east
-GPS_DEADBAND_M=50; GPS_LIVENESS_SECS=1200
-send_verdict() { if gps_should_send "$1" "$2" "$3"; then echo send; else echo skip; fi; }
+_NEAR_LAT=41.87811; _NEAR_LON=-87.62945 # ~29 m east
+GPS_DEADBAND_M=50
+# $1 lat $2 lon $3 acc $4 armed $5 outside $6 leased $7 underway $8 force
+send_verdict() { if gps_should_send "$@"; then echo send; else echo skip; fi; }
 
 GPS_LAST_LAT=""; GPS_LAST_LON=""; GPS_LAST_SENT=0
-check "gps: first fix of the run always sends" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 0)"
+check "gps: first fix of the run always sends" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 0 0)"
 
 GPS_LAST_LAT=$_A_LAT; GPS_LAST_LON=$_A_LON; GPS_LAST_SENT=$(date +%s)
-check "gps: parked, unarmed, unmoved, recent -> skip" "skip" "$(send_verdict "$_A_LAT" "$_A_LON" 0)"
-check "gps: armed ALWAYS sends even when unmoved (the safety case)" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 1734)"
-check "gps: moved past the 50 m deadband -> send" "send" "$(send_verdict "$_FAR_LAT" "$_FAR_LON" 0)"
-
-GPS_LAST_SENT=$(( $(date +%s) - 1300 ))   # older than the 1200 s liveness floor
-check "gps: liveness floor elapsed -> send even when unmoved" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 0)"
-
-GPS_LAST_SENT=$(date +%s); GPS_DEADBAND_M=0   # RBE disabled
-check "gps: deadband 0 disables RBE -> always send" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 0)"
+check "gps: parked, unarmed, unmoved -> skip" "skip" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 0 0)"
+check "gps: moved past the 50 m deadband -> send" "send" "$(send_verdict "$_FAR_LAT" "$_FAR_LON" 5 0 0 0 0)"
+GPS_LAST_SENT=$(( $(date +%s) - 86400 ))
+check "gps: NO liveness send any more — a day unmoved is still a skip (the check-in is the liveness)" "skip" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 0 0)"
+check "gps: a move past the deadband but inside twice the fix's accuracy is noise -> skip" "skip" "$(send_verdict "$_FAR_LAT" "$_FAR_LON" 95 0 0 0 0)"
+GPS_DEADBAND_M=0
+check "gps: the deadband has a 25 m floor — 0 no longer means send every tick" "skip" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 0 0)"
+GPS_DEADBAND_M=10
+check "gps: a 10 m deadband is floored to 25 m (wander is 5-15 m)" "skip" "$(send_verdict 41.87811 -87.62970 - 0 0 0 0)"
+check "gps: ...and ~29 m clears that floor" "send" "$(send_verdict "$_NEAR_LAT" "$_NEAR_LON" 2 0 0 0 0)"
 GPS_DEADBAND_M=50
+check "gps: ARMED and inside the circle sends NO position (heartbeats only)" "skip" "$(send_verdict "$_FAR_LAT" "$_FAR_LON" 5 1 0 0 0)"
+check "gps: armed and OUTSIDE sends every tick (breach positions)" "send" "$(send_verdict "$_A_LAT" "$_A_LON" 5 1 1 0 0)"
+check "gps: while LEASED every sample is sent, moved or not" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 1 0)"
+check "gps: while leased and armed inside, still every sample" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 1 0 1 0)"
+check "gps: UNDERWAY every sample is sent" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 0 0 0 1)"
+check "gps: force (a command follow-up, a disarm) always sends" "send" "$(send_verdict "$_A_LAT" "$_A_LON" - 1 0 0 0 force)"
 
 # (The pass/fail summary used to sit HERE, part-way down the file — so every check below it could
 # fail and the script still exited 0. It is at the bottom now.)
@@ -1720,12 +1729,19 @@ check "cp reboot" '200 {"ok":true}' "$(status_of "$r") $(body_of "$r")"
   VID=v_test; WORKER_URL=https://api.example.test; DEVICE_ID=brv_net_hublite; DEVICE_TOKEN=hubtok_0123456789abcdef; PENDING_ACK=""
   curl() { if [ "$1" = "-K" ]; then command curl "$@"; else eval "echo \"\${$#}\"" >> "$T/rt.urls"; printf '%s' '{"commands":[{"id":"c9","cmd":"reboot"}]}'; fi; }
   run_commands() { echo "RAN $1" >> "$T/rt.ran"; }
-  rm -f "$RDIR/brv_net_cp1.ctr"
+  rm -f "$RDIR/brv_net_cp1.ctr" "$RDIR/brv_net_cp1.sent" "$RDIR/brv_net_cp1.gpssent" "$RDIR/cadence"
   ( rt_load brv_net_cp1 && rt_poll_report )
+  ( rt_load brv_net_cp1 && rt_poll_report )
+  grep -c 'event=modem.measurement' "$T/rt.urls" > "$T/rt.n2"
+  wc -l < "$T/rt.spool" | tr -d ' ' >> "$T/rt.n2"
+  # A member starts watching: the main loop's check-in writes a 60 s cadence, and the last report is older.
+  echo 60 > "$RDIR/cadence"; echo $(( $(date +%s) - 90 )) > "$RDIR/brv_net_cp1.sent"
   ( rt_load brv_net_cp1 && rt_poll_report )
   echo "$DEVICE_ID $DEVICE_TOKEN ack=$PENDING_ACK" > "$T/rt.after"
 )
-check "report: modem.measurement goes AS the router, with the router's own token" "2" \
+check "report (0.17.0): the second poll inside the check-in cadence sends NO modem report and spools no unmoved fix" "1
+1" "$(cat "$T/rt.n2")"
+check "report: modem.measurement goes AS the router, with the router's own token (first poll, then the leased cadence)" "2" \
   "$(grep -c '^https://api.example.test/api/agent?vid=v_test&device=brv_net_cp1&event=modem.measurement&t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&up=1&mode=LTE&rssi=-71&rsrp=-101&sinr=7.4&rsrq=-12&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-' "$T/rt.urls")"
 check "report: a command queued for the ROUTER never runs on the hub-lite" "0" "$(wc -l < "$T/rt.ran" | tr -d ' ')"
 check "report: the hub-lite's own identity and ack list are untouched" "brv_net_hublite hubtok_0123456789abcdef ack=" "$(cat "$T/rt.after")"
@@ -1784,6 +1800,379 @@ check "remove: an id that is a path never reaches rm" "422 yes" "$(status_of "$r
 touch "$RS/stop"; curl -s -o /dev/null "http://127.0.0.1:$RP/stop" 2>/dev/null; kill "$RSTUB_PID" 2>/dev/null; wait "$RSTUB_PID" 2>/dev/null
 fi
 
+echo ""
+echo "# --- 0.17.0: hub->cloud cadence (D6 check-in, L1-L4) ----------------------------------------"
+# Every block below runs in a SUBSHELL that re-sources the hub-lite, so the stubs earlier suites left
+# in this shell (send_event, log) never stand in for the real functions under test.
+C17="$T/c17"; mkdir -p "$C17"
+cat > "$C17/conf" <<CONF
+VID="v_test"
+DEVICE_ID="brv_net_test"
+DEVICE_TOKEN="tok_SECRET_0123456789"
+WORKER_URL="https://api.example.test"
+MGMT_KEY=$KEY
+LINKTAP_HOST=192.168.8.50
+LINKTAP_GW_ID=GW02
+LINKTAP_DEV_IDS=$DEV
+LINKTAP_ALLOWED=1
+LINKTAP_NORMAL_VOL_L=378
+CONF
+# A fresh hub-lite in a subshell with all its state under $C17. Usage: ( hl17; ... )
+hl17() {
+  # shellcheck disable=SC1091
+  . "$HL_DIR/brvg-hub-lite.sh"
+  CONF="$C17/conf"; . "$C17/conf"
+  log() { :; }
+  ANCHOR_STATE="$C17/anchor"; ANCHOR_ALERTED="$C17/anchor.alerted"; ANCHOR_WARNED="$C17/anchor.warned"
+  ANCHOR_STREAK="$C17/anchor.streak"; ANCHOR_WSTREAK="$C17/anchor.wstreak"
+  ZONE_STATE="$C17/zone"; ZONE_ALERTED="$C17/zone.alerted"; ZONE_STREAK="$C17/zone.streak"
+  HUB_LITE_GPS="$C17/gps.json"; HUB_LITE_GPS_HIT="$C17/gps.hit"; HUB_LITE_STATE="$C17/state"
+  LIVE_UNTIL_FILE="$C17/live"; LIVE_PID_FILE="$C17/live.pid"; MEMBER_KEYS_FILE="$C17/keys"
+  RELAY_SPOOL="$C17/spool"; BRVG_RELAY_SPOOL="$C17/spool"; RELAY_SEQ_FILE="$C17/seq"; RELAY_STATE_DIR="$C17/relay"
+  RELAY_BOOT_FILE="$C17/boot"; LT_STATE_DIR="$C17/lt"; WAN_STATE_DIR="$C17/wan"; HUB_LITE_UPDATE="$C17/update"
+  GPS_INTERVAL=120; MODEM_INTERVAL=600; GPS_DEADBAND_M=50; AT_PORT=/nonexistent/at
+  rm -f "$ANCHOR_STATE" "$ZONE_STATE" "$C17"/*.streak "$C17"/*.alerted "$C17/spool" "$C17/live"
+}
+# A curl stand-in for /api/agent sends: logs the URL, answers with $C17/reply (a file, so a test can change it).
+agent_curl() { eval "echo \"\${$#}\"" >> "$C17/urls"; cat "$C17/reply" 2>/dev/null; }
+
+# --- the flat v2 `anchor` object: the shared fixture's three cases, plus a zone-only arm ---
+FX_ARMED='{"status":"ok","anchor":{"sig":1757750400000,"lat":41.492907,"lon":-81.694361,"radiusM":60,"warnM":45,"hbSec":60,"sampleSec":30}}'
+FX_DISARM='{"status":"ok","anchor":{"sig":0}}'
+FX_EXTRAS='{"status":"ok","anchor":{"sig":3515501400000,"lat":41.492907,"lon":-81.694361,"radiusM":60,"warnM":45,"zoneCy":41.4929,"zoneCx":-81.6944,"zoneR":40,"zoneStreak":3,"hbSec":60,"sampleSec":30}}'
+FX_ZONE='{"status":"ok","anchor":{"sig":1757751000000,"zoneCy":41.4929,"zoneCx":-81.6944,"zoneR":40,"zoneStreak":3,"hbSec":60,"sampleSec":30},"lease":0,"leaseUntil":0,"checkinSec":900,"live":0}'
+check "fixture v2 armed: hubLiteParse" "1757750400000 41.492907 -81.694361 60 45" "$(printf '%s' "$FX_ARMED" | parse_anchor)"
+check "fixture v2 armed: no zone" "" "$(printf '%s' "$FX_ARMED" | parse_zone)"
+check "fixture v2 disarm: hubLiteParse" "0" "$(printf '%s' "$FX_DISARM" | parse_anchor)"
+check "fixture v2-flat-extras: the base keys still parse (hubLiteParse)" "3515501400000 41.492907 -81.694361 60 45" "$(printf '%s' "$FX_EXTRAS" | parse_anchor)"
+check "fixture v2-flat-extras: and the zone keys parse" "3515501400000 41.4929 -81.6944 40 3" "$(printf '%s' "$FX_EXTRAS" | parse_zone)"
+check "zone-only arm: no anchor line, a zone line" "|1757751000000 41.4929 -81.6944 40 3" "$(printf '%s' "$FX_ZONE" | parse_anchor)|$(printf '%s' "$FX_ZONE" | parse_zone)"
+(
+  hl17
+  apply_watch "$(printf '%s' "$FX_ZONE" | parse_anchor)" "$(printf '%s' "$FX_ZONE" | parse_zone)"
+  echo "zoneonly=$(anchor_sig) anchorfile=$([ -f "$ANCHOR_STATE" ] && echo y || echo n)" > "$C17/w"
+  apply_watch "$(printf '%s' "$FX_EXTRAS" | parse_anchor)" "$(printf '%s' "$FX_EXTRAS" | parse_zone)"
+  echo "both=$(anchor_sig) zone=$(cut -d' ' -f1 "$ZONE_STATE")" >> "$C17/w"
+  apply_watch "$(printf '%s' "$FX_ARMED" | parse_anchor)" ""
+  echo "anchoronly=$(anchor_sig) zonefile=$([ -f "$ZONE_STATE" ] && echo y || echo n)" >> "$C17/w"
+  apply_watch 0 ""
+  echo "disarm=$(anchor_sig) final=$GPS_FORCE_NEXT" >> "$C17/w"
+)
+check "watch: a zone-only arm is echoed as its own signature" "zoneonly=1757751000000 anchorfile=n" "$(sed -n 1p "$C17/w")"
+check "watch: anchor + zone run under the one summed signature" "both=3515501400000 zone=3515501400000" "$(sed -n 2p "$C17/w")"
+check "watch: an armed reply without zone keys takes the zone down" "anchoronly=1757750400000 zonefile=n" "$(sed -n 3p "$C17/w")"
+check "watch: the disarm clears both and asks for one final position" "disarm=0 final=1" "$(sed -n 4p "$C17/w")"
+
+# --- zone streak of 3, with the quality gate ---
+(
+  hl17
+  send_event() { echo "$1 $2" >> "$C17/zsent"; }
+  rm -f "$C17/zsent"
+  apply_watch "" "7 41.4086 -81.7494 40 3"
+  check_zone 41.4095 -81.7494 5 0; check_zone 41.4095 -81.7494 5 0
+  echo "two=$(cat "$C17/zsent" 2>/dev/null | wc -l | tr -d ' ') out=$ZONE_OUT d=$ZONE_D" > "$C17/z"
+  check_zone 41.4095 -81.7494 5 1
+  echo "unreliable=$(cat "$ZONE_STREAK")" >> "$C17/z"
+  check_zone 41.4095 -81.7494 5 0
+  echo "three=$(cat "$C17/zsent")" >> "$C17/z"
+  check_zone 41.4095 -81.7494 5 0
+  echo "latched=$(wc -l < "$C17/zsent" | tr -d ' ')" >> "$C17/z"
+  check_zone 41.4086 -81.7494 5 0
+  echo "back=$([ -f "$ZONE_ALERTED" ] && echo latched || echo clear) streak=$(cat "$ZONE_STREAK" 2>/dev/null)" >> "$C17/z"
+)
+check "zone: two breaching samples fire nothing (streak 3, not the anchor's 2)" "two=0 out=1 d=100" "$(sed -n 1p "$C17/z")"
+check "zone: an UNRELIABLE sample neither advances nor clears the streak" "unreliable=2" "$(sed -n 2p "$C17/z")"
+check "zone: the third reliable breach fires zone.motion (the cloud sweep's own event)" "three=zone.motion dist=100&limit=40" "$(sed -n 3p "$C17/z")"
+check "zone: latched for the episode" "latched=1" "$(sed -n 4p "$C17/z")"
+check "zone: back inside ends the episode" "back=clear streak=" "$(sed -n 5p "$C17/z")"
+
+# --- fix quality ---
+check "quality: AT+QGPSLOC sats, hdop, knots" "9 1.2 0" "$(printf '+QGPSLOC: 061951.000,29.97580,-95.36047,1.2,32.5,2,0.00,0.0,0.0,110824,09\r\nOK\r\n' | parse_qgpsloc_quality)"
+check "quality: NMEA sats/hdop from GGA, SOG from RMC" "8 0.9 0.958" \
+  "$(printf '$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n$GPRMC,025433.00,A,4124.50743,N,08144.98471,W,0.958,,140826,,,A*60\r\n' | parse_nmea_quality)"
+check "quality: a source that says nothing is unknown, not zero" "- - -" "$(printf 'garbage\n' | parse_nmea_quality)"
+check "quality: gpsd TPV speed m/s -> knots" "- - 3.9" "$(printf '{"class":"TPV","mode":3,"lat":1.5,"lon":2.5,"speed":2.0}\n' | parse_gpsd_quality)"
+check "sample: joined, with - for a missing accuracy" "41.40846 -81.74975 - 8 0.9 0.958" "$(gps_join "41.40846 -81.74975" "8 0.9 0.958")"
+check "sample: no position is no sample" "" "$(gps_join "" "8 0.9 1")"
+check "gate: a good fix is reliable" "0" "$(gps_unreliable 1 9 0.9 0 30)"
+check "gate: hdop > 5 is unreliable" "1" "$(gps_unreliable 1 9 5.5 0 30)"
+check "gate: fewer than 4 satellites is unreliable" "1" "$(gps_unreliable 1 3 0.9 0 30)"
+check "gate: a fix older than 3 samples is unreliable" "1" "$(gps_unreliable 1 9 0.9 91 30)"
+check "gate: unknown sats/hdop never count against the fix" "0" "$(gps_unreliable 1 - - 0 30)"
+check "gate: no fix is unreliable" "1" "$(gps_unreliable 0 - - 0 30)"
+
+# --- underway detection ---
+(
+  hl17
+  UW=0; UW_ENTER_N=0
+  underway_step 1000 41.0 -81.0 2.0 0 0 0; echo "one=$UW" > "$C17/u"
+  underway_step 1030 41.0 -81.0 2.1 0 0 0; echo "two=$UW" >> "$C17/u"
+  UW=0; UW_ENTER_N=0
+  underway_step 1000 41.0 -81.0 2.0 0 0 0; underway_step 1030 41.0 -81.0 2.0 0 1 0; underway_step 1060 41.0 -81.0 0.1 0 0 0
+  echo "gapped=$UW" >> "$C17/u"
+  UW=0; UW_ENTER_N=0
+  underway_step 1000 41.0 -81.0 - 60 0 0; underway_step 1030 41.0 -81.0 - 70 0 0; echo "displace=$UW" >> "$C17/u"
+  UW=0; UW_ENTER_N=0
+  underway_step 1000 41.0 -81.0 0.2 60 0 1; underway_step 1030 41.0 -81.0 0.2 70 0 1; echo "armedswing=$UW" >> "$C17/u"
+  UW=1; UW_SLOW_SINCE=""
+  underway_step 2000 41.0 -81.0 0.2 0 0 0; underway_step 2200 41.0 -81.0 0.1 0 0 0; echo "slow200=$UW" >> "$C17/u"
+  underway_step 2250 41.0 -81.0 0.1 0 1 0; echo "unreliable-at-310=$UW" >> "$C17/u"
+  underway_step 2301 41.0 -81.0 0.1 0 0 0; echo "slow301=$UW" >> "$C17/u"
+  UW=1; UW_SLOW_SINCE=""
+  underway_step 3000 41.0 -81.0 0.2 0 0 0; underway_step 3200 41.001 -81.0 0.2 0 0 0; underway_step 3350 41.001 -81.0 0.2 0 0 0
+  echo "drifting=$UW" >> "$C17/u"
+)
+check "underway: one fast fix is not a trip" "one=0" "$(sed -n 1p "$C17/u")"
+check "underway: SOG >= 1.5 kn on 2 consecutive fixes enters" "two=1" "$(sed -n 2p "$C17/u")"
+check "underway: an unreliable fix between them never starts a trip (and a slow one resets)" "gapped=0" "$(sed -n 3p "$C17/u")"
+check "underway: >= 50 m from the last sent position on 2 fixes enters (no SOG source)" "displace=1" "$(sed -n 4p "$C17/u")"
+check "underway: while ARMED a swing away from the last sent position is not a trip" "armedswing=0" "$(sed -n 5p "$C17/u")"
+check "underway: slow for 200 s is still underway" "slow200=1" "$(sed -n 6p "$C17/u")"
+check "underway: an unreliable fix never ends a trip" "unreliable-at-310=1" "$(sed -n 7p "$C17/u")"
+check "underway: 5 min under 0.5 kn and 25 m ends it" "slow301=0" "$(sed -n 8p "$C17/u")"
+check "underway: slow but moving 100+ m restarts the 5-min clock" "drifting=1" "$(sed -n 9p "$C17/u")"
+
+# --- gps_tick end to end: armed heartbeat, no positions inside, breach positions, underway ---
+(
+  hl17
+  : > "$C17/urls"; printf '{"status":"ok"}' > "$C17/reply"
+  curl() { agent_curl "$@"; }
+  SAMPLE="41.4086 -81.7494 5 9 0.9 0.0"
+  collect_gps() { echo "$SAMPLE"; }
+  apply_anchor 1234 41.4086 -81.7494 50 0
+  GPS_LAST_LAT=""; gps_tick
+  echo "armed-inside-positions=$(grep -c 'event=gps.measurement' "$C17/urls")" > "$C17/g"
+  echo "sample-secs=$(gps_sample_secs "$(date +%s)")" >> "$C17/g"
+  gps_heartbeat "$(date +%s)"
+  grep 'event=gps.heartbeat' "$C17/urls" | sed 's/.*&t=tok_SECRET_0123456789&//; s/fixAgeS=[0-9]*/fixAgeS=N/' >> "$C17/g"
+  SAMPLE="41.4095 -81.7494 5 9 0.9 0.0"; gps_tick
+  echo "breach-positions=$(grep -c 'event=gps.measurement' "$C17/urls")" >> "$C17/g"
+  echo "lan=$(tr -d '\n' < "$HUB_LITE_GPS" | sed 's/"ts":[0-9]*,//; s/"fixAt":[0-9]*,//')" >> "$C17/g"
+  apply_anchor 0; : > "$C17/urls"
+  SAMPLE="41.4095 -81.7494 5 9 0.9 0.0"; gps_tick
+  echo "disarm-final=$(grep -c 'event=gps.measurement' "$C17/urls")" >> "$C17/g"
+  gps_tick
+  echo "unarmed-unmoved=$(grep -c 'event=gps.measurement' "$C17/urls")" >> "$C17/g"
+  SAMPLE="41.4095 -81.7494 5 9 0.9 2.5"; gps_tick; gps_tick; gps_tick
+  echo "underway=$UW positions=$(grep -c 'event=gps.measurement' "$C17/urls") secs=$(gps_sample_secs "$(date +%s)")" >> "$C17/g"
+  DEVICE_TOKEN=""; : > "$C17/urls"; apply_anchor 55 41.4086 -81.7494 50 0; gps_heartbeat "$(date +%s)"
+  echo "legacy-heartbeats=$(wc -l < "$C17/urls" | tr -d ' ')" >> "$C17/g"
+  # Owner ruling 2026-09-15: a security zone on its own gets NO 60 s heartbeat — the check-in only.
+  DEVICE_TOKEN="tok_SECRET_0123456789"; apply_anchor 0; : > "$C17/urls"; GPS_FORCE_NEXT=0; UW=0; UW_ENTER_N=0
+  apply_watch "" "77 41.4086 -81.7494 40 3"
+  SAMPLE="41.4086 -81.7494 5 9 0.9 0.0"; gps_tick; gps_heartbeat "$(date +%s)"
+  echo "zone-only: due=$(hb_armed && echo yes || echo no) heartbeats=$(grep -c 'event=gps.heartbeat' "$C17/urls") positions=$(grep -c 'event=gps.measurement' "$C17/urls") sig=$(anchor_sig)" >> "$C17/g"
+  SAMPLE="41.4095 -81.7494 5 9 0.9 0.0"; gps_tick; gps_tick; gps_tick
+  echo "zone-breach: event=$(grep -c 'event=zone.motion' "$C17/urls") anchorwatch-tag=$(grep -c 'anchorwatch=1' "$C17/urls")" >> "$C17/g"
+)
+check "tick: armed and inside the circle sends no position" "armed-inside-positions=0" "$(sed -n 1p "$C17/g")"
+check "tick: armed samples at 30 s" "sample-secs=30" "$(sed -n 2p "$C17/g")"
+check "heartbeat: the quality fields, no position, the watch signature" \
+  "fixValid=1&sats=9&hdop=0.9&fixAgeS=N&inside=1&distFromCenterM=0&streak=0&unreliable=0&anchorsig=1234" "$(sed -n 3p "$C17/g")"
+check "tick: a sample outside the circle IS sent (breach positions)" "breach-positions=1" "$(sed -n 4p "$C17/g")"
+check "lan read: the collector's JSON for cgi-bin/gps" \
+  'lan={"v":1,"state":"armed","leased":false,"anchorsig":"1234","fixValid":true,"unreliable":false,"fixAgeS":0,"lat":41.4095,"lon":-81.7494,"acc":5,"sats":9,"hdop":0.9,"sogKn":0.0,"inside":false,"distFromCenterM":100}' \
+  "$(sed -n 5p "$C17/g")"
+check "tick: the disarm sends one final position" "disarm-final=1" "$(sed -n 6p "$C17/g")"
+check "tick: unarmed and unmoved sends nothing" "unarmed-unmoved=1" "$(sed -n 7p "$C17/g")"
+check "tick: underway after 2 fast fixes, then every sample sent at 30 s" "underway=1 positions=3 secs=30" "$(sed -n 8p "$C17/g")"
+check "heartbeat: never on the legacy /api/shelly path (it would be an alert a minute)" "legacy-heartbeats=0" "$(sed -n 9p "$C17/g")"
+check "heartbeat: a SECURITY ZONE alone gets none, and sends no position inside (owner ruling 2026-09-15)" "zone-only: due=no heartbeats=0 positions=0 sig=77" "$(sed -n 10p "$C17/g")"
+check "zone: the breach is still detected locally and sent at once; zone fixes are not tagged as an anchor watch" "zone-breach: event=1 anchorwatch-tag=0" "$(sed -n 11p "$C17/g")"
+
+# --- the check-in (L1): the cadence switch, and what rides it ---
+LEASE_REPLY='{"status":"ok","event":"hub.checkin","lease":1,"leaseUntil":4102444800,"checkinSec":60,"live":1}'
+NOLEASE_REPLY='{"status":"ok","event":"hub.checkin","lease":0,"leaseUntil":0,"checkinSec":900,"live":0}'
+check "live fields: a leased reply" "1 4102444800 60 1" "$(printf '%s' "$LEASE_REPLY" | parse_live_fields)"
+check "live fields: nobody watching" "0 0 900 0" "$(printf '%s' "$NOLEASE_REPLY" | parse_live_fields)"
+check "live fields: a reply without them (switch off) says nothing" "" "$(printf '{"status":"ok","leases":1}' | parse_live_fields)"
+check "cadence: 15 min unwatched" "900" "$(checkin_interval 0 0 1000 1)"
+check "cadence: 1 min while a lease is live" "60" "$(checkin_interval 1 2000 1000 1)"
+check "cadence: a lease that has run out is unwatched" "900" "$(checkin_interval 1 999 1000 1)"
+check "cadence: a failed check-in retries within 2 min" "120" "$(checkin_interval 0 0 1000 0)"
+(
+  hl17
+  : > "$C17/urls"
+  curl() { agent_curl "$@"; }
+  drain_relay() { echo drain >> "$C17/ci.log"; }
+  live_link_manage() { echo "manage lease=$LIVE_LEASE live=$LIVE_OK" >> "$C17/ci.log"; }
+  fetch_member_keys() { echo keys >> "$C17/ci.log"; }
+  fetch_mgmt_key() { :; }
+  : > "$C17/ci.log"
+  MODEM_P="up=1&rssi=-70"; MODEM_PENDING=1
+  printf '%s' "$NOLEASE_REPLY" > "$C17/reply"
+  do_checkin 10000
+  echo "idle=$(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" 10000 "$CHECKIN_OK")" > "$C17/ci"
+  printf '%s' "$LEASE_REPLY" > "$C17/reply"
+  do_checkin 10060
+  echo "leased=$(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" 10060 "$CHECKIN_OK")" >> "$C17/ci"
+  printf '{"status":"ok","event":"hub.checkin"}' > "$C17/reply"
+  do_checkin 10120
+  echo "switch-off=$(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" 10120 "$CHECKIN_OK")" >> "$C17/ci"
+  cp "$C17/urls" "$C17/urls.ci"
+  DEVICE_TOKEN=""; : > "$C17/urls"; do_checkin 10180
+  echo "legacy=$(grep -c 'hub.checkin' "$C17/urls")" >> "$C17/ci"
+)
+check "check-in: 900 s after a reply with no lease" "idle=900" "$(sed -n 1p "$C17/ci")"
+check "check-in: switches to 60 s when the reply carries a lease" "leased=60" "$(sed -n 2p "$C17/ci")"
+check "check-in: back to 900 s when a check-in reply stops carrying the lease" "switch-off=900" "$(sed -n 3p "$C17/ci")"
+check "check-in: never on the legacy VEHICLE_KEY path (/api/shelly would alert every 15 min)" "legacy=0" "$(sed -n 4p "$C17/ci")"
+check "check-in: three check-ins, each GET /api/agent event=hub.checkin with the version and the watch signature" "3" \
+  "$(grep -c '^https://api.example.test/api/agent?vid=v_test&device=brv_net_test&event=hub.checkin&t=tok_SECRET_0123456789&av=[0-9.]*&anchorsig=0$' "$C17/urls.ci")"
+check "check-in: the pending modem sample rides the FIRST check-in only (once per sample)" "1" "$(grep -c 'event=modem.measurement&.*up=1&rssi=-70&av=' "$C17/urls.ci")"
+check "check-in: every check-in drains the spool and settles the link" "drain|manage lease=0 live=0|drain|manage lease=1 live=1|drain|manage lease=0 live=0" \
+  "$(grep -v keys "$C17/ci.log" | tr '\n' '|' | sed 's/|$//')"
+
+# --- L4: keys ride the check-in ---
+(
+  hl17
+  fetch_mgmt_key() { echo mgmt >> "$C17/k.log"; }
+  fetch_member_keys() { echo members >> "$C17/k.log"; }
+  : > "$C17/k.log"; KEYS_ASKED_AT=0
+  LAST_REPLY='{"status":"ok"}'
+  keys_on_checkin 100000; keys_on_checkin 100060; keys_on_checkin 100900
+  echo "nosig=$(grep -c members "$C17/k.log") mgmt=$(grep -c mgmt "$C17/k.log")" > "$C17/k"
+  printf 'sig %s\n' "$(printf 'a%.0s' $(seq 1 64))" > "$MEMBER_KEYS_FILE"
+  : > "$C17/k.log"
+  LAST_REPLY="{\"status\":\"ok\",\"keysSig\":\"$(printf 'a%.0s' $(seq 1 64))\"}"; keys_on_checkin 200000
+  LAST_REPLY="{\"status\":\"ok\",\"keysSig\":\"$(printf 'b%.0s' $(seq 1 64))\"}"; keys_on_checkin 200060
+  echo "sig=$(grep -c members "$C17/k.log")" >> "$C17/k"
+)
+check "keys: without a signature on the reply, the member set is asked on the check-in at most once per 15 min" "nosig=2 mgmt=3" "$(sed -n 1p "$C17/k")"
+check "keys: with a signature on the reply, asked only when it changed" "sig=1" "$(sed -n 2p "$C17/k")"
+
+# --- the live link (D6): open/close with the lease, relayed calls through the door's role gate ---
+check "poll verdict: 200 is a call" "call" "$(live_poll_verdict 200)"
+check "poll verdict: 204 polls again" "again" "$(live_poll_verdict 204)"
+check "poll verdict: no answer retries" "retry" "$(live_poll_verdict 000)"
+check "poll verdict: 409 not_leased ends the link" "stop" "$(live_poll_verdict 409)"
+# (The frame is put in a variable first: bash, which is `sh` on macOS, mis-parses an escaped quote
+# inside single quotes inside "$(...)" and brace-expands the result. dash, as CI runs, does not.)
+_fr='{"type":"call","id":"c1","uid":"u","role":"control","method":"POST","path":"/api/hub/linktap/valve","body":"{\"devId\":\"a\",\"action\":\"open\"}"}'
+check "frame: body unescaped" '{"devId":"a","action":"open"}' "$(printf '%s' "$_fr" | live_frame_str body)"
+check "frame: a key inside the body is never read as the frame's" "monitor" \
+  "$(printf '%s' '{"type":"call","id":"c1","uid":"u","role":"monitor","method":"POST","path":"/p","body":"{\"role\":\"owner\"}"}' | live_frame_str role)"
+check "frame: an absent body is absent" "" "$(printf '%s' '{"type":"call","id":"c1","role":"monitor","method":"GET","path":"/api/hub/status"}' | live_frame_str body)"
+check "result body: escaped for JSON" 'a \"q\" \\ b\nc' "$(printf 'a "q" \\ b\nc\n' | json_escape_body)"
+: > "$SHIM_LOG"
+(
+  hl17
+  export BRVG_HUB_LITE_CONF="$C17/conf" BRVG_HUB_LITE_BIN="$HL_DIR/brvg-hub-lite.sh" BRVG_LT_STATE_DIR="$C17/lt" \
+    BRVG_RELAY_SPOOL="$C17/spool" BRVG_HUB_LITE_STARTED="$T/started" BRVG_MEMBER_KEYS="$C17/keys" \
+    BRVG_MEMBER_KEYS_STALE="$C17/keys-stale" BRVG_HUB_LITE_RELOAD="$C17/reload" BRVG_HUB_LITE_UPDATE="$C17/update"
+  HUB_LITE_API="$HL_DIR/hub-lite-api.sh"; PATH="$T/bin:$PATH"; mkdir -p "$C17/lt"
+  REMOTE_ADDR=192.168.8.20; GATEWAY_INTERFACE=CGI/1.1   # as if this shell were uhttpd's: the child must shed both
+  call() { printf '{"type":"call","id":"%s","uid":"u1","role":"%s","method":"%s","path":"%s"%s}' "$1" "$2" "$3" "$4" "${5:+,\"body\":\"$5\"}"; }
+  call id1 monitor GET /api/hub/status | live_run_call > "$C17/r1"
+  call id2 monitor POST /api/hub/linktap/valve "{\\\"devId\\\":\\\"$DEV\\\",\\\"action\\\":\\\"open\\\",\\\"durationSecs\\\":600}" | live_run_call > "$C17/r2"
+  call id3 control POST /api/hub/linktap/valve "{\\\"devId\\\":\\\"$DEV\\\",\\\"action\\\":\\\"open\\\",\\\"durationSecs\\\":600}" | live_run_call > "$C17/r3"
+  call id4 owner POST /api/hub/bootstrap "{}" | live_run_call > "$C17/r4"
+  call id5 viewer GET /api/hub/status | live_run_call > "$C17/r5"
+)
+check "relay: a monitor reads status over the link" '{"type":"result","id":"id1","status":200,"body":"{\"lite' "$(sed 's/lite.*/lite/' "$C17/r1")"
+check "relay: a MONITOR is refused a valve open (D3)" '{"type":"result","id":"id2","status":403,' "$(sed 's/"status":\([0-9]*\),.*/"status":\1,/' "$C17/r2")"
+check "relay: a CONTROL crew member opens the valve (D3)" '{"type":"result","id":"id3","status":200,"body":"{\"ok\":true}"}' "$(cat "$C17/r3")"
+check "relay: and the gateway got exactly one open" "1" "$(grep -c '"cmd":6' "$SHIM_LOG")"
+check "relay: a path outside the router's own allowlist is 404 (setup is LAN-only)" '{"type":"result","id":"id4","status":404,' "$(sed 's/"status":\([0-9]*\),.*/"status":\1,/' "$C17/r4")"
+check "relay: a role the door does not know gets nothing" '{"type":"result","id":"id5","status":403,' "$(sed 's/"status":\([0-9]*\),.*/"status":\1,/' "$C17/r5")"
+r=$(api GET /status "" HTTP_AUTHORIZATION="" BRVG_RELAY_ROLE=owner GATEWAY_INTERFACE=CGI/1.1)
+check "relay role: UNFORGEABLE from the LAN — through uhttpd (GATEWAY_INTERFACE/REMOTE_ADDR set) it is ignored" "401" "$(status_of "$r")"
+(
+  hl17
+  : > "$C17/poll.log"
+  curl() {
+    case "$*" in
+      *live/poll*)
+        _o=""; _p=""; for _a in "$@"; do [ "$_p" = "-o" ] && _o="$_a"; _p="$_a"; done
+        _n=$(( $(cat "$C17/poll.n" 2>/dev/null || echo 0) + 1 )); echo "$_n" > "$C17/poll.n"
+        case "$_n" in
+          1) printf '%s' '{"type":"call","id":"k1","uid":"u","role":"monitor","method":"GET","path":"/api/hub/nope"}' > "$_o"; printf 200 ;;
+          2) : > "$_o"; printf 204 ;;
+          *) printf '{"live":0,"reason":"not_leased"}' > "$_o"; printf 409 ;;
+        esac ;;
+      *live/result*) for _a in "$@"; do case "$_a" in @*) cat "${_a#@}" >> "$C17/poll.log" ;; esac; done ;;
+    esac
+  }
+  rm -f "$C17/poll.n"
+  echo $(( $(date +%s) + 600 )) > "$LIVE_UNTIL_FILE"
+  live_link_loop
+  echo "polls=$(cat "$C17/poll.n") file=$([ -f "$LIVE_UNTIL_FILE" ] && echo kept || echo gone)" > "$C17/ll"
+  cat "$C17/poll.log" >> "$C17/ll"; echo >> "$C17/ll"
+  # manage: open with a live lease, close when it is gone
+  live_link_loop() { sleep 30; }
+  LIVE_LEASE=1; LIVE_UNTIL=$(( $(date +%s) + 120 )); LIVE_OK=1
+  live_link_manage "$(date +%s)"
+  echo "open=$(live_link_running && echo running || echo no) until=$([ "$(cat "$LIVE_UNTIL_FILE")" = "$LIVE_UNTIL" ] && echo written)" >> "$C17/ll"
+  LIVE_LEASE=0; LIVE_UNTIL=0; LIVE_OK=0
+  _pid=$(cat "$LIVE_PID_FILE"); live_link_manage "$(date +%s)"; sleep 1
+  echo "closed=$(kill -0 "$_pid" 2>/dev/null && echo running || echo stopped) file=$([ -f "$LIVE_UNTIL_FILE" ] && echo kept || echo gone)" >> "$C17/ll"
+  LIVE_LEASE=1; LIVE_UNTIL=$(( $(date +%s) + 120 )); LIVE_OK=0
+  live_link_manage "$(date +%s)"
+  echo "held-elsewhere=$(live_link_running && echo running || echo no)" >> "$C17/ll"
+)
+check "link: holds the poll, answers the call, re-polls on 204, ends on 409 not_leased" "polls=3 file=gone" "$(sed -n 1p "$C17/ll")"
+check "link: the call's answer is posted as a result frame" '{"type":"result","id":"k1","status":404,' "$(sed -n 2p "$C17/ll" | sed 's/"status":\([0-9]*\),.*/"status":\1,/')"
+check "link: a live lease OPENS the link (background child, lease clock written)" "open=running until=written" "$(sed -n 3p "$C17/ll")"
+check "link: no lease CLOSES it (child stopped, clock removed)" "closed=stopped file=gone" "$(sed -n 4p "$C17/ll")"
+check "link: a lease this router may not hold (live=0) opens nothing" "held-elsewhere=no" "$(sed -n 5p "$C17/ll")"
+
+# --- the LAN GPS read: /api/hub/gps/live and cgi-bin/gps ---
+printf '{"v":1,"ts":1,"state":"armed","fixValid":true,"lat":41.4,"lon":-81.7}\n' > "$C17/gps.json"
+rm -f "$C17/gps.hit"
+r=$(api GET /gps/live "" HTTP_AUTHORIZATION="" BRVG_HUB_LITE_GPS="$C17/gps.json" BRVG_HUB_LITE_GPS_HIT="$C17/gps.hit")
+check "gps/live: a boat's position needs a member key" "401" "$(status_of "$r")"
+r=$(api GET /gps/live "" BRVG_HUB_LITE_GPS="$C17/gps.json" BRVG_HUB_LITE_GPS_HIT="$C17/gps.hit")
+check "gps/live: serves the collector's sample verbatim" '200 {"v":1,"ts":1,"state":"armed","fixValid":true,"lat":41.4,"lon":-81.7}' "$(status_of "$r") $(body_of "$r" | tr -d '\r')"
+check "gps/live: a read asks the collector to sample at 30 s" "yes" "$([ -s "$C17/gps.hit" ] && echo yes || echo no)"
+r=$(printf '' | env PATH="$T/bin:$PATH" REQUEST_METHOD=GET HTTP_AUTHORIZATION="Bearer $KEY" BRVG_HUB_LITE_CONF="$C17/conf" \
+  BRVG_HUB_LITE_BIN="$HL_DIR/brvg-hub-lite.sh" BRVG_HUB_LITE_API="$HL_DIR/hub-lite-api.sh" BRVG_HUB_LITE_GPS="$C17/gps.json" \
+  BRVG_HUB_LITE_GPS_HIT="$C17/gps.hit" BRVG_MEMBER_KEYS="$C17/keys" REMOTE_ADDR=192.168.8.20 sh "$HL_DIR/hub-lite-gps-cgi.sh" 2>/dev/null)
+check "cgi-bin/gps: the same read, same key" "200" "$(status_of "$r")"
+check "cgi-bin/gps: JSON, never a web page (owner D1)" "application/json" "$(printf '%s' "$r" | sed -n 's/^Content-Type: \([a-z/]*\).*/\1/p' | head -1)"
+r=$(api GET /status "")
+check "gps/live: webUiEnabled stays false — a hub-lite still has no local web interface" "1" "$(body_of "$r" | grep -c '"webUiEnabled":false')"
+
+# --- L3: LinkTap measurement only on a transition or while watering ---
+check "lt send: every poll while watering" "yes" "$(lt_should_send 1 'w=1 rf=1' 'w=1 rf=1' && echo yes || echo no)"
+check "lt send: an idle valve unchanged is NOT sent" "no" "$(lt_should_send 0 'w=0 rf=1' 'w=0 rf=1' && echo yes || echo no)"
+check "lt send: watering 1->0 is sent" "yes" "$(lt_should_send 0 'w=1 rf=1' 'w=0 rf=1' && echo yes || echo no)"
+check "lt send: the RF link lost is sent" "yes" "$(lt_should_send 0 'w=0 rf=1' 'w=0 rf=0' && echo yes || echo no)"
+check "lt send: the first poll after a restart is sent" "yes" "$(lt_should_send 0 '' 'w=0 rf=1' && echo yes || echo no)"
+mkdir -p "$T/lt3"; : > "$T/spool3"
+lt3() { printf '%s' "$1" > "$SHIM_CMD3"; : > "$SHIM_LOG"
+  ( LT_STATE_DIR="$T/lt3"; BRVG_RELAY_SPOOL="$T/spool3"; CONF="$C17/conf"; . "$C17/conf"; PATH="$T/bin:$PATH"; LT_SENT=0; linktap_tick; echo "$LT_SENT" > "$T/lt3.sent" ) }
+lt3 '{"is_watering":0,"volume":0,"is_rf_linked":true,"battery":90}'
+lt3 '{"is_watering":0,"volume":0,"is_rf_linked":true,"battery":89}'
+lt3 '{"is_watering":0,"volume":0,"is_rf_linked":true,"battery":89}'
+check "lt tick: three idle polls spool ONE measurement (was three)" "1 0" "$(grep -c 'linktap.measurement' "$T/spool3") $(cat "$T/lt3.sent")"
+check "lt tick: the LAN door's copy is still refreshed every poll" "1" "$(grep -c 'battery=89' "$T/lt3/meas.$DEV")"
+lt3 '{"is_watering":1,"volume":1,"is_rf_linked":true,"speed":5}'
+lt3 '{"is_watering":1,"volume":2,"is_rf_linked":true,"speed":5}'
+check "lt tick: the start and every watering poll are sent, and ask for a drain" "3 1" "$(grep -c 'linktap.measurement' "$T/spool3") $(cat "$T/lt3.sent")"
+lt3 '{"is_watering":0,"volume":2,"is_rf_linked":true}'
+lt3 '{"is_watering":0,"volume":0,"is_rf_linked":false}'
+lt3 '{"is_watering":0,"volume":0,"is_rf_linked":false}'
+check "lt tick: the stop and an RF loss are sent; the quiet poll after is not" "5" "$(grep -c 'linktap.measurement' "$T/spool3")"
+(
+  hl17
+  LT_STATE_DIR="$T/lt3"; BRVG_RELAY_SPOOL="$T/spool3"; : > "$T/spool3"; rm -f "$T/lt3/idle.at"
+  lt_checkin_spool 50000; lt_checkin_spool 50060; lt_checkin_spool 50900
+  echo "$(grep -c 'linktap.measurement' "$T/spool3")" > "$T/lt3.ci"
+)
+check "lt check-in: the idle reading rides the check-in, once per idle period (not every leased minute)" "2" "$(cat "$T/lt3.ci")"
+
+# --- the batch envelope never claims "keyframe" (the cloud's full-value contract) ---
+(
+  hl17
+  mkdir -p "$RELAY_STATE_DIR"; echo 5 > "$RELAY_SEQ_FILE"
+  printf '1\ts1\thumidity.change\trh=60\n' > "$RELAY_SPOOL"
+  curl() { for _a in "$@"; do case "$_a" in '{"v":1'*) printf '%s' "$_a" > "$C17/batch" ;; esac; done; printf 200; }
+  drain_relay
+)
+check "batch: the resend-all round (seq 6) is still kind delta — a partial reading is never a keyframe" "1" "$(grep -c '"seq":6,.*"kind":"delta"' "$C17/batch")"
+check "flood close is untouched by the cadence: the receiver still closes with the WAN down" "1" \
+  "$(LINKTAP_HOST=192.168.8.50 LINKTAP_GW_ID=GW02 LINKTAP_DEV_IDS=$DEV BRVG_RELAY_SPOOL="$C17/fspool" PATH="$T/bin:$PATH" sh -c ". \"$HL_DIR/brvg-hub-lite.sh\"; echo 0 > \"$SHIM_RC\"; : > \"$SHIM_LOG\"; linktap_flood_close; grep -c '\"cmd\":7' \"$SHIM_LOG\"")"
+
 [ -n "${KEEP_T:-}" ] && echo "T=$T" || rm -rf "$T"
 
 # --- the PACKAGED scripts are the tested scripts ----------------------------------------------
@@ -1794,7 +2183,7 @@ if [ -z "${BRVG_STRIPPED_RUN:-}" ]; then
   _sd=$(mktemp -d)
   mkdir -p "$_sd/package"
   _parse_ok=1
-  for _f in brvg-hub-lite.sh routers.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh; do
+  for _f in brvg-hub-lite.sh routers.sh hub-lite-api.sh hub-lite-cgi.sh hub-lite-gps-cgi.sh hub-lite-mgmt.sh package/feed-setup.sh; do
     sh "$HL_SRC/package/strip-comments.sh" "$HL_SRC/$_f" "$_sd/$_f"
     sh -n "$_sd/$_f" || _parse_ok=0
   done
