@@ -2387,7 +2387,14 @@ async fn key_sync_loop(rt: Shared) {
     loop {
         // The gate is consulted before the config file is even read: a tick that is not due must
         // cost nothing at all.
-        if let Some(reason) = rt.key_sync.lock().await.due(now_ms()) {
+        //
+        // ⚠️ THE GUARD IS DROPPED ON ITS OWN LINE, deliberately. On edition 2021 a temporary in an
+        // `if let` scrutinee lives until the END of the if-let block, so `if let Some(r) =
+        // rt.key_sync.lock().await.due(..)` would still hold the lock when `sync_member_keys` tries
+        // to take it — a permanent deadlock of the whole key sync, in production only (the tests
+        // drive the body directly). `the_loop_itself_fetches_at_boot` is the regression test.
+        let due = rt.key_sync.lock().await.due(now_ms());
+        if let Some(reason) = due {
             let cfg = hub_config::read_config_in(&rt.base);
             if !cfg.token.is_empty() {
                 sync_member_keys(&rt, &client, &cfg, reason).await;
@@ -4792,6 +4799,34 @@ mod tests {
             }
         }
         assert_eq!(stub.lock().unwrap().hits, hits_before, "30 ticks of a dead worker cost nothing");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn the_loop_itself_fetches_at_boot_and_then_goes_quiet() {
+        // Drives the REAL loop, not just its body. It is the only test that can catch the loop
+        // holding the gate's lock while the fetch it just authorized tries to take it — which is
+        // exactly what an `if let Some(r) = ...lock().await.due(..)` does on edition 2021, and which
+        // would deadlock key sync forever in production while every body-level test still passed.
+        let stub = Arc::new(std::sync::Mutex::new(KeyStub { keys: vec![key("owner"), key("control")], etag: true, ..Default::default() }));
+        let (rt, _cfg, base) = key_sync_rt("keysig-loop", stub_key_worker(stub.clone()).await).await;
+        tokio::spawn(key_sync_loop(rt.clone()));
+        let landed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if rt.keys.read().await.len() == 2 && !hub_config::read_config_in(&base).member_keys_sig.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(landed.is_ok(), "the boot sync never completed - the loop is wedged");
+        assert_eq!(stub.lock().unwrap().hits, 1);
+
+        // And it stays quiet: nothing is due, so the ticks cost nothing.
+        rt.key_wake.notify_one();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(stub.lock().unwrap().hits, 1, "a wake with nothing due must not spend a request");
         let _ = std::fs::remove_dir_all(&base);
     }
 
