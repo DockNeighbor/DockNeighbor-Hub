@@ -1,0 +1,68 @@
+{
+  "fixture": "anchor-reply.v2",
+  "designOfRecord": "sc4-internal docs/TELEMETRY-ARCHITECTURE-2026-09-13.md §A7.2 (APPROVED 2026-09-13)",
+  "copies": [
+    "sc4-internal/fixtures/anchor-reply.v2.json (authoritative)",
+    "DockNeighbor-Cloud fixtures/anchor-reply.v2.json",
+    "DockNeighbor-Hub daemon/fixtures/anchor-reply.v2.json (Phase 2)"
+  ],
+  "rules": [
+    "The `anchor` object is FLAT: never nest an object or an array (hub-lite parse_anchor captures [^}]* and would be silently unarmed).",
+    "Never repeat a base key (sig, lat, lon, radiusM, warnM) and never use a new key whose name contains one: hub-lite's per-key sed is greedy and the last match wins.",
+    "No strings at all (so no spaces in strings); flags are 0/1.",
+    "Numbers are plain decimals, never exponents: lat/lon with at most 6 decimals (41.492907), metres and seconds as integers.",
+    "{\"sig\":0} is the disarm. `sig` = anchor armedTs + zone armedTs (anchor-only keeps today's value).",
+    "No version gating: every hub gets this object; an old hub-lite reads the base keys and ignores the rest."
+  ],
+  "cases": {
+    "armed": {
+      "input": {
+        "anchorWatch": "{\"lat\":41.492907,\"lon\":-81.694361,\"radiusM\":60,\"warnRadiusM\":45,\"armedTs\":1757750400000}",
+        "securityZone": null,
+        "reportedSig": "0"
+      },
+      "reply": {
+        "sig": 1757750400000,
+        "lat": 41.492907,
+        "lon": -81.694361,
+        "radiusM": 60,
+        "warnM": 45,
+        "hbSec": 300,
+        "sampleSec": 30
+      },
+      "hubLiteParse": "1757750400000 41.492907 -81.694361 60 45"
+    },
+    "disarm": {
+      "input": {
+        "anchorWatch": null,
+        "securityZone": null,
+        "reportedSig": "1757750400000"
+      },
+      "reply": {
+        "sig": 0
+      },
+      "hubLiteParse": "0"
+    },
+    "v2-flat-extras": {
+      "input": {
+        "anchorWatch": "{\"lat\":41.492907,\"lon\":-81.694361,\"radiusM\":60,\"warnRadiusM\":45,\"armedTs\":1757750400000}",
+        "securityZone": "{\"lat\":41.4929,\"lon\":-81.6944,\"radiusM\":40,\"armedTs\":1757751000000}",
+        "reportedSig": "1757750400000"
+      },
+      "reply": {
+        "sig": 3515501400000,
+        "lat": 41.492907,
+        "lon": -81.694361,
+        "radiusM": 60,
+        "warnM": 45,
+        "zoneCy": 41.4929,
+        "zoneCx": -81.6944,
+        "zoneR": 40,
+        "zoneStreak": 3,
+        "hbSec": 300,
+        "sampleSec": 30
+      },
+      "hubLiteParse": "3515501400000 41.492907 -81.694361 60 45"
+    }
+  }
+}

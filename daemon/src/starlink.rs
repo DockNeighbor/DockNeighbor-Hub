@@ -401,7 +401,7 @@ pub fn parse_location(r: &pb::GetLocationResponse) -> Option<GpsFix> {
     if !lat.is_finite() || !lon.is_finite() || lat.abs() > 90.0 || lon.abs() > 180.0 || (lat == 0.0 && lon == 0.0) {
         return None;
     }
-    Some(GpsFix { lat, lon, acc: r.sigma_m.filter(|a| a.is_finite() && *a >= 0.0) })
+    Some(GpsFix { lat, lon, acc: r.sigma_m.filter(|a| a.is_finite() && *a >= 0.0), ..Default::default() })
 }
 
 // --- gRPC framing ---------------------------------------------------------------------------------

@@ -10,7 +10,10 @@
 //   * the MANAGEMENT API on the LAN (0.0.0.0, not loopback — a phone on the boat's Wi-Fi manages
 //     the hub exactly like the desktop app on the same machine). Typed allowlist, same discipline
 //     as the agent command channel: status / config / token / clear. Nothing generic.
-//   * the HEARTBEAT loop — `hub.measurement` on the agent wire, from Rust, off the store.
+//   * the CHECK-IN loop — one consolidated `POST /api/agent/batch` keyframe every 15 minutes carrying
+//     every device's current value plus the hub's own `hub.status` (cadence.rs, owner ruling
+//     2026-09-15); immediate single events ride the same route as `delta` posts. The old per-beat
+//     `hub.measurement` GET is retired.
 //   * the KEY SYNC loop — pulls the vehicle members' per-user API keys from the worker
 //     (minted per (user, vehicle), owner's scheme). Until the first successful sync the API
 //     answers 401 to everything: deny by default, never an open window.
@@ -18,7 +21,7 @@
 // AUTH: every request carries `x-brvg-key`. Keys arrive from the worker with the member's uid and
 // vehicle role attached, so the hub knows WHO is calling; writes are gated on the same role
 // matrix the app uses (vehicleCapabilities.ts). The hub's own cloud token never appears in any
-// response, and reqwest errors are stringified with `without_url()` because heartbeat/sync URLs
+// response, and reqwest errors are stringified with `without_url()` because check-in/sync URLs
 // carry that token in `t=`.
 //
 // The WebSocket to the worker (remote-control relay + live key pushes) is a later increment; the
@@ -28,7 +31,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +42,9 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 
+use crate::batch;
+use crate::cadence;
+use crate::geofence;
 use crate::hub_config::{self, HubConfig, MemberKey};
 use crate::linktap;
 use crate::cycle;
@@ -61,40 +67,28 @@ const KEY_HEADER: &str = "x-brvg-key";
 const KEY_SYNC_SECS: u64 = 300;
 /// An unregistered hub polls the store at this cadence waiting for the bootstrap seed.
 const UNREGISTERED_POLL_SECS: u64 = 30;
+/// The lowest `heartbeatSecs` the config door accepts. The value is still stored and reported (the
+/// app writes it at bootstrap), but it no longer paces anything: the cloud cadence is the 15-minute
+/// keyframe plus immediate events (cadence.rs), one rule for every hub.
 const HEARTBEAT_FLOOR_SECS: u64 = 15;
 
-// ── Report-by-exception heartbeat (scanning redesign, Phase 2) ──────────────────────────────────
-// The heartbeat is a LIVENESS + config-poll beat, NOT the alarm path: a flood or valve change
-// reaches the cloud immediately through the LinkTap poll loop and forward_shelly_to_cloud, and both
-// call note_activity() — which ALSO wakes this loop at once. So backing the beat off when nothing is
-// happening never delays an alarm; it only stops a parked, idle hub from beating 1440×/day for
-// nothing (and, post Phase-1a, from bumping its activity cursor that often).
+// ── Hub → cloud cadence (owner ruling 2026-09-15; hub cadence audit H1–H9) ──────────────────────────
+// "There should be 100–200 updates from the hub to the cloud a day — one every ~15 min when not
+// underway, the GPS is not moving, and nothing is alarming."
 //
-// Three cadences by how long since the last local event (a valve/gateway report or a forwarded
-// sensor event):
-//   * ACTIVE  — within 2 min of an event: beat fast so the app/cloud track the situation live.
-//   * NORMAL  — within 10 min: the configured cadence (heartbeat_secs, floor 15 s).
-//   * QUIET   — idle beyond that: one beat every 20 min. Comfortably under the cloud's 60-min
-//               offline default (owner contract; connectivitySweep.DEFAULT_OFFLINE_MINS), with two
-//               beats of margin, so a healthy parked hub never reads as offline.
-const HEARTBEAT_ACTIVE_SECS: u64 = 20;
-const HEARTBEAT_QUIET_SECS: u64 = 20 * 60;
-const HEARTBEAT_ACTIVE_WINDOW_MS: i64 = 2 * 60 * 1000;
-const HEARTBEAT_NORMAL_WINDOW_MS: i64 = 10 * 60 * 1000;
-
-/// PURE: the next heartbeat interval, from how long since the last local event and the configured
-/// cadence. ACTIVE is never SLOWER than configured, QUIET never FASTER — so an operator who sets an
-/// unusually fast or slow `heartbeat_secs` is still respected as the baseline the modes bend around.
-fn heartbeat_interval_secs(idle_ms: i64, configured_secs: u64) -> u64 {
-    let normal = configured_secs.max(HEARTBEAT_FLOOR_SECS);
-    if idle_ms < HEARTBEAT_ACTIVE_WINDOW_MS {
-        HEARTBEAT_ACTIVE_SECS.min(normal)
-    } else if idle_ms < HEARTBEAT_NORMAL_WINDOW_MS {
-        normal
-    } else {
-        HEARTBEAT_QUIET_SECS.max(normal)
-    }
-}
+// What used to be here was a report-by-exception HEARTBEAT whose idle back-off could never engage:
+// every GPS fix, valve poll and router poll was forwarded unconditionally, and each forward counted as
+// "activity", so a real hub beat every 20 s — 4,320 `hub.measurement` GETs a day on top of 1,440 GPS
+// fixes, 1,440 valve polls and 720 per router. It is replaced by:
+//   * ONE keyframe every 15 min (checkin_loop): hub.status + every device's current value.
+//   * immediate `delta` posts for real changes only (cadence.rs gates, geofence.rs for GPS).
+//   * a `gps.heartbeat` only while an ANCHOR WATCH is armed (gps_heartbeat_loop): every 5 min while
+//     inside the circle, 60 s during a drag, retried within 60 s if a post fails — a security
+//     zone alone stays on the 15-minute cadence (owner ruling 2026-09-15).
+//   * every sample while a member holds the watch lease (do_watch), and the LAN live feed
+//     (/api/hub/gps/live) that costs the cloud nothing.
+// A SKIPPED forward is not activity (H3): `note_activity` is rung only by real events, commands, a
+// refresh and a lease start — each of which is worth an early check-in.
 
 /// PURE: is this invocation the hub service? (`schtasks … "<exe>" --hub` — hub_service.rs.)
 pub fn hub_mode_requested<I: IntoIterator<Item = String>>(args: I) -> bool {
@@ -150,48 +144,13 @@ pub fn may_control(role: &str) -> bool {
     matches!(role, "owner" | "coowner" | "admin" | "control")
 }
 
+/// Any member of the vessel — the `view` capability (monitor and above). Deny by default: an empty or
+/// unknown role is not a member.
+pub fn may_view(role: &str) -> bool {
+    matches!(role, "owner" | "coowner" | "admin" | "control" | "monitor")
+}
+
 // --- Wire ---------------------------------------------------------------------------------------
-
-/// PURE: the heartbeat URL. Split out because it IS the wire contract — `hub.measurement` rides
-/// the same `/api/agent` ingest as the router agent and the worker classifies it as telemetry,
-/// never an alert. The only place the hub token meets a URL.
-pub fn heartbeat_url(
-    worker_base: &str, cfg: &HubConfig, ver: &str, platform: &str, update: Option<&str>, ack: Option<&str>,
-) -> Result<String, String> {
-    let base = worker_base.trim_end_matches('/');
-    let mut u = url::Url::parse(&format!("{base}/api/agent")).map_err(|e| e.to_string())?;
-    u.query_pairs_mut()
-        .append_pair("vid", &cfg.vid)
-        .append_pair("device", &cfg.hub_id)
-        .append_pair("event", "hub.measurement")
-        .append_pair("t", &cfg.token)
-        .append_pair("name", &cfg.name)
-        .append_pair("platform", platform)
-        .append_pair("ver", ver);
-    // Only present when a newer release exists — the worker stores it flat on the hub's sensorState
-    // doc (extractSensorStateExtras), so the fleet console reads "update available" straight off the
-    // same heartbeat that carries the running version.
-    if let Some(v) = update.filter(|v| !v.is_empty()) {
-        u.query_pairs_mut().append_pair("update", v);
-    }
-    // Commands this hub has handled and is acknowledging so the worker prunes them from the queue
-    // (agentCommands.ackCommands parses this same comma-separated `ack`). The router agent uses the
-    // identical param; the daemon simply never did until it learned to act on commands.
-    if let Some(a) = ack.filter(|a| !a.is_empty()) {
-        u.query_pairs_mut().append_pair("ack", a);
-    }
-    Ok(u.to_string())
-}
-
-pub async fn send_heartbeat_once(client: &reqwest::Client, worker_base: &str, cfg: &HubConfig) -> Result<(), String> {
-    let url = heartbeat_url(worker_base, cfg, env!("CARGO_PKG_VERSION"), std::env::consts::OS, None, None)?;
-    let res = client.get(url).send().await.map_err(|e| e.without_url().to_string())?;
-    if res.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("HTTP {}", res.status().as_u16()))
-    }
-}
 
 /// PURE: read `{linktap:{allowed, profiles}}` out of a worker reply (cloud-server #105).
 /// Config-as-state — the worker recomputes it from the vehicle on every report, so what arrives IS
@@ -269,7 +228,7 @@ pub struct Rt {
     /// waiter released the moment that knowledge changes takes the interval out of the path.
     pub valve_rev: tokio::sync::watch::Sender<u64>,
     /// The newest released version, when it is newer than the one running — else None. Written by
-    /// the update-check loop, read by the heartbeat (so the fleet console sees it) and by
+    /// the update-check loop, read by the keyframe's hub.status (so the fleet console sees it) and by
     /// /api/hub/status (so the local app does). Visibility only; nothing here installs anything.
     pub update_available: tokio::sync::RwLock<Option<String>>,
     /// The web app this hub serves at `/` (web_bundle.rs) — None until a signed bundle has been
@@ -277,14 +236,13 @@ pub struct Rt {
     pub web: tokio::sync::RwLock<Option<crate::web_bundle::WebBundle>>,
     /// Mirror of `hub_config::web_ui_disabled`, read on every `/` request without touching the file.
     pub web_ui_disabled: std::sync::atomic::AtomicBool,
-    /// Epoch ms of the last local event worth reporting (a valve/gateway report or a forwarded
-    /// sensor event). The heartbeat picks its cadence from how stale this is — recent ⇒ ACTIVE/
-    /// NORMAL, long-idle ⇒ QUIET (report-by-exception, Phase 2). Boot counts as activity so a fresh
-    /// hub starts responsive and settles to quiet on its own.
+    /// Epoch ms of the last REAL local event (an alarm, a valve transition, a command, a refresh, a
+    /// lease start). Diagnostics only now — nothing paces itself off it. A skipped forward never
+    /// touches it (H3).
     pub last_activity_ms: AtomicI64,
-    /// Rung by note_activity() the instant a local event happens, so the heartbeat loop breaks its
-    /// nap and beats NOW (in ACTIVE cadence) instead of after the current — possibly 20-minute —
-    /// interval. This is what makes quiet-mode backoff free of latency: the alarm path wakes it.
+    /// Rung by note_activity(): the check-in loop sends its keyframe NOW (at most one per
+    /// MIN_CHECKIN_GAP_MS) instead of at the end of its 15-minute nap — so a refresh after an arm,
+    /// a lease start, or a command reply reaches the hub in about a second.
     pub wake: tokio::sync::Notify,
     /// Rung by do_valve the instant a valve command executes, so the linktap poll loop breaks its
     /// (up to 60s) nap and reports the new state to the cloud within a couple seconds instead of on
@@ -310,7 +268,7 @@ pub struct Rt {
     /// its ack to be read) is not run a second time. In-memory and bounded — forgetting an id is
     /// harmless (at worst one extra up-to-date check). See handle_agent_commands.
     pub handled_cmds: tokio::sync::Mutex<HashSet<String>>,
-    /// Command ids to acknowledge on the next heartbeat (`?ack=`), so the worker prunes them from
+    /// Command ids to acknowledge on the next keyframe check-in (`?ack=`), so the worker prunes them from
     /// the queue. An id lands here only once this hub has reached a TERMINAL decision about the
     /// command; a self-update that actually swaps restarts BEFORE acking, on purpose (see
     /// run_commanded_self_update), so a crash mid-update leaves the command to be retried.
@@ -318,11 +276,11 @@ pub struct Rt {
     /// Telemetry reports the uplink refused or dropped, oldest first. A boat's cellular link fails
     /// sends constantly (`report … failed to send`), and each failed report USED TO BE LOST — a gap
     /// in the cloud with no retry. They now queue here and drain FIFO on the next successful send or
-    /// heartbeat. BOUNDED (drop-oldest at MAX_SPOOL_REPORTS): a long outage sheds the oldest samples
+    /// keyframe. BOUNDED (drop-oldest at MAX_SPOOL_REPORTS): a long outage sheds the oldest samples
     /// rather than growing without limit. In-memory only — a restart clears it, which is acceptable
     /// (stale telemetry has little value, and restarts are rare). See spool_report / drain_reports.
     pub pending_reports: tokio::sync::Mutex<std::collections::VecDeque<crate::linktap_runtime::Report>>,
-    /// Held for the duration of a drain so the poll loop and the heartbeat loop cannot drain at once
+    /// Held for the duration of a drain so the samplers and the check-in loop cannot drain at once
     /// and double-send the front report. Pushes take `pending_reports` only briefly and never wait
     /// on this, so enqueuing never blocks behind a network flush.
     pub report_flush: tokio::sync::Mutex<()>,
@@ -330,11 +288,77 @@ pub struct Rt {
     /// Until 2026-09-13 a failed forward was logged and DROPPED: a bilge alarm that fired during an
     /// uplink blip closed the valve locally and never reached the cloud — no push, no WhatsApp, no
     /// alert log. Queued here, retried by `shelly_retry_loop` every few seconds and after each good
-    /// heartbeat, shed oldest-READING-first so an alarm is the last thing a long outage loses.
+    /// keyframe, shed oldest-READING-first so an alarm is the last thing a long outage loses.
     /// In-memory, like `pending_reports`.
     pub pending_shelly: tokio::sync::Mutex<std::collections::VecDeque<QueuedShelly>>,
     /// One drain at a time, for the same double-send reason as `report_flush`.
     pub shelly_flush: tokio::sync::Mutex<()>,
+    /// What the hub knows and what it last SENT, per device — the cadence gates' memory (Telemetry).
+    pub telemetry: tokio::sync::Mutex<Telemetry>,
+    /// The watch lease (H6): epoch ms until which a member is watching. Only ever raised, atomically
+    /// (cadence::lease_extend), so two viewers renewing at once cannot shorten each other's lease.
+    pub lease_until_ms: AtomicI64,
+    /// When `/api/hub/refresh` last rang the check-in — the 5 s coalescing window (H8).
+    pub last_refresh_ms: AtomicI64,
+    /// When the last keyframe check-in started.
+    pub last_checkin_ms: AtomicI64,
+    /// When any batch post (keyframe, event or heartbeat) was last delivered — a check-in for the
+    /// anchor-watch heartbeat clock.
+    pub last_cloud_ok_ms: AtomicI64,
+    /// Per-process id for the batch envelope's `boot`, so a restart's counter reset is not a replay.
+    pub boot_id: String,
+    /// The event queue's batch sequence (kind delta only — see batch::envelope).
+    pub batch_seq: AtomicU64,
+    /// The event post that failed transiently, kept with ITS seq so the retry is byte-identical and
+    /// the cloud drops it whole if the first attempt did land. Guarded by `report_flush`.
+    pub inflight_delta: tokio::sync::Mutex<Option<(u64, Vec<batch::Item>)>>,
+    /// Bumped on every GPS sample; `/api/hub/gps/live` long-polls wait on it (H7).
+    pub gps_live: tokio::sync::watch::Sender<u64>,
+    /// How many LAN live-feed polls are open. While any is, GPS sources sample at full rate.
+    pub gps_live_waiters: AtomicUsize,
+}
+
+/// The newest GPS sample for the LAN live feed.
+#[derive(Clone, Debug)]
+pub struct LiveFix {
+    pub device: String,
+    pub fix: crate::gps::GpsFix,
+    pub at_ms: i64,
+    pub inside: Option<bool>,
+    pub dist_from_center_m: Option<f64>,
+    pub unreliable: bool,
+    /// `unarmed` | `anchor` | `zone` | `underway`.
+    pub state: &'static str,
+}
+
+/// The cadence gates' memory: the newest value of every device (what the keyframe carries) and what
+/// the cloud last RECEIVED for it (what an immediate send is compared against).
+#[derive(Default)]
+pub struct Telemetry {
+    /// The watch the worker says is armed (None = unarmed). Adopted from any batch reply's `anchor`.
+    pub watch: Option<geofence::Watch>,
+    /// Per GPS device.
+    pub geofences: HashMap<String, geofence::Geofence>,
+    /// Per GPS device: the newest fix and when it was sampled.
+    pub gps_latest: HashMap<String, (crate::gps::GpsFix, i64)>,
+    pub gps_live: Option<LiveFix>,
+    /// Per router id: the newest `modem.measurement` params, WITHOUT any `wanKb_*`.
+    pub router_latest: HashMap<String, Vec<(String, String)>>,
+    pub router_sent: HashMap<String, cadence::RouterSent>,
+    /// Per router id: KB of WAN use not yet sent (summed across skipped sends).
+    pub wan_pending_kb: HashMap<String, u64>,
+    /// Per `lt_<dev>`: what the cloud last received for the valve.
+    pub valve_sent: HashMap<String, cadence::ValveSent>,
+    /// Per Shelly id: the last telemetry event name and every reading param seen, merged.
+    pub shelly_latest: HashMap<String, (String, Vec<(String, String)>)>,
+    /// Per `<shelly id>|<param>`.
+    pub reading_gates: HashMap<String, cadence::ReadingGate>,
+}
+
+impl Telemetry {
+    pub fn anchorsig(&self) -> u64 {
+        self.watch.as_ref().map_or(0, |w| w.sig)
+    }
 }
 
 /// A sensor report waiting for the uplink, with when it first failed (for the log line only — the
@@ -346,9 +370,9 @@ pub struct QueuedShelly {
     pub attempts: u32,
 }
 
-/// Record that something happened locally and wake the heartbeat to report it immediately.
-/// Called from the telemetry/forward paths — never from the heartbeat itself, or it would keep
-/// itself perpetually ACTIVE.
+/// Record that something REAL happened locally and wake the check-in loop to send its keyframe now.
+/// Called for alarms, valve/uplink transitions, commands, a refresh and a lease start — never for a
+/// sample the cadence gates held back (H3), or a busy sensor would pin the hub at the gap floor.
 fn note_activity(rt: &Rt) {
     rt.last_activity_ms.store(now_ms(), Ordering::Relaxed);
     rt.wake.notify_one();
@@ -387,7 +411,26 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         pending_shelly: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
         shelly_flush: tokio::sync::Mutex::new(()),
         report_flush: tokio::sync::Mutex::new(()),
+        telemetry: tokio::sync::Mutex::new(Telemetry::default()),
+        lease_until_ms: AtomicI64::new(0),
+        last_refresh_ms: AtomicI64::new(0),
+        last_checkin_ms: AtomicI64::new(0),
+        last_cloud_ok_ms: AtomicI64::new(0),
+        boot_id: uuid::Uuid::new_v4().simple().to_string()[..16].to_string(),
+        batch_seq: AtomicU64::new(1),
+        inflight_delta: tokio::sync::Mutex::new(None),
+        gps_live: tokio::sync::watch::channel(0u64).0,
+        gps_live_waiters: AtomicUsize::new(0),
     })
+}
+
+/// Is a member watching right now (H6)?
+pub fn leased(rt: &Rt) -> bool {
+    cadence::lease_active(rt.lease_until_ms.load(Ordering::SeqCst), now_ms())
+}
+
+fn lan_live(rt: &Rt) -> bool {
+    rt.gps_live_waiters.load(Ordering::SeqCst) > 0
 }
 
 pub fn router(rt: Shared) -> Router {
@@ -407,6 +450,11 @@ pub fn router(rt: Shared) -> Router {
         .route("/api/hub/linktap/valve", post(h_valve))
         .route("/api/hub/gps", post(h_gps))
         .route("/api/hub/gps/discover", post(h_gps_discover))
+        // The LAN live position feed (H7). Key-gated like /api/hub/linktap/state and, like it, not in
+        // `dispatch`: the relay is not a stream, so this is reachable only on the boat's own network.
+        .route("/api/hub/gps/live", get(h_gps_live))
+        .route("/api/hub/refresh", post(h_refresh))
+        .route("/api/hub/watch", post(h_watch))
         .route("/api/hub/routers", get(h_routers_list).post(h_routers))
         .route("/api/hub/sensors", get(h_sensors_list).post(h_sensors))
         .route("/api/hub/linktap/state", get(h_valve_state))
@@ -701,6 +749,8 @@ pub async fn dispatch(rt: &Rt, caller: &Caller, method: &str, path: &str, body: 
         ("POST", "/api/hub/routers") => do_routers(rt, caller, body).await,
         ("GET", "/api/hub/sensors") => do_sensors_list(rt).await,
         ("POST", "/api/hub/sensors") => do_sensors(rt, caller, body).await,
+        ("POST", "/api/hub/refresh") => do_refresh(rt, caller).await,
+        ("POST", "/api/hub/watch") => do_watch(rt, caller, body).await,
         _ => err(404, "no such hub endpoint"),
     }
 }
@@ -1188,6 +1238,149 @@ async fn h_sensors(State(rt): State<Shared>, headers: HeaderMap, body: axum::bod
     lan_call(&rt, &headers, "POST", "/api/hub/sensors", &body).await
 }
 
+async fn h_refresh(State(rt): State<Shared>, headers: HeaderMap) -> Response {
+    lan_call(&rt, &headers, "POST", "/api/hub/refresh", b"").await
+}
+
+async fn h_watch(State(rt): State<Shared>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    lan_call(&rt, &headers, "POST", "/api/hub/watch", &body).await
+}
+
+/// "Check in NOW" (H8, §A7.2) — the app and the worker call this (relayed) right after an anchor watch
+/// or zone is armed or disarmed, so the hub's next batch reply carries the new `anchor` in about a
+/// second instead of at the end of a 15-minute nap.
+///
+/// It CARRIES NO CONFIG — the worker stays the source of truth, and arming itself was authorized
+/// cloud-side — so any member may ask (`view`). Answers 202 at once; calls within 5 s coalesce into
+/// one wake (the app and the worker both fire, by design).
+async fn do_refresh(rt: &Rt, caller: &Caller) -> Answer {
+    if !may_view(&caller.role) {
+        return err(403, "asking the hub to check in needs a member of this vessel");
+    }
+    let now = now_ms();
+    let rang = rt
+        .last_refresh_ms
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |last| if cadence::refresh_should_ring(last, now) { Some(now) } else { None })
+        .is_ok();
+    if rang {
+        note_activity(rt);
+    }
+    Answer { status: 202, body: serde_json::json!({ "ok": true, "coalesced": !rang }).to_string() }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WatchReq {
+    #[serde(default)]
+    lease_sec: Option<f64>,
+}
+
+/// The telemetry LEASE (H6, §A7.11(b), G5) — a member has the app open and visible. The worker records
+/// the lease itself and relays this call to the daemon; while `leaseUntil > now` the hub forwards
+/// EVERY sample (GPS at 10 s from NMEA / 30 s from a router, router status at 30 s, valve polls and
+/// sensor readings as they arrive). The lease never changes the armed heartbeat and never gates an
+/// alarm. A lease that STARTS rings the check-in and every sampler at once (M1, "send now"), so the
+/// first live values arrive within a couple of seconds.
+async fn do_watch(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
+    if !may_view(&caller.role) {
+        return err(403, "watching the vessel needs a member of this vessel");
+    }
+    let req: WatchReq = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        WatchReq::default()
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(r) => r,
+            Err(e) => return err(422, &format!("invalid JSON body: {e}")),
+        }
+    };
+    let now = now_ms();
+    let prev = rt
+        .lease_until_ms
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| Some(cadence::lease_extend(cur, now, req.lease_sec)))
+        .unwrap_or_else(|v| v);
+    let until = rt.lease_until_ms.load(Ordering::SeqCst);
+    if !cadence::lease_active(prev, now) {
+        crate::hlog!("telemetry: a member is watching - live until {}s from now", (until - now) / 1000);
+        note_activity(rt);
+        rt.gps_wake.notify_one();
+        rt.router_wake.notify_one();
+        rt.linktap_wake.notify_one();
+    }
+    ok_json(&serde_json::json!({ "ok": true, "leaseUntil": until }))
+}
+
+/// How long `/api/hub/gps/live` holds a caller who is already current.
+const GPS_LIVE_HOLD_SECS: u64 = 25;
+
+/// Counts an open LAN live poll for as long as it is held, so the samplers run at full rate only while
+/// someone on the boat is actually looking.
+struct LiveWaiter<'a>(&'a AtomicUsize);
+impl<'a> LiveWaiter<'a> {
+    fn new(n: &'a AtomicUsize) -> Self {
+        n.fetch_add(1, Ordering::SeqCst);
+        LiveWaiter(n)
+    }
+}
+impl Drop for LiveWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// PURE: the live-feed body.
+fn gps_live_body(rev: u64, live: Option<&LiveFix>, now: i64) -> serde_json::Value {
+    match live {
+        None => serde_json::json!({ "seq": rev, "fix": null, "state": "unarmed" }),
+        Some(l) => serde_json::json!({
+            "seq": rev,
+            "fix": {
+                "devId": l.device,
+                "lat": l.fix.lat,
+                "lon": l.fix.lon,
+                "acc": l.fix.acc,
+                "hdop": l.fix.hdop,
+                "sats": l.fix.sats,
+                "sogKn": l.fix.sog_kn,
+                "fixAgeS": ((now - l.at_ms).max(0) / 1000),
+            },
+            "inside": l.inside,
+            "distFromCenterM": l.dist_from_center_m.map(|d| d.round() as i64),
+            "unreliable": l.unreliable,
+            "state": l.state,
+        }),
+    }
+}
+
+/// The LAN live position (H7, §A7.11(a)): `GET /api/hub/gps/live?since=<seq>` answers the newest
+/// sample, and HOLDS a caller that is already current (`since` = the current seq) for up to 25 s
+/// until the next one exists — the same long-poll shape as `/api/hub/linktap/state`. Nothing here
+/// touches the cloud; while a poll is open the GPS source samples at its full rate.
+async fn do_gps_live(rt: &Rt, params: &HashMap<String, String>) -> Answer {
+    let since = params.get("since").and_then(|v| v.parse::<u64>().ok());
+    let hold = params.get("wait").and_then(|v| v.parse::<u64>().ok()).unwrap_or(GPS_LIVE_HOLD_SECS).min(GPS_LIVE_HOLD_SECS);
+    let _waiter = LiveWaiter::new(&rt.gps_live_waiters);
+    let mut rx = rt.gps_live.subscribe();
+    let mut rev = *rx.borrow();
+    if hold > 0 && since == Some(rev) {
+        // Ring the sampler so a source idling at 60 s speeds up for this viewer now.
+        rt.gps_wake.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(hold), rx.changed()).await;
+        rev = *rx.borrow();
+    }
+    let live = rt.telemetry.lock().await.gps_live.clone();
+    ok_json(&gps_live_body(rev, live.as_ref(), now_ms()))
+}
+
+async fn h_gps_live(State(rt): State<Shared>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
+    let Some(caller) = caller_from_headers(&rt, &headers).await else {
+        return answer_response(err(401, "a member key is required"));
+    };
+    if !may_view(&caller.role) {
+        return answer_response(err(403, "the live position needs a member of this vessel"));
+    }
+    answer_response(do_gps_live(&rt, &q).await)
+}
+
 
 /// Valve state for a LOCAL app, with an optional wait.
 ///
@@ -1587,56 +1780,402 @@ fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
-/// Beat while registered+enabled; otherwise poll the store waiting for the bootstrap seed (the
-/// signed-in app writes it once at registration — the service may well boot first).
-async fn heartbeat_loop(rt: Shared) {
+/// The check-in loop (H1): one consolidated keyframe every 15 minutes while registered and enabled;
+/// otherwise poll the store waiting for the bootstrap seed (the signed-in app writes it once at
+/// registration — the service may well boot first).
+///
+/// Woken early by `note_activity` (a refresh, a lease start, a real event), never more often than
+/// MIN_CHECKIN_GAP_MS. A failed keyframe is retried after CHECKIN_RETRY_SECS, not the full interval.
+async fn checkin_loop(rt: Shared) {
     let client = http_client();
+    let mut next_due = tokio::time::Instant::now() + Duration::from_secs(cadence::FIRST_CHECKIN_SECS);
     loop {
         let cfg = hub_config::read_config_in(&rt.base);
-        if !cfg.token.is_empty() && !cfg.vid.is_empty() && cfg.enabled {
-            let update = rt.update_available.read().await.clone();
-            // Acks owed from earlier beats. TAKEN, not copied: a successful beat drops them (the
-            // worker has pruned them), a failed one puts them back to retry.
-            let sending: Vec<String> = std::mem::take(&mut *rt.pending_acks.lock().await);
-            let ack = if sending.is_empty() { None } else { Some(sending.join(",")) };
-            match heartbeat_with_reply(&client, &rt.worker_base, &cfg, update.as_deref(), ack.as_deref()).await {
-                Ok(body) => {
-                    apply_linktap_reply(&rt, &body).await;
-                    handle_agent_commands(&rt, &client, &body).await;
-                    // A good heartbeat means the uplink is up — flush any telemetry that failed to
-                    // send while it was down (drain_reports is a no-op when the queue is empty).
-                    drain_reports(&rt).await;
-                    drain_shelly(&rt).await;
-                }
-                Err(e) => {
-                    if !sending.is_empty() {
-                        rt.pending_acks.lock().await.extend(sending);
-                    }
-                    crate::hlog!("hub: heartbeat failed: {e}");
-                }
-            }
-            // Report-by-exception cadence: fast right after a local event, the configured beat while
-            // things are recent, one beat every 20 min once idle. A local event mid-nap rings
-            // rt.wake and we beat immediately — so the backoff never costs alarm latency.
-            let idle = now_ms() - rt.last_activity_ms.load(Ordering::Relaxed);
-            let secs = heartbeat_interval_secs(idle, u64::from(cfg.heartbeat_secs));
+        if cfg.token.is_empty() || cfg.vid.is_empty() || !cfg.enabled {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(UNREGISTERED_POLL_SECS)) => {}
                 _ = rt.wake.notified() => {}
             }
-        } else {
-            tokio::time::sleep(Duration::from_secs(UNREGISTERED_POLL_SECS)).await;
+            continue;
         }
+        tokio::select! {
+            _ = tokio::time::sleep_until(next_due) => {}
+            _ = rt.wake.notified() => {}
+        }
+        let since = now_ms() - rt.last_checkin_ms.load(Ordering::SeqCst);
+        if since < cadence::MIN_CHECKIN_GAP_MS {
+            tokio::time::sleep(Duration::from_millis((cadence::MIN_CHECKIN_GAP_MS - since) as u64)).await;
+        }
+        let cfg = hub_config::read_config_in(&rt.base);
+        if cfg.token.is_empty() || cfg.vid.is_empty() || !cfg.enabled {
+            continue;
+        }
+        rt.last_checkin_ms.store(now_ms(), Ordering::SeqCst);
+        match checkin_once(&rt, &client, &cfg).await {
+            Ok(()) => next_due = tokio::time::Instant::now() + Duration::from_secs(cadence::CHECKIN_SECS),
+            Err(e) => {
+                crate::hlog!("hub: check-in failed: {e}");
+                next_due = tokio::time::Instant::now() + Duration::from_secs(cadence::CHECKIN_RETRY_SECS);
+            }
+        }
+    }
+}
+
+/// What a keyframe item, once delivered, makes "last sent".
+#[derive(Clone, Debug)]
+enum SentMark {
+    Router { id: String, kb: u64, sent: cadence::RouterSent },
+    Valve { device: String, sent: cadence::ValveSent },
+    Gps { device: String, lat: f64, lon: f64 },
+    Reading { key: String, value: f64 },
+}
+
+/// Build the 15-minute keyframe (H1): hub.status first, then every device's COMPLETE current value.
+/// Each item carries the marks that become "last sent" if — and only if — its post is accepted.
+async fn build_keyframe(rt: &Rt, cfg: &HubConfig, update: Option<&str>) -> Vec<(batch::Item, Vec<SentMark>)> {
+    let now = now_ms();
+    let leased = leased(rt);
+    let valves: Vec<(String, Vec<(String, String)>)> = match rt.linktap.lock().await.as_ref() {
+        Some(r) => r.measurements(),
+        None => Vec::new(),
+    };
+    let t = rt.telemetry.lock().await;
+    let sig = t.anchorsig();
+    let mut out: Vec<(batch::Item, Vec<SentMark>)> =
+        vec![(batch::hub_status_item(&cfg.hub_id, &cfg.name, env!("CARGO_PKG_VERSION"), std::env::consts::OS, update, sig), Vec::new())];
+    for r in cfg.routers.iter().filter(|r| r.enabled && !r.agent_token.is_empty()) {
+        if let Some(params) = t.router_latest.get(&r.id) {
+            let kb = t.wan_pending_kb.get(&r.id).copied().unwrap_or(0);
+            out.push((
+                batch::router_item(&r.id, params, kb),
+                vec![SentMark::Router { id: r.id.clone(), kb, sent: cadence::RouterSent::from_params(params) }],
+            ));
+        }
+    }
+    for (dev, params) in valves {
+        let device = format!("lt_{dev}");
+        out.push((batch::valve_item(&dev, &params), vec![SentMark::Valve { device, sent: cadence::ValveSent::from_params(&params) }]));
+    }
+    let mut gps: Vec<(&String, &(crate::gps::GpsFix, i64))> = t.gps_latest.iter().collect();
+    gps.sort_by(|a, b| a.0.cmp(b.0));
+    for (dev, (fix, at)) in gps {
+        let fresh_geofence = geofence::Geofence::default();
+        let g = t.geofences.get(dev).unwrap_or(&fresh_geofence);
+        if cadence::keyframe_carries_fix(g, leased, now - at) {
+            out.push((batch::gps_fix_item(dev, fix, sig), vec![SentMark::Gps { device: dev.clone(), lat: fix.lat, lon: fix.lon }]));
+        }
+    }
+    type ShellyLatest<'a> = (&'a String, &'a (String, Vec<(String, String)>));
+    let mut shellys: Vec<ShellyLatest> = t.shelly_latest.iter().collect();
+    shellys.sort_by(|a, b| a.0.cmp(b.0));
+    for (dev, (event, params)) in shellys {
+        let marks = params
+            .iter()
+            .filter(|(k, _)| matches!(k.as_str(), "v" | "tC" | "rh"))
+            .filter_map(|(k, v)| v.parse::<f64>().ok().map(|value| SentMark::Reading { key: format!("{dev}|{k}"), value }))
+            .collect();
+        out.push((batch::Item { device: dev.clone(), event: event.clone(), params: params.clone() }, marks));
+    }
+    out
+}
+
+async fn apply_sent_marks(rt: &Rt, marks: Vec<SentMark>) {
+    let mut t = rt.telemetry.lock().await;
+    for m in marks {
+        match m {
+            SentMark::Router { id, kb, sent } => {
+                if let Some(p) = t.wan_pending_kb.get_mut(&id) {
+                    *p = p.saturating_sub(kb);
+                }
+                t.router_sent.insert(id, sent);
+            }
+            SentMark::Valve { device, sent } => {
+                t.valve_sent.insert(device, sent);
+            }
+            SentMark::Gps { device, lat, lon } => t.geofences.entry(device).or_default().mark_sent(lat, lon),
+            SentMark::Reading { key, value } => t.reading_gates.entry(key).or_default().mark_sent(value),
+        }
+    }
+}
+
+/// One keyframe check-in: build, split at 50 items, post, act on each reply, mark what landed.
+async fn checkin_once(rt: &Rt, client: &reqwest::Client, cfg: &HubConfig) -> Result<(), String> {
+    let update = rt.update_available.read().await.clone();
+    let built = build_keyframe(rt, cfg, update.as_deref()).await;
+    // Acks owed from earlier replies. TAKEN, not copied: a delivered first post drops them (the
+    // worker has pruned them), a failed one puts them back to retry.
+    let sending: Vec<String> = std::mem::take(&mut *rt.pending_acks.lock().await);
+    let ack = if sending.is_empty() { None } else { Some(sending.join(",")) };
+    let chunks: Vec<Vec<(batch::Item, Vec<SentMark>)>> = if built.is_empty() {
+        vec![Vec::new()]
+    } else {
+        built.chunks(batch::MAX_ITEMS).map(|c| c.to_vec()).collect()
+    };
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let items: Vec<batch::Item> = chunk.iter().map(|(it, _)| it.clone()).collect();
+        let first = i == 0;
+        match post_batch(rt, client, cfg, batch::Kind::Keyframe, None, &items, if first { ack.as_deref() } else { None }).await {
+            PostOutcome::Delivered(body) => {
+                apply_sent_marks(rt, chunk.into_iter().flat_map(|(_, m)| m).collect()).await;
+                handle_batch_reply(rt, client, &body).await;
+            }
+            PostOutcome::Transient(why) | PostOutcome::Refused(why) => {
+                if first && !sending.is_empty() {
+                    rt.pending_acks.lock().await.extend(sending);
+                }
+                return Err(why);
+            }
+        }
+    }
+    // A delivered keyframe means the uplink is up — flush anything that failed to send while it was down.
+    drain_reports(rt).await;
+    drain_shelly(rt).await;
+    Ok(())
+}
+
+/// The fate of one batch post.
+enum PostOutcome {
+    Delivered(serde_json::Value),
+    /// Uplink or cloud trouble — worth retrying.
+    Transient(String),
+    /// The cloud refused THIS post (400/401/404…) — resending cannot help.
+    Refused(String),
+}
+
+/// POST one batch. Errors are stringified with `without_url()`: the URL carries the hub token.
+async fn post_batch(
+    rt: &Rt,
+    client: &reqwest::Client,
+    cfg: &HubConfig,
+    kind: batch::Kind,
+    seq: Option<u64>,
+    items: &[batch::Item],
+    ack: Option<&str>,
+) -> PostOutcome {
+    let sig = rt.telemetry.lock().await.anchorsig();
+    let url = match batch::batch_url(&rt.worker_base, &cfg.vid, &cfg.hub_id, &cfg.token, ack, sig) {
+        Ok(u) => u,
+        Err(e) => return PostOutcome::Refused(format!("bad worker url: {e}")),
+    };
+    for it in items {
+        let (_, dropped) = batch::clamp_item(it);
+        if dropped > 0 {
+            crate::hlog!("hub: {} {} carried more than {} params - {dropped} dropped", it.device, it.event, batch::MAX_PARAMS);
+        }
+    }
+    let body = batch::envelope(kind, seq, &rt.boot_id, items, env!("CARGO_PKG_VERSION"));
+    match client.post(url).json(&body).send().await {
+        Err(e) => PostOutcome::Transient(format!("failed to send: {}", e.without_url())),
+        Ok(res) => {
+            let code = res.status().as_u16();
+            if (200..300).contains(&code) {
+                rt.last_cloud_ok_ms.store(now_ms(), Ordering::SeqCst);
+                PostOutcome::Delivered(res.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null))
+            } else if code >= 500 || code == 408 || code == 429 {
+                PostOutcome::Transient(format!("cloud answered HTTP {code}"))
+            } else {
+                PostOutcome::Refused(report_refusal(code, &cfg.hub_id).unwrap_or_default())
+            }
+        }
+    }
+}
+
+/// Everything a batch reply can carry: valve config-as-state, queued commands, the watch config.
+async fn handle_batch_reply(rt: &Rt, client: &reqwest::Client, body: &serde_json::Value) {
+    apply_linktap_reply(rt, body).await;
+    apply_watch_reply(rt, body).await;
+    handle_agent_commands(rt, client, body).await;
+}
+
+/// Adopt the `anchor` object a reply carried (H5). A changed signature is a new episode for every GPS
+/// device; the samplers are rung so an anchor watch speeds sampling up at once.
+async fn apply_watch_reply(rt: &Rt, body: &serde_json::Value) {
+    let next = match geofence::parse_anchor_reply(body) {
+        None => return,
+        Some(geofence::AnchorReply::Disarm) => None,
+        Some(geofence::AnchorReply::Arm(w)) => Some(w),
+    };
+    {
+        let mut t = rt.telemetry.lock().await;
+        if t.watch.as_ref().map(|w| w.sig) == next.as_ref().map(|w| w.sig) {
+            return;
+        }
+        match &next {
+            None => crate::hlog!("watch: disarmed by cloud config"),
+            Some(w) => crate::hlog!(
+                "watch: armed (sig {}{}{})",
+                w.sig,
+                w.anchor.as_ref().map(|a| format!(", anchor radius {}m warn {}m", a.radius_m, a.warn_m)).unwrap_or_default(),
+                w.zone.as_ref().map(|z| format!(", zone radius {}m streak {}", z.radius_m, z.streak)).unwrap_or_default()
+            ),
+        }
+        t.watch = next.clone();
+        for g in t.geofences.values_mut() {
+            g.sync_watch(next.as_ref());
+        }
+    }
+    // Not note_activity: this arrived ON a reply, so a second check-in would only repeat it.
+    rt.gps_wake.notify_one();
+    rt.router_wake.notify_one();
+}
+
+/// The anchor watch's heartbeat (H5, §A7.3): every 5 min while the boat is INSIDE its circle and 60 s
+/// while a drag is in progress (owner ruling 2026-09-15; cadence::anchor_heartbeat_secs), ONE
+/// post carrying a `gps.heartbeat` item per GPS source — fix quality, inside/distance and the running
+/// `anchorsig`, never a position. 🔴 NOT for a security zone alone (owner ruling, Jonathan 2026-09-15:
+/// "Security zone is 15 min checkin, not faster like the anchorwatch") — a zone-only hub posts nothing
+/// here and its breach goes out as an event the moment the streak confirms.
+///
+/// Any delivered post (an immediate event, a keyframe) counts as the check-in and restarts the clock.
+/// A failed heartbeat is retried after 30 s, then every 60 s, until a post lands — the cloud raises its
+/// lost-device alarm at 10 minutes, so one lost beat must never reach it. The GPS sources keep
+/// sampling at their own rate for local drag detection; only the SEND cadence is 5 minutes.
+///
+/// Not spooled: a heartbeat that arrives late would lie about liveness,
+/// and the cloud judges freshness on arrival. Its reply carries the watch delta like any other.
+async fn gps_heartbeat_loop(rt: Shared) {
+    const TICK: Duration = Duration::from_secs(5);
+    let client = http_client();
+    let mut last_err: Option<String> = None;
+    let mut clock = cadence::HeartbeatClock::default();
+    loop {
+        tokio::time::sleep(TICK).await;
+        let cfg = hub_config::read_config_in(&rt.base);
+        if cfg.token.is_empty() || cfg.vid.is_empty() || !cfg.enabled {
+            continue;
+        }
+        let now = now_ms();
+        let (sig, breaching) = {
+            let t = rt.telemetry.lock().await;
+            match t.watch.as_ref().filter(|w| w.anchor.is_some()) {
+                None => (0, false),
+                Some(w) => (w.sig, gps_devices(&cfg).iter().any(|d| t.geofences.get(d).is_some_and(|g| g.anchor_breaching()))),
+            }
+        };
+        if sig == 0 {
+            clock.reset();
+            continue;
+        }
+        if !clock.due(sig, rt.last_cloud_ok_ms.load(Ordering::SeqCst), now, cadence::anchor_heartbeat_secs(breaching)) {
+            continue;
+        }
+        let items = heartbeat_items(&mut *rt.telemetry.lock().await, &cfg, now);
+        if items.is_empty() {
+            continue;
+        }
+        match post_batch(&rt, &client, &cfg, batch::Kind::Delta, None, &items, None).await {
+            PostOutcome::Delivered(body) => {
+                clock.delivered(sig);
+                if last_err.take().is_some() {
+                    crate::hlog!("watch: heartbeat delivered again");
+                }
+                handle_batch_reply(&rt, &client, &body).await;
+            }
+            PostOutcome::Transient(why) | PostOutcome::Refused(why) => {
+                clock.failed(now_ms());
+                if last_err.as_deref() != Some(why.as_str()) {
+                    crate::hlog!("watch: heartbeat not delivered - {why}; retrying");
+                    last_err = Some(why);
+                }
+            }
+        }
+    }
+}
+
+/// The heartbeat items due now: one per GPS source while an ANCHOR WATCH is armed, none otherwise —
+/// in particular none for a security zone alone (owner ruling 2026-09-15).
+fn heartbeat_items(t: &mut Telemetry, cfg: &HubConfig, now: i64) -> Vec<batch::Item> {
+    let Some(watch) = t.watch.clone().filter(|w| w.anchor.is_some()) else { return Vec::new() };
+    gps_devices(cfg)
+        .into_iter()
+        .map(|dev| {
+            let g = t.geofences.entry(dev.clone()).or_default();
+            g.sync_watch(Some(&watch));
+            batch::heartbeat_item(&dev, g.heartbeat_params(now))
+        })
+        .collect()
+}
+
+/// Every GPS device id this hub samples: its own LAN source and each router with GPS on.
+fn gps_devices(cfg: &HubConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if !cfg.gps.host.is_empty() && cfg.gps.enabled && !cfg.gps.dev_id.is_empty() {
+        out.push(cfg.gps.dev_id.clone());
+    }
+    for r in cfg.routers.iter().filter(|r| r.enabled && r.gps_enabled && !r.gps_dev_id.is_empty()) {
+        if !out.contains(&r.gps_dev_id) {
+            out.push(r.gps_dev_id.clone());
+        }
+    }
+    out
+}
+
+/// One GPS sample through the geofence (H4): record it, publish it to the LAN live feed, send what the
+/// geofence says to send, and raise its local alarms immediately.
+async fn gps_observe(rt: &Rt, device: &str, fix: &crate::gps::GpsFix) {
+    let now = now_ms();
+    let is_leased = leased(rt);
+    let (decision, sig) = {
+        let mut guard = rt.telemetry.lock().await;
+        let t = &mut *guard;
+        let watch = t.watch.clone();
+        t.gps_latest.insert(device.to_string(), (fix.clone(), now));
+        let g = t.geofences.entry(device.to_string()).or_default();
+        let sample = geofence::Sample { lat: fix.lat, lon: fix.lon, acc: fix.acc, hdop: fix.hdop, sats: fix.sats, sog_kn: fix.sog_kn, fix_age_s: 0.0 };
+        let d = g.observe(watch.as_ref(), &sample, now, is_leased);
+        if d.send_position {
+            g.mark_sent(fix.lat, fix.lon);
+        }
+        let state = if g.underway() {
+            "underway"
+        } else if watch.as_ref().is_some_and(|w| w.anchor.is_some()) {
+            "anchor"
+        } else if watch.as_ref().is_some_and(|w| w.zone.is_some()) {
+            "zone"
+        } else {
+            "unarmed"
+        };
+        let obs = g.last().cloned();
+        let sig = g.sig();
+        t.gps_live = Some(LiveFix {
+            device: device.to_string(),
+            fix: fix.clone(),
+            at_ms: now,
+            inside: obs.as_ref().and_then(|o| o.inside),
+            dist_from_center_m: obs.as_ref().and_then(|o| o.dist_from_center_m),
+            unreliable: obs.as_ref().is_some_and(|o| o.unreliable),
+            state,
+        });
+        (d, sig)
+    };
+    rt.gps_live.send_modify(|v| *v = v.wrapping_add(1));
+    if let Some(on) = decision.underway_changed {
+        crate::hlog!("gps: {device} - {}", if on { "underway" } else { "stopped (no longer underway)" });
+    }
+    let mut queued = false;
+    if decision.send_position {
+        enqueue_report(rt, &crate::linktap_runtime::Report { token: None, device: device.to_string(), event: batch::GPS_FIX_EVENT.into(), params: batch::gps_fix_params(fix, sig) }).await;
+        queued = true;
+    }
+    for (event, mut params) in decision.events {
+        crate::hlog!("watch: {device} - {event} ({})", params.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "));
+        params.push(("anchorsig".into(), sig.to_string()));
+        enqueue_report(rt, &crate::linktap_runtime::Report { token: None, device: device.to_string(), event, params }).await;
+        note_activity(rt);
+        queued = true;
+    }
+    if queued {
+        drain_reports(rt).await;
     }
 }
 
 /// How often the daemon checks whether a newer release exists. Hours, not minutes: a release lands
 /// a few times a week at most, and this is visibility, not a safety path. Runs once at boot too, so
-/// a freshly started hub reports its update status on its first heartbeat rather than hours later.
+/// a freshly started hub reports its update status on its first check-in rather than hours later.
 const UPDATE_CHECK_SECS: u64 = 6 * 3600;
 
 /// Poll GitHub for the latest daemon version and record it in `rt.update_available` when it is newer
-/// than the running one. Phase 1a: this only makes the gap VISIBLE (heartbeat + /api/hub/status);
+/// than the running one. Phase 1a: this only makes the gap VISIBLE (hub.status + /api/hub/status);
 /// it installs nothing. Every failure is silent — an offline or locked-down hub reports no update
 /// rather than an error, and never a false positive.
 async fn update_check_loop(rt: Shared) {
@@ -1672,7 +2211,7 @@ async fn update_check_loop(rt: Shared) {
     }
 }
 
-/// PURE: the (id, verb) pairs a heartbeat reply carried. A command with no id can never be
+/// PURE: the (id, verb) pairs a batch reply carried. A command with no id can never be
 /// acknowledged — it would loop forever — so it is dropped rather than run.
 fn parse_agent_commands(body: &serde_json::Value) -> Vec<(String, String)> {
     body.get("commands").and_then(|c| c.as_array()).map(|arr| {
@@ -1685,7 +2224,7 @@ fn parse_agent_commands(body: &serde_json::Value) -> Vec<(String, String)> {
     }).unwrap_or_default()
 }
 
-/// Act on the console-queued commands a heartbeat reply carried.
+/// Act on the console-queued commands a batch reply carried.
 ///
 /// 🔴 THIS IS THE ONLY WRITE-CAPABLE CLOUD CHANNEL INTO THE DAEMON, and its scope is exactly one
 /// verb: install the vendor-signed newer release. The command is a fixed verb with NO ARGUMENT —
@@ -1735,18 +2274,6 @@ async fn run_commanded_self_update(rt: &Rt, client: &reqwest::Client, id: &str) 
             rt.pending_acks.lock().await.push(id.to_string());
         }
     }
-}
-
-/// The heartbeat, keeping its reply — the config-as-state channel (cloud-server #105 attaches
-/// `{linktap:{allowed,profiles}}` to a hub's report). send_heartbeat_once stays for callers that
-/// only care whether it landed.
-async fn heartbeat_with_reply(client: &reqwest::Client, worker_base: &str, cfg: &HubConfig, update: Option<&str>, ack: Option<&str>) -> Result<serde_json::Value, String> {
-    let url = heartbeat_url(worker_base, cfg, env!("CARGO_PKG_VERSION"), std::env::consts::OS, update, ack)?;
-    let res = client.get(url).send().await.map_err(|e| e.without_url().to_string())?;
-    if !res.status().is_success() {
-        return Err(format!("HTTP {}", res.status().as_u16()));
-    }
-    res.json::<serde_json::Value>().await.map_err(|e| e.without_url().to_string())
 }
 
 /// Persist the cloud's valve PERMISSION and hand the per-valve profiles to the machine.
@@ -1952,8 +2479,39 @@ async fn linktap_act(
     // waiters here means a local app learns what the hub learned, when the hub learned it.
     rt.valve_rev.send_modify(|v| *v = v.wrapping_add(1));
 
+    // H2: a valve's `linktap.measurement` goes out on a transition (watering on/off, RF link, a fault
+    // flag) and on every observation WHILE WATERING; an idle, healthy valve rides the keyframe (the
+    // runtime keeps its last measurement for it). Everything else the machine reports — a cycle end,
+    // a failed stop or reopen — is an event and always goes at once.
+    let is_leased = leased(rt);
+    let mut queued = false;
     for r in reports {
-        spool_report(rt, &r).await;
+        if r.event == "linktap.measurement" {
+            let (due, transition) = {
+                let mut t = rt.telemetry.lock().await;
+                let last = t.valve_sent.get(&r.device);
+                let transition = cadence::valve_transition(last, &r.params);
+                let due = is_leased || cadence::valve_measurement_due(last, &r.params);
+                if due || last.is_none() {
+                    // First observation after start: the baseline (the keyframe carries the value).
+                    t.valve_sent.insert(r.device.clone(), cadence::ValveSent::from_params(&r.params));
+                }
+                (due, transition)
+            };
+            if !due {
+                continue; // H3: a held-back sample is not activity
+            }
+            if transition {
+                note_activity(rt);
+            }
+        } else {
+            note_activity(rt);
+        }
+        enqueue_report(rt, &r).await;
+        queued = true;
+    }
+    if queued {
+        drain_reports(rt).await;
     }
     let gw = {
         let guard = rt.linktap.lock().await;
@@ -1969,7 +2527,7 @@ async fn linktap_act(
             // A close that did not happen is worth hearing about immediately; the machine keeps
             // stop_issued set, so the next observation retries without a re-issue storm.
             crate::hlog!("linktap: {dev_id} STOP FAILED: {:?}", reply.error);
-            spool_report(rt, &crate::linktap_runtime::Report { token: None,
+            report_event(rt, &crate::linktap_runtime::Report { token: None,
                 device: format!("lt_{dev_id}"),
                 event: "linktap.stop_failed".into(),
                 params: vec![("error".into(), reply.error.unwrap_or_default())],
@@ -2008,7 +2566,7 @@ async fn linktap_act(
             }
         } else {
             crate::hlog!("linktap: {dev_id} - {} FAILED: {:?}", open.why, reply.error);
-            spool_report(rt, &crate::linktap_runtime::Report { token: None,
+            report_event(rt, &crate::linktap_runtime::Report { token: None,
                 device: format!("lt_{dev_id}"),
                 event: "linktap.reopen_failed".into(),
                 params: vec![("why".into(), open.why.into()), ("error".into(), reply.error.unwrap_or_default())],
@@ -2072,7 +2630,7 @@ async fn linktap_poll_loop(rt: Shared) {
                 watch = next;
                 if let Some(r) = report {
                     crate::hlog!("linktap: gateway {} - {}", gw.host, r.event);
-                    spool_report(&rt, &r).await;
+                    report_event(&rt, &r).await;
                 }
             }
         }
@@ -2121,15 +2679,15 @@ async fn linktap_poll_loop(rt: Shared) {
 /// running it on an unentitled vehicle is that a boat which was going to flood does not. There is
 /// no revenue to protect on the closing side of a valve.
 ///
-/// How often the hub reads a fix from the configured GPS source. One a minute matches the LinkTap
-/// floor and is plenty for a boat's position; the loop re-reads config each pass, so a source
-/// configured after boot is picked up with no restart.
+/// How often the hub reads a fix from its own GPS source while nothing is armed, nobody is watching
+/// and the boat is not underway. Faster cadences come from geofence::sample_secs. The loop re-reads
+/// config each pass, so a source configured after boot is picked up with no restart.
 const GPS_POLL_SECS: u64 = 60;
 
-/// Poll the configured LAN GPS source and report `gps.measurement` — the hub as GPS acquirer
-/// (owner 2026-09-11). Reports through spool_report, so a fix taken while the uplink is down is
-/// queued and delivered on reconnect like any other telemetry. Errors are logged only when they
-/// CHANGE, so a boat with no lock (or a wrong password) does not fill the log once a minute.
+/// Poll the configured LAN GPS source and run every fix through the geofence (H4) — the hub as GPS
+/// acquirer (owner 2026-09-11). What reaches the cloud is the geofence's decision, spooled so a fix
+/// taken while the uplink is down is still delivered. Errors are logged only when they CHANGE, so a
+/// boat with no lock (or a wrong password) does not fill the log once a minute.
 async fn gps_poll_loop(rt: Shared) {
     // The LAN client: a Cradlepoint on 443 presents a self-signed certificate, which the cloud
     // client rightly refuses — and did, silently, until this loop got its own (routers::lan_client).
@@ -2146,16 +2704,7 @@ async fn gps_poll_loop(rt: Shared) {
             match result {
                 Ok(fix) => {
                     if last_note.is_some() { crate::hlog!("gps: {} - fix acquired", g.host); last_note = None; }
-                    let mut params = vec![
-                        ("lat".to_string(), format!("{:.6}", fix.lat)),
-                        ("lon".to_string(), format!("{:.6}", fix.lon)),
-                    ];
-                    if let Some(acc) = fix.acc { params.push(("acc".to_string(), format!("{acc:.1}"))); }
-                    spool_report(&rt, &crate::linktap_runtime::Report { token: None,
-                        device: g.dev_id.clone(),
-                        event: "gps.measurement".to_string(),
-                        params,
-                    }).await;
+                    gps_observe(&rt, &g.dev_id, &fix).await;
                 }
                 Err(why) => {
                     if last_note.as_deref() != Some(why.as_str()) {
@@ -2167,8 +2716,13 @@ async fn gps_poll_loop(rt: Shared) {
         } else {
             last_note = None; // no source configured — reset so a later fault logs once
         }
+        let fast = {
+            let t = rt.telemetry.lock().await;
+            t.watch.as_ref().is_some_and(|w| w.anchor.is_some()) || t.geofences.get(&g.dev_id).is_some_and(|x| x.wants_fast_sampling())
+        };
+        let secs = geofence::sample_secs(fast, leased(&rt), lan_live(&rt), g.kind == "nmea", GPS_POLL_SECS);
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(GPS_POLL_SECS)) => {}
+            _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
             _ = rt.gps_wake.notified() => {}
         }
     }
@@ -2213,7 +2767,7 @@ pub async fn linktap_flood_stop_all(rt: &Rt) {
         let reply = linktap::post_command(&client, &gw, &linktap::build_stop(&gw, &id)).await;
         crate::hlog!("linktap: flood shutoff -> {id} {}", if reply.ok { "closed" } else { "FAILED" });
         if !reply.ok {
-            spool_report(rt, &crate::linktap_runtime::Report { token: None,
+            report_event(rt, &crate::linktap_runtime::Report { token: None,
                 device: format!("lt_{id}"),
                 event: "linktap.stop_failed".into(),
                 params: vec![("error".into(), reply.error.unwrap_or_default()), ("cause".into(), "flood".into())],
@@ -2233,10 +2787,16 @@ pub async fn linktap_flood_stop_all(rt: &Rt) {
 /// Best-effort, like every other outbound: a flood that cannot be forwarded has already had the
 /// valve closed locally, and blocking on the cloud would defeat the point of closing first.
 async fn forward_shelly_to_cloud(rt: &Rt, call: &ShellyCall) {
-    // A forwarded sensor event (a flood among them) is a local change — wake the heartbeat into
-    // ACTIVE cadence. The forward itself is what carries the alarm; this only makes the liveness
-    // beat track the situation too.
-    note_activity(rt);
+    // H2: a periodic READING is held against the §2.2 thresholds (compared with the last SENT value)
+    // and rides the keyframe unless it moved enough; an ALARM, its clear or a switch state is never
+    // held. While a member is watching, every reading goes as it arrives.
+    if cadence::is_telemetry_event(&call.event) {
+        if !shelly_reading_due(rt, call).await {
+            return; // H3: a held-back reading is not activity
+        }
+    } else {
+        note_activity(rt);
+    }
     let dropped = {
         let mut q = rt.pending_shelly.lock().await;
         enqueue_shelly(&mut q, QueuedShelly { call: call.clone(), queued_ms: now_ms(), attempts: 0 }, MAX_SHELLY_QUEUE)
@@ -2247,11 +2807,34 @@ async fn forward_shelly_to_cloud(rt: &Rt, call: &ShellyCall) {
     drain_shelly(rt).await;
 }
 
+/// Record a Shelly reading for the keyframe and decide whether it goes to the cloud now.
+async fn shelly_reading_due(rt: &Rt, call: &ShellyCall) -> bool {
+    let is_leased = leased(rt);
+    let mut t = rt.telemetry.lock().await;
+    let entry = t.shelly_latest.entry(call.device.clone()).or_insert_with(|| (call.event.clone(), Vec::new()));
+    entry.0 = call.event.clone();
+    for (k, v) in &call.extras {
+        match entry.1.iter_mut().find(|(ek, _)| ek == k) {
+            Some(slot) => slot.1 = v.clone(),
+            None => entry.1.push((k.clone(), v.clone())),
+        }
+    }
+    let (kind, key) = cadence::reading_kind(&call.event);
+    let value = if key.is_empty() { None } else { call.extras.iter().rev().find(|(k, _)| k == key).and_then(|(_, v)| v.parse::<f64>().ok()) };
+    let Some(v) = value else { return is_leased };
+    let gate = t.reading_gates.entry(format!("{}|{key}", call.device)).or_default();
+    let due = gate.observe(kind, v) || is_leased;
+    if due {
+        gate.mark_sent(v);
+    }
+    due
+}
+
 /// How many sensor reports the hub holds across an outage. Sensors report on events and wake-ups,
 /// not every second — a few hundred covers hours of a busy boat.
 pub const MAX_SHELLY_QUEUE: usize = 300;
 /// How often queued sensor reports are retried while any are waiting. Short on purpose: the queue
-/// exists for alarms, and the heartbeat that also drains it can be asleep for 20 minutes.
+/// exists for alarms, and the check-in that also drains it can be asleep for 15 minutes.
 pub const SHELLY_RETRY_SECS: u64 = 10;
 
 /// PURE: is this sensor event an ALARM (kept longest when the queue must shed), as opposed to a
@@ -2359,7 +2942,7 @@ async fn shelly_retry_loop(rt: Shared) {
     }
 }
 
-/// Report one telemetry line to the cloud, through the same /api/agent path the heartbeat uses.
+/// Report one telemetry line to the cloud as a `delta` batch post (drain_reports).
 /// Best-effort by design: telemetry that cannot be delivered must never block the valve logic that
 /// produced it.
 /// The most telemetry the hub buffers across a uplink outage before shedding its oldest samples.
@@ -2380,115 +2963,77 @@ fn push_bounded<T>(q: &mut std::collections::VecDeque<T>, item: T, cap: usize) -
     dropped
 }
 
-/// The fate of one delivery attempt: delivered, worth retrying (the uplink), or hopeless (a refusal
-/// that will never change on a re-send — do not wedge the queue behind it).
-enum SendOutcome {
-    Sent,
-    Transient,
-    Permanent,
-}
-
-/// Deliver ONE telemetry report to `/api/agent`, classifying the result.
-///
-/// ⚠️ NAME OURSELVES AS THE VOUCHER. `/api/agent` authenticates the token against the token's OWN
-/// device; a hub speaks for hardware with no cloud credential (a LinkTap valve driven over the LAN),
-/// so it must claim its hub id or the worker looks up `agenttoken_lt_<valve>`, finds nothing, and
-/// answers 401 — which is how every valve measurement was silently dead 2026-08-26..31. The worker
-/// verifies this token against THIS hub id and then allows only `lt_*` devices
-/// (cloud-server agentToken.ts::hubMayReportFor).
-async fn send_report_once(rt: &Rt, report: &crate::linktap_runtime::Report) -> SendOutcome {
-    let cfg = hub_config::read_config_in(&rt.base);
-    if cfg.token.is_empty() || cfg.vid.is_empty() {
-        return SendOutcome::Permanent; // unregistered — there is nothing to deliver to; do not hoard
-    }
-    let base = rt.worker_base.trim_end_matches('/');
-    let Ok(mut u) = url::Url::parse(&format!("{base}/api/agent")) else { return SendOutcome::Permanent };
-    u.query_pairs_mut()
-        .append_pair("vid", &cfg.vid)
-        .append_pair("device", &report.device)
-        .append_pair("event", &report.event);
-    match &report.token {
-        // A managed router's report carries the ROUTER's token and no `hub` — to the cloud it is
-        // the router reporting, exactly as a hub-lite router does (routers.rs).
-        Some(t) => {
-            u.query_pairs_mut().append_pair("t", t);
-        }
-        None => {
-            u.query_pairs_mut().append_pair("t", &cfg.token);
-            if !cfg.hub_id.is_empty() {
-                u.query_pairs_mut().append_pair("hub", &cfg.hub_id);
-            }
-        }
-    }
-    for (k, v) in &report.params {
-        u.query_pairs_mut().append_pair(k, v);
-    }
-    match http_client().get(u).send().await {
-        // A transport error is the uplink, not the report — retry it.
-        Err(e) => {
-            crate::hlog!("linktap: report {} queued (failed to send: {})", report.event, e.without_url());
-            SendOutcome::Transient
-        }
-        Ok(res) => {
-            let code = res.status().as_u16();
-            match report_refusal(code, &report.device) {
-                None => SendOutcome::Sent,
-                // 5xx / 408 / 429 are the worker or edge having a moment — retry. Any other non-2xx
-                // is a refusal a re-send cannot fix (bad request, auth, not found); DROP it, or it
-                // would sit at the front of the queue forever and block every report behind it.
-                Some(why) => {
-                    if code >= 500 || code == 408 || code == 429 {
-                        crate::hlog!("linktap: report {} queued ({why})", report.event);
-                        SendOutcome::Transient
-                    } else {
-                        crate::hlog!("linktap: report {} dropped ({why})", report.event);
-                        SendOutcome::Permanent
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Flush queued telemetry oldest-first, stopping at the first TRANSIENT failure — the uplink is
-/// still down, so keep that report and the rest for the next drain. Serialized by `report_flush` so
-/// the poll loop and the heartbeat loop cannot drain at once and double-send. Pop-send-refront keeps
-/// a retryable report at the front without holding the queue lock across the network call.
+/// Deliver the queued EVENTS as `delta` batch posts (up to 50 items each), oldest first, stopping at
+/// the first TRANSIENT failure — the uplink is still down, so keep that post and the rest for the next
+/// drain. A failed post is kept WITH ITS SEQ and resent byte-for-byte, so a retry of a post the cloud
+/// already took is dropped whole (agentBatch.ts isNewSeq) instead of re-firing its alarms. Serialized
+/// by `report_flush`, so the samplers and the check-in cannot drain at once and double-send.
 async fn drain_reports(rt: &Rt) {
     let _flush = rt.report_flush.lock().await;
+    let client = http_client();
     loop {
-        let next = { rt.pending_reports.lock().await.pop_front() };
-        let Some(r) = next else { break };
-        match send_report_once(rt, &r).await {
-            SendOutcome::Sent | SendOutcome::Permanent => {} // delivered, or hopeless — either way it leaves the queue
-            SendOutcome::Transient => {
-                rt.pending_reports.lock().await.push_front(r);
-                break; // uplink down — leave the backlog for the next successful send or heartbeat
+        let inflight = rt.inflight_delta.lock().await.take();
+        let (seq, items) = match inflight {
+            Some(x) => x,
+            None => {
+                let mut q = rt.pending_reports.lock().await;
+                if q.is_empty() {
+                    break;
+                }
+                let n = q.len().min(batch::MAX_ITEMS);
+                let items: Vec<batch::Item> = q.drain(..n).map(|r| batch::from_report(&r)).collect();
+                (rt.batch_seq.fetch_add(1, Ordering::SeqCst), items)
+            }
+        };
+        let cfg = hub_config::read_config_in(&rt.base);
+        if cfg.token.is_empty() || cfg.vid.is_empty() {
+            // Unregistered — there is nothing to deliver to; do not hoard.
+            rt.pending_reports.lock().await.clear();
+            break;
+        }
+        match post_batch(rt, &client, &cfg, batch::Kind::Delta, Some(seq), &items, None).await {
+            PostOutcome::Delivered(body) => handle_batch_reply(rt, &client, &body).await,
+            PostOutcome::Refused(why) => {
+                crate::hlog!("hub: {} report(s) dropped ({why}): {}", items.len(), items.iter().map(|i| i.event.as_str()).collect::<Vec<_>>().join(", "));
+            }
+            PostOutcome::Transient(why) => {
+                crate::hlog!("hub: {} report(s) queued ({why})", items.len());
+                *rt.inflight_delta.lock().await = Some((seq, items));
+                break;
             }
         }
     }
 }
 
-/// Deliver a telemetry report, retrying past a flaky uplink.
-///
-/// 🔴 WHY A QUEUE AND NOT A FIRE-AND-FORGET SEND. This used to send once and, on failure, log and
-/// DROP the report — a permanent gap in the cloud for every `report … failed to send`, which on a
-/// boat's cellular link is constant. The state the app shows would simply skip whatever the hub
-/// observed while the uplink hiccuped. Now the report is enqueued (bounded) and the backlog drains
-/// the moment a send succeeds — here, and again after every good heartbeat (heartbeat_loop). Still
-/// never blocks the valve logic that produced it.
-async fn spool_report(rt: &Rt, report: &crate::linktap_runtime::Report) {
-    // A report means the local state just changed — wake the heartbeat into ACTIVE cadence so the
-    // cloud/app track it live, even if the hub was in a 20-minute quiet nap.
-    note_activity(rt);
+/// Queue a report WITHOUT draining — for a caller about to queue more, so they share one post.
+async fn enqueue_report(rt: &Rt, report: &crate::linktap_runtime::Report) {
     let dropped = {
         let mut q = rt.pending_reports.lock().await;
         push_bounded(&mut q, report.clone(), MAX_SPOOL_REPORTS)
     };
     if dropped > 0 {
-        crate::hlog!("linktap: report backlog full - dropped {dropped} oldest sample(s)");
+        crate::hlog!("hub: report backlog full - dropped {dropped} oldest sample(s)");
     }
+}
+
+/// Deliver a report, retrying past a flaky uplink.
+///
+/// 🔴 WHY A QUEUE AND NOT A FIRE-AND-FORGET SEND. This used to send once and, on failure, log and
+/// DROP the report — a permanent gap in the cloud for every `report … failed to send`, which on a
+/// boat's cellular link is constant. Now the report is enqueued (bounded) and the backlog drains the
+/// moment a send succeeds — here, and again after every delivered keyframe (checkin_once). Still
+/// never blocks the valve logic that produced it.
+///
+/// ⚠️ NOT ACTIVITY BY ITSELF (H3). Only callers that know this is a real event ring note_activity.
+async fn spool_report(rt: &Rt, report: &crate::linktap_runtime::Report) {
+    enqueue_report(rt, report).await;
     drain_reports(rt).await;
+}
+
+/// A report that IS an event (a failed stop, a gateway lost, …): spool it and check in early.
+async fn report_event(rt: &Rt, report: &crate::linktap_runtime::Report) {
+    note_activity(rt);
+    spool_report(rt, report).await;
 }
 
 /// PURE: is this response a failure worth saying out loud, and what should the line say?
@@ -2521,7 +3066,7 @@ pub fn now_ms() -> i64 {
 // --- Entry --------------------------------------------------------------------------------------
 
 /// The `--hub` main. Never returns except on fatal startup errors or ctrl-c (manual runs);
-/// as a service there is no console, so failures also land in the heartbeat's absence — the
+/// as a service there is no console, so failures also land in the check-ins' absence — the
 /// connectivity sweep alerting on a quiet hub is the real monitor.
 pub fn run_headless() {
     // A manual run stops on ctrl-c. A Windows service cannot: it has no console and no signal —
@@ -2570,7 +3115,9 @@ where
                 crate::adopt::ADOPTION_WINDOW.as_secs() / 60
             );
         }
-        tokio::spawn(heartbeat_loop(rt.clone()));
+        tokio::spawn(checkin_loop(rt.clone()));
+        // The anchor watch's "checks in OK" heartbeat — idle (no posts) unless an anchor watch is armed.
+        tokio::spawn(gps_heartbeat_loop(rt.clone()));
         tokio::spawn(update_check_loop(rt.clone()));
         tokio::spawn(key_sync_loop(rt.clone()));
         // The LinkTap poll floor. It re-reads its own configuration each pass, so a gateway
@@ -3250,14 +3797,15 @@ async fn sensor_hunt_loop(rt: Shared) {
 }
 
 /// How often the router loop wakes to see whether any router is due. Each router has its own
-/// cadence (routers::poll_secs); this is only the tick.
-const ROUTER_TICK_SECS: u64 = 15;
+/// cadence (routers::poll_secs, faster while its GPS is armed/underway/watched); this is only the tick.
+const ROUTER_TICK_SECS: u64 = 5;
 
-/// Read each managed router on its cadence and report — `modem.measurement` as the router (with
-/// the router's own agent token) and, when its GPS is on, `gps.measurement` as the linked gps_source
-/// device (with the hub's token, the vouched `brv_gps_*` path). Re-reads config each pass, so a
-/// router added, edited or removed from the app is picked up without a restart. Errors are logged
-/// only when they CHANGE, so an unplugged router does not fill the log every two minutes.
+/// Read each managed router on its cadence (H2): the `modem.measurement` becomes the router's newest
+/// value for the keyframe, and goes to the cloud AT ONCE only when the uplink kind (`wan`) or its
+/// up/down state moved, or a member is watching. The KB it used since the last SENT report accumulates
+/// and rides whichever send comes first. When its GPS is on, every fix goes through the geofence as the
+/// linked gps_source device. Re-reads config each pass, so a router added, edited or removed from the
+/// app is picked up without a restart. Errors are logged only when they CHANGE.
 async fn router_poll_loop(rt: Shared) {
     let client = crate::routers::lan_client();
     let mut last_error: HashMap<String, String> = HashMap::new();
@@ -3266,8 +3814,21 @@ async fn router_poll_loop(rt: Shared) {
     loop {
         let cfg = hub_config::read_config_in(&rt.base);
         let now = now_ms();
+        let is_leased = leased(&rt);
         for r in cfg.routers.iter().filter(|r| r.enabled && !r.host.is_empty()) {
-            let due_ms = (crate::routers::poll_secs(r) * 1000) as i64;
+            let idle = crate::routers::poll_secs(r);
+            let gps_fast = r.gps_enabled && !r.gps_dev_id.is_empty() && {
+                let t = rt.telemetry.lock().await;
+                t.watch.as_ref().is_some_and(|w| w.anchor.is_some()) || t.geofences.get(&r.gps_dev_id).is_some_and(|g| g.wants_fast_sampling())
+            };
+            let secs = if r.gps_enabled && !r.gps_dev_id.is_empty() {
+                geofence::sample_secs(gps_fast, is_leased, lan_live(&rt), false, idle)
+            } else if is_leased {
+                idle.min(crate::routers::POLL_FLOOR_SECS)
+            } else {
+                idle
+            };
+            let due_ms = (secs * 1000) as i64;
             if last_report_ms.get(&r.id).map_or(false, |t| now - t < due_ms) {
                 continue;
             }
@@ -3292,7 +3853,7 @@ async fn router_poll_loop(rt: Shared) {
                         last_counters.insert(r.id.clone(), c);
                     }
                     // A modem's params or a dish's — routers::report_params decides, the loop does not.
-                    if let Some(params) = crate::routers::report_params(&snap, delta) {
+                    if let Some(params) = crate::routers::report_params(&snap, None) {
                         if r.agent_token.is_empty() {
                             // Readable in the app, but nothing reaches the cloud: say so once.
                             if last_error.get(&r.id).map_or(true, |e| e != "no agent token") {
@@ -3300,31 +3861,49 @@ async fn router_poll_loop(rt: Shared) {
                                 last_error.insert(r.id.clone(), "no agent token".into());
                             }
                         } else {
-                            spool_report(&rt, &crate::linktap_runtime::Report {
-                                device: r.id.clone(),
-                                event: "modem.measurement".into(),
-                                params,
-                                token: Some(r.agent_token.clone()),
-                            })
-                            .await;
+                            let send = {
+                                let mut t = rt.telemetry.lock().await;
+                                *t.wan_pending_kb.entry(r.id.clone()).or_insert(0) += delta.unwrap_or(0);
+                                t.router_latest.insert(r.id.clone(), params.clone());
+                                let event = cadence::router_is_event(t.router_sent.get(&r.id), &params);
+                                if event {
+                                    crate::hlog!(
+                                        "routers: {} '{}' - uplink {} {}",
+                                        r.host, r.name,
+                                        params.iter().find(|(k, _)| k == "wan").map_or("?", |(_, v)| v.as_str()),
+                                        if params.iter().any(|(k, v)| k == "up" && v == "1") { "up" } else { "down" }
+                                    );
+                                }
+                                if !t.router_sent.contains_key(&r.id) {
+                                    // First read after start: the baseline (the keyframe carries it).
+                                    t.router_sent.insert(r.id.clone(), cadence::RouterSent::from_params(&params));
+                                }
+                                if event || is_leased {
+                                    let kb = t.wan_pending_kb.insert(r.id.clone(), 0).unwrap_or(0);
+                                    t.router_sent.insert(r.id.clone(), cadence::RouterSent::from_params(&params));
+                                    Some((batch::router_item(&r.id, &params, kb), event))
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some((item, event)) = send {
+                                if event {
+                                    note_activity(&rt);
+                                }
+                                spool_report(&rt, &crate::linktap_runtime::Report {
+                                    device: item.device,
+                                    event: item.event,
+                                    params: item.params,
+                                    token: None,
+                                })
+                                .await;
+                            }
                         }
                     }
                     if r.gps_enabled && !r.gps_dev_id.is_empty() {
                         if let Some(fix) = &snap.fix {
-                            let mut params = vec![
-                                ("lat".to_string(), format!("{:.6}", fix.lat)),
-                                ("lon".to_string(), format!("{:.6}", fix.lon)),
-                            ];
-                            if let Some(acc) = fix.acc {
-                                params.push(("acc".to_string(), format!("{acc:.1}")));
-                            }
-                            spool_report(&rt, &crate::linktap_runtime::Report {
-                                device: r.gps_dev_id.clone(),
-                                event: "gps.measurement".into(),
-                                params,
-                                token: None,
-                            })
-                            .await;
+                            let fix = crate::gps::GpsFix { lat: fix.lat, lon: fix.lon, acc: fix.acc, ..Default::default() };
+                            gps_observe(&rt, &r.gps_dev_id, &fix).await;
                         }
                     }
                 }
@@ -3336,6 +3915,12 @@ async fn router_poll_loop(rt: Shared) {
         last_report_ms.retain(|k, _| ids.contains(k));
         last_counters.retain(|k, _| ids.contains(k));
         last_error.retain(|k, _| ids.contains(k));
+        {
+            let mut t = rt.telemetry.lock().await;
+            t.router_latest.retain(|k, _| ids.contains(k));
+            t.router_sent.retain(|k, _| ids.contains(k));
+            t.wan_pending_kb.retain(|k, _| ids.contains(k));
+        }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(ROUTER_TICK_SECS)) => {}
             _ = rt.router_wake.notified() => {
@@ -3480,33 +4065,6 @@ mod tests {
         assert_eq!(Vec::from(q), vec![2, 3, 4]);
     }
 
-    #[test]
-    fn heartbeat_backs_off_when_idle_and_speeds_up_after_an_event() {
-        let cfg = 60; // the default configured cadence
-                      // Just after a local event ⇒ ACTIVE (fast), but never slower than configured.
-        assert_eq!(heartbeat_interval_secs(0, cfg), HEARTBEAT_ACTIVE_SECS);
-        assert_eq!(heartbeat_interval_secs(HEARTBEAT_ACTIVE_WINDOW_MS - 1, cfg), HEARTBEAT_ACTIVE_SECS);
-        // Recent-ish ⇒ NORMAL (the configured beat).
-        assert_eq!(heartbeat_interval_secs(HEARTBEAT_ACTIVE_WINDOW_MS, cfg), 60);
-        assert_eq!(heartbeat_interval_secs(HEARTBEAT_NORMAL_WINDOW_MS - 1, cfg), 60);
-        // Long idle ⇒ QUIET (one beat every 20 min), still under the 60-min offline threshold.
-        assert_eq!(heartbeat_interval_secs(HEARTBEAT_NORMAL_WINDOW_MS, cfg), HEARTBEAT_QUIET_SECS);
-        assert!(HEARTBEAT_QUIET_SECS < 60 * 60, "quiet beat must stay under the 60-min offline default");
-    }
-
-    #[test]
-    fn heartbeat_respects_an_unusual_configured_cadence() {
-        // A very fast configured beat: ACTIVE is never SLOWER than it.
-        assert_eq!(heartbeat_interval_secs(0, 15), 15);
-        // A configured beat slower than QUIET: QUIET never FASTER than it, and NORMAL honors it.
-        let slow = 30 * 60; // 30 min
-        assert_eq!(heartbeat_interval_secs(HEARTBEAT_NORMAL_WINDOW_MS, slow), slow);
-        assert_eq!(heartbeat_interval_secs(HEARTBEAT_ACTIVE_WINDOW_MS, slow), slow);
-        // Below the floor is lifted to the floor.
-        assert_eq!(heartbeat_interval_secs(HEARTBEAT_NORMAL_WINDOW_MS, 5), HEARTBEAT_QUIET_SECS);
-        assert_eq!(heartbeat_interval_secs(HEARTBEAT_ACTIVE_WINDOW_MS, 5), HEARTBEAT_FLOOR_SECS);
-    }
-
     fn temp_base(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("brvg-hub-server-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -3569,16 +4127,6 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_url_carries_acks_and_omits_an_empty_one() {
-        let cfg = seeded_cfg();
-        let some = url::Url::parse(&heartbeat_url("https://w.example", &cfg, "0.3.30", "linux", None, Some("a1,b2")).unwrap()).unwrap();
-        let q: std::collections::HashMap<_, _> = some.query_pairs().into_owned().collect();
-        assert_eq!(q.get("ack").map(String::as_str), Some("a1,b2"));
-        let none = url::Url::parse(&heartbeat_url("https://w.example", &cfg, "0.3.30", "linux", None, Some("")).unwrap()).unwrap();
-        assert!(!none.query_pairs().any(|(k, _)| k == "ack"), "empty ack must be omitted, like update");
-    }
-
-    #[test]
     fn parse_agent_commands_keeps_only_well_formed_pairs() {
         let body = serde_json::json!({ "commands": [
             { "id": "x1", "cmd": "self_update" },
@@ -3593,44 +4141,6 @@ mod tests {
         );
         assert!(parse_agent_commands(&serde_json::json!({})).is_empty());
         assert!(parse_agent_commands(&serde_json::json!({ "commands": "nope" })).is_empty());
-    }
-
-    #[test]
-    fn the_heartbeat_is_a_hub_measurement_on_the_agent_wire() {
-        let cfg = seeded_cfg();
-        let u = url::Url::parse(&heartbeat_url("https://w.example/", &cfg, "1.0.82", "windows", None, None).unwrap()).unwrap();
-        assert_eq!(u.path(), "/api/agent"); // same ingest as the router agent
-        let q: HashMap<_, _> = u.query_pairs().into_owned().collect();
-        assert_eq!(q["vid"], "v1");
-        assert_eq!(q["device"], "hub_abc123");
-        assert_eq!(q["event"], "hub.measurement"); // telemetry classification, never an alert
-        assert_eq!(q["t"], "hubtok-secret");
-        assert_eq!(q["name"], "Central");
-        assert_eq!(q["platform"], "windows");
-        assert_eq!(q["ver"], "1.0.82");
-        assert!(!q.contains_key("update")); // absent when there is no newer release
-    }
-
-    #[test]
-    fn the_heartbeat_carries_an_update_marker_only_when_one_exists() {
-        let cfg = seeded_cfg();
-        // No update → no param (also covers an empty string being treated as none).
-        let none = url::Url::parse(&heartbeat_url("https://w.example", &cfg, "0.3.23", "linux", Some(""), None).unwrap()).unwrap();
-        assert!(!none.query_pairs().any(|(k, _)| k == "update"));
-        // A newer release → the version rides the heartbeat, so the fleet console reads it flat.
-        let some = url::Url::parse(&heartbeat_url("https://w.example", &cfg, "0.3.23", "linux", Some("0.3.24"), None).unwrap()).unwrap();
-        let q: HashMap<_, _> = some.query_pairs().into_owned().collect();
-        assert_eq!(q["update"], "0.3.24");
-    }
-
-    #[test]
-    fn a_hub_name_with_spaces_and_symbols_cannot_break_the_query() {
-        let cfg = HubConfig { name: "Jon's boat & RV=hub".into(), ..seeded_cfg() };
-        let raw = heartbeat_url("https://w.example", &cfg, "1.0.82", "macos", None, None).unwrap();
-        assert!(!raw.contains("boat & RV"), "the name must be encoded: {raw}");
-        let q: HashMap<_, _> = url::Url::parse(&raw).unwrap().query_pairs().into_owned().collect();
-        assert_eq!(q["name"], "Jon's boat & RV=hub");
-        assert_eq!(q["t"], "hubtok-secret"); // an `=` in the name must not spill into another param
     }
 
     #[tokio::test]
@@ -3955,23 +4465,246 @@ mod tests {
         assert!(miss.is_err());
     }
 
-    #[tokio::test]
-    async fn a_heartbeat_reaches_the_agent_ingest_with_the_hub_identity() {
-        async fn stub(Query(q): Query<HashMap<String, String>>) -> &'static str {
-            assert_eq!(q["event"], "hub.measurement");
-            assert_eq!(q["device"], "hub_abc123");
-            assert_eq!(q["t"], "hubtok-secret");
-            assert!(!q["ver"].is_empty());
-            "OK"
-        }
+    /// A stub worker that records every `/api/agent/batch` post (query + body) and answers `reply`.
+    type BatchPosts = Arc<std::sync::Mutex<Vec<(HashMap<String, String>, serde_json::Value)>>>;
+
+    async fn stub_batch_worker(reply: serde_json::Value) -> (String, BatchPosts) {
+        let posts: BatchPosts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = posts.clone();
+        let app = Router::new().route(
+            "/api/agent/batch",
+            post(move |Query(q): Query<HashMap<String, String>>, body: axum::body::Bytes| {
+                let seen = seen.clone();
+                let reply = reply.clone();
+                async move {
+                    seen.lock().unwrap().push((q, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null)));
+                    Json(reply)
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/api/agent", get(stub))).await.unwrap()
-        });
-        let client = reqwest::Client::new();
-        send_heartbeat_once(&client, &format!("http://{addr}"), &seeded_cfg()).await.unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), posts)
     }
+
+    #[tokio::test]
+    async fn the_keyframe_check_in_is_one_batch_with_the_hub_status_and_acts_on_the_reply() {
+        // H1: the retired `hub.measurement` GET is now a `hub.status` item on the consolidated keyframe,
+        // and the reply's commands, valve config and watch config are all honoured.
+        let reply = serde_json::json!({
+            "status": "ok", "processed": 1,
+            "commands": [{ "id": "c9", "cmd": "not_a_verb" }],
+            "anchor": { "sig": 1757750400000u64, "lat": 41.492907, "lon": -81.694361, "radiusM": 60, "warnM": 45, "hbSec": 300, "sampleSec": 30 },
+        });
+        let (worker, posts) = stub_batch_worker(reply).await;
+        let base = temp_base("keyframe");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, worker);
+        rt.pending_acks.lock().await.push("c1".into());
+        *rt.update_available.write().await = Some("9.9.9".into());
+        // A router that has reported, with KB accumulated across skipped sends.
+        {
+            let mut t = rt.telemetry.lock().await;
+            t.gps_latest.insert("brv_gps_a".into(), (crate::gps::GpsFix { lat: 41.49, lon: -81.69, acc: Some(4.0), sats: Some(9), ..Default::default() }, now_ms()));
+        }
+        let cfg = hub_config::read_config_in(&rt.base);
+        checkin_once(&rt, &http_client(), &cfg).await.unwrap();
+
+        let posts = posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 1, "one check-in is ONE post");
+        let (q, body) = &posts[0];
+        assert_eq!((q["vid"].as_str(), q["device"].as_str(), q["t"].as_str()), ("v1", "hub_abc123", "hubtok-secret"));
+        assert_eq!(q["ack"], "c1", "owed acks ride the keyframe");
+        assert_eq!(q["anchorsig"], "0", "an unarmed hub echoes sig 0 so the worker sends the watch");
+        assert_eq!(body["kind"], "keyframe");
+        assert_eq!(body["agent"]["tier"], "hub");
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items[0]["event"], "hub.status");
+        assert_eq!(items[0]["device"], "hub_abc123");
+        assert_eq!(items[0]["params"]["name"], "Central");
+        assert_eq!(items[0]["params"]["update"], "9.9.9");
+        assert!(!items[0]["params"]["ver"].as_str().unwrap().is_empty());
+        let gps = items.iter().find(|i| i["event"] == "gps.measurement").expect("the keep-alive fix rides the keyframe");
+        assert_eq!(gps["params"]["sats"], "9");
+
+        // The reply acted on: the watch adopted, the unknown command queued for its ack.
+        assert_eq!(rt.telemetry.lock().await.anchorsig(), 1757750400000);
+        assert_eq!(*rt.pending_acks.lock().await, vec!["c9".to_string()]);
+        // …and the geofence for the known GPS device now measures from what the keyframe sent.
+        assert_eq!(rt.telemetry.lock().await.geofences["brv_gps_a"].last_sent(), Some((41.49, -81.69)));
+    }
+
+    #[tokio::test]
+    async fn events_go_as_delta_posts_with_a_seq_and_a_failed_post_is_resent_byte_identical() {
+        use std::sync::atomic::AtomicUsize;
+        // The cloud is down for the first attempt.
+        let posts: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (seen, h) = (posts.clone(), hits.clone());
+        let app = Router::new().route("/api/agent/batch", post(move |body: axum::body::Bytes| {
+            let (seen, h) = (seen.clone(), h.clone());
+            async move {
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+                if n == 0 { (StatusCode::SERVICE_UNAVAILABLE, "down").into_response() } else { Json(serde_json::json!({"status": "ok"})).into_response() }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let base = temp_base("delta_retry");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, worker);
+        let r = crate::linktap_runtime::Report { token: None, device: "lt_abc".into(), event: "linktap.stop_failed".into(), params: vec![("error".into(), "rf".into())] };
+        spool_report(&rt, &r).await;
+        assert!(rt.inflight_delta.lock().await.is_some(), "a failed event post is KEPT");
+        // Another event arrives while the first is still owed: it must not jump the queue.
+        spool_report(&rt, &crate::linktap_runtime::Report { event: "linktap.reopen_failed".into(), ..r.clone() }).await;
+        let posts = posts.lock().unwrap().clone();
+        assert_eq!(posts.len(), 3);
+        assert_eq!(posts[0], posts[1], "the retry is byte-identical, seq included");
+        assert_eq!(posts[0]["kind"], "delta");
+        assert!(posts[0]["seq"].as_u64().is_some());
+        assert!(posts[2]["seq"].as_u64().unwrap() > posts[0]["seq"].as_u64().unwrap());
+        assert_eq!(posts[2]["items"][0]["event"], "linktap.reopen_failed");
+        assert!(rt.inflight_delta.lock().await.is_none() && rt.pending_reports.lock().await.is_empty());
+    }
+
+    #[test]
+    fn the_sixty_second_heartbeat_runs_only_for_an_anchor_watch_never_a_zone_alone() {
+        let mut cfg = seeded_cfg();
+        cfg.gps = hub_config::GpsConfig { kind: "nmea".into(), host: "10.0.0.5".into(), dev_id: "brv_gps_a".into(), enabled: true, ..Default::default() };
+        let mut t = Telemetry::default();
+        assert!(heartbeat_items(&mut t, &cfg, 0).is_empty(), "unarmed: no heartbeat");
+        let zone = geofence::Zone { lat: 41.0, lon: -81.0, radius_m: 40.0, streak: 3 };
+        t.watch = Some(geofence::Watch { sig: 7, anchor: None, zone: Some(zone.clone()), hb_secs: 60, sample_secs: 30 });
+        assert!(heartbeat_items(&mut t, &cfg, 0).is_empty(), "owner: a security zone is the 15-minute check-in, not the anchor watch's heartbeat");
+        t.watch = Some(geofence::Watch { sig: 8, anchor: Some(geofence::Circle { lat: 41.0, lon: -81.0, radius_m: 60.0, warn_m: 0.0 }), zone: Some(zone), hb_secs: 60, sample_secs: 30 });
+        let items = heartbeat_items(&mut t, &cfg, 0);
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].device.as_str(), items[0].event.as_str()), ("brv_gps_a", "gps.heartbeat"));
+        assert!(items[0].params.contains(&("anchorsig".to_string(), "8".to_string())));
+    }
+
+    #[tokio::test]
+    async fn an_anchor_drag_is_sent_the_moment_the_streak_trips_and_positions_follow_every_sample() {
+        let (worker, posts) = stub_batch_worker(serde_json::json!({"status": "ok"})).await;
+        let base = temp_base("drag_now");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, worker);
+        rt.telemetry.lock().await.watch = Some(geofence::Watch {
+            sig: 42, anchor: Some(geofence::Circle { lat: 41.0, lon: -81.0, radius_m: 60.0, warn_m: 0.0 }), zone: None, hb_secs: 60, sample_secs: 30,
+        });
+        let fix = |north_m: f64| crate::gps::GpsFix { lat: 41.0 + north_m / 111_195.0, lon: -81.0, acc: Some(3.0), hdop: Some(0.9), sats: Some(10), sog_kn: Some(0.3) };
+        gps_observe(&rt, "brv_gps_a", &fix(20.0)).await;
+        gps_observe(&rt, "brv_gps_a", &fix(90.0)).await;
+        assert!(posts.lock().unwrap().is_empty(), "inside, then one sample outside: nothing sent");
+        gps_observe(&rt, "brv_gps_a", &fix(95.0)).await;
+        let events: Vec<String> = posts.lock().unwrap().iter().flat_map(|(_, b)| b["items"].as_array().unwrap().iter().map(|i| i["event"].as_str().unwrap().to_string()).collect::<Vec<_>>()).collect();
+        assert!(events.contains(&"anchor.motion".to_string()), "the drag goes at once: {events:?}");
+        assert!(events.contains(&"gps.measurement".to_string()), "with the position");
+        assert!(rt.telemetry.lock().await.geofences["brv_gps_a"].anchor_breaching());
+        let before = posts.lock().unwrap().len();
+        gps_observe(&rt, "brv_gps_a", &fix(100.0)).await;
+        assert_eq!(posts.lock().unwrap().len(), before + 1, "every sample while outside");
+        assert!(rt.last_cloud_ok_ms.load(Ordering::SeqCst) > 0, "a delivered event counts as a check-in for the heartbeat clock");
+    }
+
+    #[tokio::test]
+    async fn refresh_is_view_gated_answers_202_and_coalesces_within_five_seconds() {
+        let base = temp_base("refresh");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, "https://unused.example".into());
+        let who = |role: &str| Caller { uid: "u".into(), role: role.into() };
+        let a = dispatch(&rt, &who("monitor"), "POST", "/api/hub/refresh", b"").await;
+        assert_eq!(a.status, 202, "any member may ask the hub to check in");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["coalesced"], false);
+        let b = dispatch(&rt, &who("owner"), "POST", "/api/hub/refresh", b"").await;
+        assert_eq!(b.status, 202);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&b.body).unwrap()["coalesced"], true, "a second call inside 5 s is the same wake");
+        assert_eq!(dispatch(&rt, &who(""), "POST", "/api/hub/refresh", b"").await.status, 403);
+        assert_eq!(dispatch(&rt, &who("stranger"), "POST", "/api/hub/refresh", b"").await.status, 403);
+        // The wake really was rung (a permit is waiting for the check-in loop).
+        tokio::time::timeout(Duration::from_millis(100), rt.wake.notified()).await.expect("refresh rings the check-in");
+        // Five seconds later it rings again.
+        rt.last_refresh_ms.store(now_ms() - cadence::REFRESH_COALESCE_MS, Ordering::SeqCst);
+        let c = dispatch(&rt, &who("control"), "POST", "/api/hub/refresh", b"").await;
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&c.body).unwrap()["coalesced"], false);
+    }
+
+    #[tokio::test]
+    async fn a_watch_lease_is_atomic_view_gated_and_expires() {
+        let base = temp_base("lease");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, "https://unused.example".into());
+        let who = |role: &str| Caller { uid: "u".into(), role: role.into() };
+        assert!(!leased(&rt));
+        assert_eq!(dispatch(&rt, &who(""), "POST", "/api/hub/watch", b"{}").await.status, 403);
+        let a = dispatch(&rt, &who("monitor"), "POST", "/api/hub/watch", br#"{"leaseSec":120}"#).await;
+        assert_eq!(a.status, 200);
+        let until = serde_json::from_str::<serde_json::Value>(&a.body).unwrap()["leaseUntil"].as_i64().unwrap();
+        assert!(leased(&rt));
+        assert!((until - now_ms() - 120_000).abs() < 2_000);
+        // A shorter renewal from another viewer never cuts it; an empty body is the default lease.
+        dispatch(&rt, &who("owner"), "POST", "/api/hub/watch", br#"{"leaseSec":30}"#).await;
+        assert_eq!(rt.lease_until_ms.load(Ordering::SeqCst), until);
+        assert_eq!(dispatch(&rt, &who("owner"), "POST", "/api/hub/watch", b"").await.status, 200);
+        assert_eq!(dispatch(&rt, &who("owner"), "POST", "/api/hub/watch", b"nope").await.status, 422);
+        // Expiry.
+        rt.lease_until_ms.store(now_ms() - 1, Ordering::SeqCst);
+        assert!(!leased(&rt), "a lapsed lease stops the live forwarding");
+    }
+
+    #[tokio::test]
+    async fn the_lan_live_feed_answers_now_holds_a_current_caller_and_needs_a_member_key() {
+        let base = temp_base("gps_live");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let (origin, rt) = spawn_server(base, vec![key("monitor")]).await;
+        let c = reqwest::Client::new();
+        assert_eq!(c.get(format!("{origin}/api/hub/gps/live")).send().await.unwrap().status(), 401);
+        let v: serde_json::Value = c.get(format!("{origin}/api/hub/gps/live")).header(KEY_HEADER, key("monitor").key).send().await.unwrap().json().await.unwrap();
+        assert!(v["fix"].is_null());
+        let seq = v["seq"].as_u64().unwrap();
+        // A caller that is current is HELD until the next sample exists.
+        let rt2 = rt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            gps_observe(&rt2, "brv_gps_a", &crate::gps::GpsFix { lat: 41.5, lon: -81.7, acc: Some(3.0), hdop: Some(0.8), sats: Some(12), sog_kn: Some(0.2) }).await;
+        });
+        let t0 = std::time::Instant::now();
+        let v: serde_json::Value = c.get(format!("{origin}/api/hub/gps/live?since={seq}")).header(KEY_HEADER, key("monitor").key).send().await.unwrap().json().await.unwrap();
+        assert!(t0.elapsed() >= Duration::from_millis(250), "held until the sample");
+        assert!(v["seq"].as_u64().unwrap() > seq);
+        assert_eq!(v["fix"]["devId"], "brv_gps_a");
+        assert_eq!(v["fix"]["sats"], 12);
+        assert_eq!(v["state"], "unarmed");
+        assert_eq!(rt.gps_live_waiters.load(Ordering::SeqCst), 0, "the waiter count unwinds");
+        // The route is not reachable down the relay.
+        assert_eq!(dispatch(&rt, &Caller { uid: "u".into(), role: "owner".into() }, "GET", "/api/hub/gps/live", b"").await.status, 404);
+    }
+
+    #[tokio::test]
+    async fn an_idle_valve_poll_is_held_for_the_keyframe_and_a_watering_transition_goes_at_once() {
+        let (worker, posts) = stub_batch_worker(serde_json::json!({"status": "ok"})).await;
+        let base = temp_base("valve_gate");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, worker);
+        let m = |w: &str| crate::linktap_runtime::Report { token: None, device: "lt_abc".into(), event: "linktap.measurement".into(), params: vec![("watering".into(), w.into()), ("rf".into(), "1".into())] };
+        let client = http_client();
+        for _ in 0..3 {
+            linktap_act(&rt, &client, "abc", crate::cycle::Action::None, vec![m("0")]).await;
+        }
+        assert!(posts.lock().unwrap().is_empty(), "an idle valve polled three times sends nothing");
+        linktap_act(&rt, &client, "abc", crate::cycle::Action::None, vec![m("1")]).await;
+        linktap_act(&rt, &client, "abc", crate::cycle::Action::None, vec![m("1")]).await;
+        linktap_act(&rt, &client, "abc", crate::cycle::Action::None, vec![m("0")]).await;
+        linktap_act(&rt, &client, "abc", crate::cycle::Action::None, vec![m("0")]).await;
+        let events: Vec<String> = posts.lock().unwrap().iter().map(|(_, b)| b["items"][0]["params"]["watering"].as_str().unwrap().to_string()).collect();
+        assert_eq!(events, vec!["1", "1", "0"], "on, every poll while watering, off — then quiet");
+    }
+
     // --- Valve control through the hub -----------------------------------------------------------
 
     fn valve_cfg(allowed: bool) -> HubConfig {
@@ -4681,6 +5414,18 @@ mod tests {
         });
 
         let c = reqwest::Client::new();
+        // H2: a first READING with nobody watching is held for the keyframe, not forwarded…
+        let r = c.get(format!("{origin}/api/hub/shelly?vid=v1&event=temperature.change&device=sh_salon&k=s3cr3t&tC=21.4"))
+            .send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        for _ in 0..50 {
+            if rt.telemetry.lock().await.shelly_latest.contains_key("sh_salon") { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(hits.lock().unwrap().is_empty(), "a held reading must not reach the cloud");
+        assert_eq!(rt.telemetry.lock().await.shelly_latest["sh_salon"].1, vec![("tC".to_string(), "21.4".to_string())]);
+        // …while a member is watching, readings go as they arrive — through the same door as before.
+        dispatch(&rt, &Caller { uid: "u".into(), role: "monitor".into() }, "POST", "/api/hub/watch", b"").await;
         let r = c.get(format!("{origin}/api/hub/shelly?vid=v1&event=temperature.change&device=sh_salon&k=s3cr3t&tC=21.5"))
             .send().await.unwrap();
         assert_eq!(r.status(), 200);
