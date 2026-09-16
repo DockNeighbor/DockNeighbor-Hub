@@ -74,6 +74,13 @@ pub struct HubConfig {
     /// successful sync. Lives here because this file is already the hub's one credential store
     /// (SYSTEM/0600) — a second file would just be a second thing to lock down.
     pub member_keys: Vec<MemberKey>,
+    /// The SIGNATURE of `member_keys` (key_sync.rs `member_set_sig`) — 64 hex, the same value the
+    /// cloud puts on a payload reply as flat `keysSig`. Stored beside the set it describes so the
+    /// hub can answer "is what I hold current?" from a reply it was going to receive anyway,
+    /// instead of spending a fetch to find out. Empty means "not known yet" and costs one sync;
+    /// it is never authorization input, only a cache key.
+    #[serde(default)]
+    pub member_keys_sig: String,
     /// LinkTap gateway on the LAN, when this vehicle has one. Empty host ⇒ the capability is off
     /// and the hub advertises no `linktap` capability at all.
     #[serde(default)]
@@ -228,6 +235,7 @@ impl Default for HubConfig {
             token: String::new(),
             http_port: DEFAULT_HTTP_PORT,
             member_keys: Vec::new(),
+            member_keys_sig: String::new(),
             linktap: LinkTapConfig::default(),
             shelly_secret: String::new(),
             web_ui_disabled: false,
@@ -518,6 +526,7 @@ mod tests {
             enabled: true, heartbeat_secs: 60, token: "tok".into(),
             http_port: 9000,
             member_keys: vec![MemberKey { key: "k1".into(), uid: "u1".into(), role: "coowner".into() }],
+            member_keys_sig: "a".repeat(64),
             linktap: LinkTapConfig {
                 host: "192.168.8.20".into(), gw_id: "GW02".into(),
                 dev_ids: vec!["aaaabbbbccccdddd".into()], allowed: true,
