@@ -57,8 +57,12 @@ pub struct MemberKey {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct HubConfig {
-    /// `hub_<random>` — minted ONCE per machine and never regenerated, so re-registering or
-    /// switching vehicles does not orphan the cloud device record for this hub.
+    /// `hub_<random>` — minted on first `/identity` and stable for the life of THIS FILE.
+    /// ⚠️ It does NOT survive a clear: `clear_in` deletes hub.json outright, so the next
+    /// `/identity` mints a new id and the hub re-enrols under it. (hub-lite differs on purpose —
+    /// its `/clear` blanks the vessel fields and KEEPS DEVICE_ID.) The app heals its own device
+    /// row from the id the hub reports: `ghostHubIds` / `reconcileHubDeviceRecord` in
+    /// dashboard/src/utils/hubService.ts.
     pub hub_id: String,
     /// The vehicle this hub is signed to.
     pub vid: String,
