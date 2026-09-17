@@ -389,7 +389,7 @@ pub fn parse_probe(info: &pb::DeviceInfo) -> Probe {
 /// PURE: the uplink the dish IS. Up means not in an outage — every outage cause (booting, no
 /// satellites, obstructed, stowed…) reads as down, which is what the Connectivity page needs.
 pub fn wan_of(d: &DishStatus) -> WanStatus {
-    WanStatus { wan: "starlink".into(), up: d.outage.is_none(), ip: None }
+    WanStatus { wan: "starlink".into(), up: d.outage.is_none(), ip: None, uptime_s: None }
 }
 
 /// PURE: `get_location` → a fix, or None when the dish has no valid position yet. The dish reports
@@ -454,13 +454,28 @@ fn grpc_message(h: &http::HeaderMap) -> String {
     String::from_utf8_lossy(&out).trim().to_string()
 }
 
+/// What `get_location`'s PERMISSION_DENIED becomes (grpc_error) — also how gps_support_of_refusal
+/// recognises it, so the two cannot drift apart.
+pub const LOCATION_REFUSED: &str = "the dish will not share its position — Starlink switched off local GPS access in May 2026 (Priority plans got it back in July; the Mini and V4 have no setting for it). Use another position source for this vessel";
+
+/// PURE: a failed `location()` → GpsSupport. The dish's PERMISSION_DENIED ("Disabled due to policy",
+/// MVP's Mini, bench 2026-09-13) is the dish saying it will not give the hub a position: `no`.
+/// Anything else (unreachable, rebooting, an unknown request) says nothing about GPS: `unknown`.
+pub fn gps_support_of_refusal(why: &str) -> crate::routers::GpsSupport {
+    if why == LOCATION_REFUSED {
+        crate::routers::GpsSupport::No
+    } else {
+        crate::routers::GpsSupport::Unknown
+    }
+}
+
 /// PURE: a non-OK gRPC status → what the owner can act on. 7 (PERMISSION_DENIED) is the one that
 /// matters: `get_location` answers "Disabled due to policy" (bench 2026-09-13), which is Starlink's
 /// plan policy, not a setting — saying so is the difference between "pick another position source"
 /// and a hunt for a switch that is not there (see the header).
 pub fn grpc_error(code: i32, message: &str) -> String {
     match code {
-        7 => "the dish will not share its position — Starlink switched off local GPS access in May 2026 (Priority plans got it back in July; the Mini and V4 have no setting for it). Use another position source for this vessel".into(),
+        7 => LOCATION_REFUSED.into(),
         12 => "the dish does not know that request — its firmware has moved; this hub needs updating".into(),
         14 => "the dish is not available right now — it may be rebooting".into(),
         _ if message.is_empty() => format!("the dish answered gRPC status {code}"),
@@ -621,7 +636,7 @@ pub(crate) mod tests {
         assert_eq!(d.signal_pct, Some(100.0));
         assert_eq!(d.alerts, vec!["lower signal than predicted".to_string()]);
         assert_eq!((d.gps_valid, d.gps_sats), (Some(true), Some(25)));
-        assert_eq!(wan_of(&d), WanStatus { wan: "starlink".into(), up: true, ip: None });
+        assert_eq!(wan_of(&d), WanStatus { wan: "starlink".into(), up: true, ip: None, uptime_s: None });
     }
 
     #[test]

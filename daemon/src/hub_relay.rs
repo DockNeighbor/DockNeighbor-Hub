@@ -18,6 +18,7 @@
 // credential its telemetry uses. That means the URL is a secret, so nothing here ever logs it, and
 // anything that might carry it is redacted before it reaches a log line.
 
+use std::future::Future;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -30,6 +31,74 @@ use crate::hub_server::{dispatch, Answer, Caller, Shared};
 /// Longest wait between reconnection attempts. A hub that cannot reach the cloud has nothing better
 /// to do than keep trying, but a boat on a metered cellular link should not retry in a tight loop.
 const MAX_BACKOFF_SECS: u64 = 60;
+
+/// 🔴 EVERY NETWORK AWAIT IN THIS FILE HAS A DEADLINE, because one without cost a real vehicle its
+/// remote control for ~12 hours, 2026-09-16. CENTRAL's hub.log: `relay socket failed: … (os error
+/// 10054)` at 13:06, then NOTHING — no further `relay socket failed`, no `relay connected` — until the
+/// service was restarted that night. The reconnect in `run` had called `connect_async` with no timeout,
+/// and on the boat's flaky WAN a TCP/TLS/WebSocket handshake stalled and never returned, so the loop
+/// was parked inside one attempt forever: no log, no retry, and every remote valve command answered
+/// "No hub took that command" while the 15-minute telemetry (a separate HTTP path) kept working. The
+/// 35s silence check could not help — it only runs once a connection has reached the select loop.
+///
+/// A timeout is an ordinary `Err`, so `run` logs it and backs off exactly as for any other failure.
+///
+/// Connect covers DNS, TCP, TLS and the WebSocket upgrade together. 30s is far beyond a healthy
+/// handshake even on cellular, and short enough that a wedged attempt costs one backoff step, not a day.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// One frame write (send + flush). A write that cannot complete in this long is into a dead or wedged
+/// peer; ending the connection is what gets us a fresh one.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest the socket loop waits on one relayed call before answering 504 and going back to
+/// serving the socket. The worker gives up on a call after 15s (hubRelay.ts RELAY_TIMEOUT_MS), so a
+/// later answer is read by nobody — and while a call is awaited, no ping is sent and no frame is read.
+/// Kept under SILENCE_LIMIT so a slow call cannot, by itself, make a healthy socket look silent.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Await `fut`, but give up after `limit`: its own error, or `"<what> timed out after Ns"`.
+pub async fn within<T, E: ToString>(
+    limit: Duration,
+    what: &str,
+    fut: impl Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(_) => Err(format!("{what} timed out after {}s", limit.as_secs_f32())),
+    }
+}
+
+type RelaySocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Open the socket — DNS, TCP, TLS and the WebSocket handshake — within `limit`.
+async fn connect(url: &str, limit: Duration) -> Result<RelaySocket, String> {
+    let (socket, _resp) = within(limit, "connect", tokio_tungstenite::connect_async(url)).await?;
+    Ok(socket)
+}
+
+/// Run one relayed call without letting it hold the socket loop hostage. The call is SPAWNED rather
+/// than awaited in place so that, on timeout, it is detached and left to finish — not cancelled
+/// halfway through a gateway command or a config write. Its late answer is dropped; the worker has
+/// long since answered the caller.
+async fn answer_within<F>(limit: Duration, call: F) -> Answer
+where
+    F: Future<Output = Answer> + Send + 'static,
+{
+    match tokio::time::timeout(limit, tokio::spawn(call)).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(join)) => Answer {
+            status: 500,
+            body: serde_json::json!({ "error": format!("the hub call failed: {join}") }).to_string(),
+        },
+        Err(_) => {
+            crate::hlog!("hub: relayed call still running after {}s; answering 504", limit.as_secs());
+            Answer {
+                status: 504,
+                body: serde_json::json!({ "error": "the hub did not finish that call in time" }).to_string(),
+            }
+        }
+    }
+}
 
 /// PURE: the socket URL for this hub. `https` → `wss` so one pinned base serves both.
 pub fn relay_socket_url(worker_base: &str, cfg: &HubConfig) -> Result<String, String> {
@@ -250,19 +319,15 @@ pub fn relay_is_silent(silent_for: Duration, limit: Duration) -> bool {
 /// One connection's lifetime. `Ok` means a clean close; `Err` carries a reason worth backing off for.
 async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
     let url = relay_socket_url(&rt.worker_base, cfg)?;
-    let (socket, _resp) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| e.to_string())?;
+    let socket = connect(&url, CONNECT_TIMEOUT).await?;
     crate::hlog!("hub: relay connected");
     // Split so the ping timer can write while the read half is parked on `next()`. Without this the
     // two borrows collide and the whole liveness check is impossible to express.
     let (mut write, mut read) = socket.split();
     let lan_ips = crate::linktap_discover::local_ipv4s();
     let web_version = rt.web.read().await.as_ref().map(|w| w.version.clone());
-    write
-        .send(Message::Text(hello_frame(cfg, &lan_ips, web_version.as_deref())))
-        .await
-        .map_err(|e| e.to_string())?;
+    within(WRITE_TIMEOUT, "hello write", write.send(Message::Text(hello_frame(cfg, &lan_ips, web_version.as_deref()))))
+        .await?;
 
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -282,7 +347,7 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
                     Message::Text(t) => { last_seen = tokio::time::Instant::now(); t }
                     Message::Ping(p) => {
                         // Answer for transport hygiene, but do NOT treat it as liveness.
-                        write.send(Message::Pong(p)).await.map_err(|e| e.to_string())?;
+                        within(WRITE_TIMEOUT, "pong write", write.send(Message::Pong(p))).await?;
                         continue;
                     }
                     Message::Close(_) => return Ok(()),
@@ -299,11 +364,13 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
                     }
                     WorkerMessage::Call { id, uid, role, method, path, body } => {
                         let caller = Caller { uid, role };
-                        let answer = dispatch(rt, &caller, &method, &path, body.as_bytes()).await;
-                        write
-                            .send(Message::Text(result_frame(&id, &answer)))
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        let call_rt = rt.clone();
+                        let answer = answer_within(CALL_TIMEOUT, async move {
+                            dispatch(&call_rt, &caller, &method, &path, body.as_bytes()).await
+                        })
+                        .await;
+                        within(WRITE_TIMEOUT, "result write", write.send(Message::Text(result_frame(&id, &answer))))
+                            .await?;
                     }
                 }
             }
@@ -320,7 +387,7 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
                 // A TEXT ping, not a control-frame one: the object must answer it with a `pong`, and
                 // a hibernating object's control PINGs are answered by the edge instead — see
                 // app_ping_frame and the `Message::Text` liveness rule above.
-                write.send(Message::Text(app_ping_frame())).await.map_err(|e| e.to_string())?;
+                within(WRITE_TIMEOUT, "ping write", write.send(Message::Text(app_ping_frame()))).await?;
             }
         }
     }
@@ -521,6 +588,66 @@ mod tests {
         assert!(!relay_is_silent(Duration::from_secs(0), SILENCE_LIMIT));
         assert!(!relay_is_silent(SILENCE_LIMIT, SILENCE_LIMIT), "exactly at the limit is still alive");
         assert!(relay_is_silent(SILENCE_LIMIT + Duration::from_secs(1), SILENCE_LIMIT));
+    }
+
+    /// 🔴 THE 2026-09-16 OUTAGE, REPRODUCED. A listener that accepts TCP and then says nothing is
+    /// exactly a handshake stalled on a flaky WAN. Before the fix `connect_async` awaited it forever,
+    /// and `run` never logged or retried for ~12 hours. The outer guard turns a regression into a
+    /// FAILURE instead of a hung test run.
+    #[tokio::test]
+    async fn a_connect_whose_handshake_never_answers_fails_instead_of_hanging() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let holder = tokio::spawn(async move {
+            // Accept, then hold the stream open and silent: TCP is up, the upgrade never comes back.
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+
+        let bound = Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), connect(&format!("ws://{addr}/api/hub/ws"), bound))
+            .await
+            .expect("connect hung past the guard: the handshake has no deadline");
+        let Err(e) = outcome else { panic!("a silent handshake must not count as connected") };
+        assert!(e.starts_with("connect timed out"), "{e}");
+        assert!(started.elapsed() >= bound, "gave up before the bound: {:?}", started.elapsed());
+        holder.abort();
+    }
+
+    #[tokio::test]
+    async fn a_write_that_never_completes_ends_the_connection_with_an_error() {
+        let stuck = std::future::pending::<Result<(), String>>();
+        let e = tokio::time::timeout(Duration::from_secs(5), within(Duration::from_millis(50), "ping write", stuck))
+            .await
+            .expect("within must not hang")
+            .unwrap_err();
+        assert_eq!(e, "ping write timed out after 0.05s");
+        // A future that finishes in time passes its own result and error straight through.
+        assert_eq!(within(Duration::from_secs(1), "x", async { Ok::<_, String>(7) }).await, Ok(7));
+        assert_eq!(within::<(), _>(Duration::from_secs(1), "x", async { Err("reset") }).await, Err("reset".into()));
+    }
+
+    #[tokio::test]
+    async fn a_relayed_call_that_never_returns_is_answered_504_and_does_not_wedge_the_socket() {
+        let a = tokio::time::timeout(
+            Duration::from_secs(5),
+            answer_within(Duration::from_millis(50), std::future::pending::<Answer>()),
+        )
+        .await
+        .expect("a hung call must not hold the socket loop");
+        assert_eq!(a.status, 504);
+        let quick = answer_within(Duration::from_secs(1), async { Answer { status: 200, body: "{}".into() } }).await;
+        assert_eq!(quick.status, 200);
+    }
+
+    #[test]
+    fn a_slow_call_cannot_by_itself_make_a_healthy_socket_look_silent() {
+        // While a call is awaited no ping goes out, so the call bound must end before the silence
+        // limit would; otherwise a slow-but-finite call reconnects a perfectly good socket.
+        assert!(CALL_TIMEOUT < SILENCE_LIMIT);
+        assert!(CONNECT_TIMEOUT > Duration::ZERO && WRITE_TIMEOUT > Duration::ZERO);
     }
 
     #[test]

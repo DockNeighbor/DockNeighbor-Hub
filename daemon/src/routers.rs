@@ -104,6 +104,24 @@ pub struct WanStatus {
     pub up: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
+    /// Seconds the active uplink has been connected, when the router's status API says (a Peplink's
+    /// `status.wan.connection` `uptime`, "Uptime in second" in its Router API documentation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_s: Option<u64>,
+}
+
+/// Does this device have GPS the hub can read? Decided ONLY from what the device itself answered
+/// (owner ruling 2026-09-17: the Balance One on M/V Perseverance has no GPS and was onboarded with
+/// GPS on — never assume a router has GPS). `unknown` is "it did not say": the app defaults GPS off
+/// for it but lets the owner turn it on; `no` refuses GPS on add/edit and stops GPS polling.
+/// On the wire: `gpsSupported: "yes" | "no" | "unknown"`.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GpsSupport {
+    Yes,
+    No,
+    #[default]
+    Unknown,
 }
 
 /// The modem's APN setting: `auto` (the carrier profile the modem picks) or `manual` with a name.
@@ -139,6 +157,10 @@ pub struct Snapshot {
     /// Whether GNSS is switched on in the router's own settings (NCOS System → GPS).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gps_enabled: Option<bool>,
+    /// What the device's own GPS read said about GPS at all (GpsSupport). Kept across polls: once a
+    /// router has said `no`, the poll stops asking it for a position (`poll`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gps_supported: Option<GpsSupport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<FixOut>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -344,7 +366,7 @@ pub fn parse_wan(devices: &Value) -> Option<WanStatus> {
         return None;
     }
     let Some((key, v)) = entries.iter().find(|(_, v)| connected(v)) else {
-        return Some(WanStatus { wan: "none".into(), up: false, ip: None });
+        return Some(WanStatus { wan: "none".into(), up: false, ip: None, uptime_s: None });
     };
     let lower = key.to_ascii_lowercase();
     let wan = if lower.starts_with("mdm") {
@@ -354,7 +376,25 @@ pub fn parse_wan(devices: &Value) -> Option<WanStatus> {
     } else {
         "wired"
     };
-    Some(WanStatus { wan: wan.into(), up: true, ip: ip_of(v) })
+    // No uptime: nothing in the CBA850 capture or the app's NCOS fixtures carries a connection
+    // uptime, and the report does not guess one.
+    Some(WanStatus { wan: wan.into(), up: true, ip: ip_of(v), uptime_s: None })
+}
+
+/// PURE: `/api/status/gps` (the unwrapped `data`) → GpsSupport. A `fix` block — the shape the app's
+/// parseCradlepointGps fixtures pin (gpsSources.test.ts; gps.rs tests): `{fix:{latitude,longitude,…}}`,
+/// decimal or DMS, with or without a lock — is the router's GNSS answering: `yes`.
+///
+/// Never `no`: no NCOS answer from a unit WITHOUT a GNSS module exists in this code, its fixtures or
+/// the CBA850 bench capture, so there is nothing real to recognise one by. Anything else is
+/// `unknown` — the app then defaults GPS off rather than assuming.
+pub fn ncos_gps_support(data: &Value) -> GpsSupport {
+    let fix = data.get("fix").or_else(|| data.get("data").and_then(|d| d.get("fix")));
+    if fix.is_some_and(|f| f.is_object() && (f.get("latitude").is_some() || f.get("lat").is_some())) {
+        GpsSupport::Yes
+    } else {
+        GpsSupport::Unknown
+    }
 }
 
 /// `/api/config/wan/rules2` → the index of the rule that actually carries the modem's APN, and that
@@ -470,15 +510,45 @@ pub fn dish_params(d: &DishStatus, wan: &WanStatus, probe: Option<&Probe>) -> Ve
     p
 }
 
+/// The `modem.measurement` params for a router with NO modem and NO dish — a wired Peplink (a
+/// Balance on marina Ethernet) or a Cradlepoint on a wired uplink. Only the vendor-blind names the
+/// app's parseCachedModem reads (`up`, `wan`, `uptime` — its uptimeS) plus identity (`ip`, `model`,
+/// `fw`, `av`). Up/down statistics are all a router without a modem or GPS has to give (owner
+/// ruling 2026-09-17); `uptime` rides along only when the router's status API reported it. No `sim`,
+/// `rssi`, `sinr`, `dataMb` or any other cellular field: there is no modem, and inventing one would
+/// read as a broken modem ("No SIM") on the card.
+pub fn wan_params(wan: &WanStatus, probe: Option<&Probe>) -> Vec<(String, String)> {
+    let mut p: Vec<(String, String)> = vec![("up".into(), if wan.up { "1" } else { "0" }.into()), ("wan".into(), wan.wan.clone())];
+    let mut push = |k: &str, v: Option<String>| {
+        if let Some(v) = v {
+            p.push((k.to_string(), v));
+        }
+    };
+    push("ip", wan.ip.clone());
+    push("uptime", wan.uptime_s.map(|s| s.to_string()));
+    push("model", probe.and_then(|p| p.model.clone()));
+    push("fw", probe.and_then(|p| p.firmware.clone()));
+    push("av", Some(format!("hub-{}", env!("CARGO_PKG_VERSION"))));
+    p
+}
+
 /// What the poll loop reports for a snapshot, whichever vendor filled it: a modem's params, a
-/// dish's params, or nothing (a read that learned neither reports nothing — never an empty
-/// measurement that would look like a router with no modem).
+/// dish's params, a WAN-only report, or nothing (a read that learned no modem, no dish and no WAN
+/// reports nothing — never an empty measurement that would look like a router with no modem).
+///
+/// 🔴 THE WAN-ONLY ARM WAS MISSING until 0.3.51. CENTRAL's wired Peplink (no modem, no dish) polled
+/// fine and reachable for weeks, but this returned None, so the poll loop never set router_latest,
+/// never spooled an event and the keyframe never carried it — the app's card sat on "Waiting for its
+/// first report…" forever.
 pub fn report_params(snap: &Snapshot, wan_kb_delta: Option<u64>) -> Option<Vec<(String, String)>> {
     if let Some(m) = &snap.modem {
         return Some(modem_params(m, snap.wan.as_ref(), snap.probe.as_ref(), wan_kb_delta));
     }
     if let (Some(d), Some(w)) = (&snap.dish, &snap.wan) {
         return Some(dish_params(d, w, snap.probe.as_ref()));
+    }
+    if let Some(w) = &snap.wan {
+        return Some(wan_params(w, snap.probe.as_ref()));
     }
     None
 }
@@ -568,8 +638,12 @@ impl<'a> Ncos<'a> {
 
     /// `Ok(None)` = reachable, no lock yet.
     pub async fn gps_fix(&self) -> Result<Option<GpsFix>, String> {
-        let d = self.get("/api/status/gps").await?;
-        Ok(parse_cradlepoint_gps(&d))
+        Ok(parse_cradlepoint_gps(&self.gps_status().await?))
+    }
+
+    /// The raw `/api/status/gps` tree — the fix and the capability (ncos_gps_support) both read it.
+    pub async fn gps_status(&self) -> Result<Value, String> {
+        self.get("/api/status/gps").await
     }
 
     pub async fn gps_enabled(&self) -> Result<bool, String> {
@@ -640,10 +714,12 @@ pub(crate) fn reachability(e: reqwest::Error) -> String {
 
 /// What one read of a router's GPS side learned: `enabled` is the router's own report (NCOS's
 /// System → GPS switch; a Peplink's `gps` flag — whether the unit has GPS at all), `fix` the lock.
+/// `supported` is what that read said about GPS at all (GpsSupport), None when no read was made.
 #[derive(Debug, Default)]
 pub struct GpsRead {
     pub enabled: Option<bool>,
     pub fix: Option<GpsFix>,
+    pub supported: Option<GpsSupport>,
 }
 
 /// One read of a device's status side — what `poll` and `probe` fill the Snapshot from. A router
@@ -771,19 +847,34 @@ impl<'a> Driver<'a> {
     /// without GPS, not a failed poll.
     pub async fn gps(&self, want_fix: bool) -> GpsRead {
         match self {
-            Driver::Cradlepoint(n) => GpsRead {
-                enabled: n.gps_enabled().await.ok(),
-                fix: if want_fix { n.gps_fix().await.ok().flatten() } else { None },
-            },
+            Driver::Cradlepoint(n) => {
+                let enabled = n.gps_enabled().await.ok();
+                if !want_fix {
+                    return GpsRead { enabled, ..Default::default() };
+                }
+                match n.gps_status().await {
+                    Ok(d) => GpsRead { enabled, fix: parse_cradlepoint_gps(&d), supported: Some(ncos_gps_support(&d)) },
+                    Err(_) => GpsRead { enabled, fix: None, supported: Some(GpsSupport::Unknown) },
+                }
+            }
             // No router-side switch to read; the `gps` flag arrives with the location, so one
             // request answers both — and none is made when the owner did not ask.
             Driver::Peplink(p) => {
                 if !want_fix {
                     return GpsRead::default();
                 }
-                match p.location().await {
-                    Ok((enabled, fix)) => GpsRead { enabled, fix },
-                    Err(_) => GpsRead::default(),
+                match p.location_envelope().await {
+                    Ok(body) => {
+                        let supported = crate::peplink::gps_support(&body);
+                        match crate::peplink::peplink_response(&body) {
+                            Ok(_) => {
+                                let (enabled, fix) = crate::peplink::parse_location(&body);
+                                GpsRead { enabled, fix, supported: Some(supported) }
+                            }
+                            Err(_) => GpsRead { enabled: None, fix: None, supported: Some(supported) },
+                        }
+                    }
+                    Err(_) => GpsRead { supported: Some(GpsSupport::Unknown), ..Default::default() },
                 }
             }
             // There is no switch to read — Starlink's plan policy decides (starlink.rs header) —
@@ -793,8 +884,8 @@ impl<'a> Driver<'a> {
                     return GpsRead::default();
                 }
                 match s.location().await {
-                    Ok(fix) => GpsRead { enabled: Some(true), fix },
-                    Err(_) => GpsRead { enabled: Some(false), fix: None },
+                    Ok(fix) => GpsRead { enabled: Some(true), fix, supported: Some(GpsSupport::Yes) },
+                    Err(why) => GpsRead { enabled: Some(false), fix: None, supported: Some(crate::starlink::gps_support_of_refusal(&why)) },
                 }
             }
         }
@@ -846,6 +937,22 @@ fn unsupported(vendor: &str, what: &str) -> String {
     format!("{what} is not supported on a {vendor} through the hub — use the device's own app or admin pages")
 }
 
+/// PURE: does the poll ask this router for a position? Only when the owner turned its GPS on AND the
+/// router has not said it has none. `unknown` keeps asking — today's behaviour.
+pub fn gps_polling(cfg: &RouterConfig, prev: Option<&Snapshot>) -> bool {
+    cfg.gps_enabled && prev.and_then(|p| p.gps_supported) != Some(GpsSupport::No)
+}
+
+/// PURE: the one log line for a router whose GPS is on in the config but which says it has none —
+/// Some exactly when this read LEARNED it (the previous snapshot did not already say `no`), so a
+/// router logs it once, not once per poll.
+pub fn gps_unsupported_note(cfg: &RouterConfig, prev: Option<&Snapshot>, now: &Snapshot) -> Option<String> {
+    let learned = now.gps_supported == Some(GpsSupport::No) && prev.and_then(|p| p.gps_supported) != Some(GpsSupport::No);
+    (cfg.gps_enabled && learned).then(|| {
+        format!("routers: {} '{}' - GPS is not supported by this router; GPS polling off", cfg.host, cfg.name)
+    })
+}
+
 /// One full read of a device — the poll loop's unit of work and the `refresh` action.
 pub async fn poll(client: &reqwest::Client, cfg: &RouterConfig, prev: Option<&Snapshot>) -> Snapshot {
     let now = crate::hub_server::now_ms();
@@ -871,8 +978,14 @@ pub async fn poll(client: &reqwest::Client, cfg: &RouterConfig, prev: Option<&Sn
     if snap.probe.is_none() {
         snap.probe = drv.probe().await.ok();
     }
-    let gps = drv.gps(cfg.gps_enabled).await;
+    // A router that has said it has no GPS is not asked for a position again (owner ruling
+    // 2026-09-17). The stored gps_enabled is left as it is — the app and the owner decide that;
+    // `gps_polling` is what the poll does about it.
+    let gps = drv.gps(gps_polling(cfg, prev)).await;
     snap.gps_enabled = gps.enabled;
+    if let Some(s) = gps.supported {
+        snap.gps_supported = Some(s);
+    }
     snap.fix = gps.fix.as_ref().map(FixOut::from);
     snap.error = None;
     snap.ok_at_ms = Some(now);
@@ -1133,6 +1246,66 @@ mod tests {
 }
 
 #[cfg(test)]
+mod wired_report_tests {
+    use super::*;
+
+    fn get<'a>(params: &'a [(String, String)], k: &str) -> Option<&'a str> {
+        params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+    }
+
+    fn wired(up: bool) -> Snapshot {
+        Snapshot {
+            probe: Some(Probe { model: Some("Balance 20X".into()), firmware: Some("8.5.1".into()), ..Default::default() }),
+            wan: Some(WanStatus { wan: "wired".into(), up, ip: Some("10.1.2.3".into()), uptime_s: None }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_wired_router_with_no_modem_and_no_dish_still_reports() {
+        // CENTRAL's Peplink: reachable, polled, and until 0.3.51 NEVER reported.
+        let params = report_params(&wired(true), None).expect("a wired router must produce a report");
+        assert_eq!(get(&params, "up"), Some("1"));
+        assert_eq!(get(&params, "wan"), Some("wired"));
+        assert_eq!(get(&params, "ip"), Some("10.1.2.3"));
+        assert_eq!(get(&params, "model"), Some("Balance 20X"));
+        assert_eq!(get(&params, "fw"), Some("8.5.1"));
+        assert_eq!(get(&params, "av"), Some(format!("hub-{}", env!("CARGO_PKG_VERSION")).as_str()));
+        // Nothing cellular, and nothing a dish says: the report is exactly these six names.
+        let mut names: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["av", "fw", "ip", "model", "up", "wan"]);
+        assert_eq!(get(&report_params(&wired(false), None).unwrap(), "up"), Some("0"));
+    }
+
+    #[test]
+    fn a_modem_or_a_dish_still_wins_over_the_wan_only_report() {
+        let modem = ModemStatus { sim: "ok".into(), rssi: Some(-70.0), connected: Some(true), ..Default::default() };
+        let snap = Snapshot { modem: Some(modem.clone()), ..wired(true) };
+        assert_eq!(
+            report_params(&snap, Some(12)),
+            Some(modem_params(&modem, snap.wan.as_ref(), snap.probe.as_ref(), Some(12)))
+        );
+        let dish = DishStatus { obstruction_pct: Some(0.2), ..Default::default() };
+        let snap = Snapshot { dish: Some(dish.clone()), ..wired(true) };
+        assert_eq!(report_params(&snap, None), Some(dish_params(&dish, snap.wan.as_ref().unwrap(), snap.probe.as_ref())));
+        // A dish with no WAN read still reports nothing, as before.
+        assert!(report_params(&Snapshot { dish: Some(dish), ..Default::default() }, None).is_none());
+    }
+
+    #[test]
+    fn a_wired_uplink_going_down_is_an_event() {
+        let up = report_params(&wired(true), None).unwrap();
+        let down = report_params(&wired(false), None).unwrap();
+        let baseline = crate::cadence::RouterSent::from_params(&up);
+        assert!(!crate::cadence::router_is_event(None, &up), "the first read is a baseline, not an event");
+        assert!(!crate::cadence::router_is_event(Some(&baseline), &up));
+        assert!(crate::cadence::router_is_event(Some(&baseline), &down));
+        assert!(crate::cadence::router_is_event(Some(&crate::cadence::RouterSent::from_params(&down)), &up));
+    }
+}
+
+#[cfg(test)]
 mod read_tests {
     use super::*;
     use serde_json::json;
@@ -1180,5 +1353,135 @@ mod read_tests {
         assert!(o.contains("apn_mode") && o.contains("invalid choice"), "{o}");
         let bare = ncos_data(&json!({"success": false})).unwrap_err();
         assert_eq!(bare, "the router refused the request");
+    }
+}
+
+#[cfg(test)]
+mod gps_capability_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Cradlepoint: the unwrapped `/api/status/gps` data in the shapes the app's parseCradlepointGps
+    /// fixtures pin (gps.rs tests: decimal with accuracy, DMS). A fix block is the GNSS answering.
+    #[test]
+    fn a_cradlepoint_is_yes_only_when_its_gps_tree_carries_a_fix_block() {
+        let decimal = json!({ "fix": { "latitude": 41.4086, "longitude": -81.7494, "accuracy": 12.5 } });
+        let dms = json!({ "fix": { "latitude": { "degree": 41, "minute": 24, "second": 30.0 }, "longitude": { "degree": -81, "minute": 44, "second": 57.8 } } });
+        let no_lock = json!({ "fix": { "latitude": 0, "longitude": 0 } });
+        assert_eq!(ncos_gps_support(&decimal), GpsSupport::Yes);
+        assert_eq!(ncos_gps_support(&dms), GpsSupport::Yes);
+        assert_eq!(ncos_gps_support(&no_lock), GpsSupport::Yes, "a fix block with no lock is still a GNSS answering");
+        // The envelope-wrapped form the app fixtures also carry.
+        assert_eq!(ncos_gps_support(&json!({ "data": { "fix": { "latitude": 41.4, "longitude": -81.7 } } })), GpsSupport::Yes);
+        // Nothing real says what a GNSS-less NCOS unit answers — never `no`, never a guess.
+        assert_eq!(ncos_gps_support(&json!({})), GpsSupport::Unknown);
+        assert_eq!(ncos_gps_support(&Value::Null), GpsSupport::Unknown);
+    }
+
+    fn cfg(gps_enabled: bool) -> RouterConfig {
+        RouterConfig { host: "172.31.0.1".into(), name: "Balance One".into(), vendor: "peplink".into(), gps_enabled, ..Default::default() }
+    }
+    fn said(s: Option<GpsSupport>) -> Snapshot {
+        Snapshot { gps_supported: s, ..Default::default() }
+    }
+
+    #[test]
+    fn a_router_that_said_no_is_not_polled_for_gps_and_unknown_keeps_todays_behaviour() {
+        assert!(gps_polling(&cfg(true), None), "first poll: nothing known yet, ask");
+        assert!(gps_polling(&cfg(true), Some(&said(Some(GpsSupport::Unknown)))));
+        assert!(gps_polling(&cfg(true), Some(&said(Some(GpsSupport::Yes)))));
+        assert!(!gps_polling(&cfg(true), Some(&said(Some(GpsSupport::No)))));
+        assert!(!gps_polling(&cfg(false), None), "GPS off in the config is never polled");
+    }
+
+    #[test]
+    fn the_gps_unsupported_line_is_logged_once_when_learned() {
+        let line = "routers: 172.31.0.1 'Balance One' - GPS is not supported by this router; GPS polling off";
+        let no = said(Some(GpsSupport::No));
+        assert_eq!(gps_unsupported_note(&cfg(true), None, &no).as_deref(), Some(line));
+        assert_eq!(gps_unsupported_note(&cfg(true), Some(&said(Some(GpsSupport::Unknown))), &no).as_deref(), Some(line));
+        // The next poll carries `no` forward — silent.
+        assert_eq!(gps_unsupported_note(&cfg(true), Some(&no), &no), None);
+        // GPS off in the config: nothing to say. Unknown/yes: nothing to say.
+        assert_eq!(gps_unsupported_note(&cfg(false), None, &no), None);
+        assert_eq!(gps_unsupported_note(&cfg(true), None, &said(Some(GpsSupport::Unknown))), None);
+    }
+
+    /// The whole loop unit against the mock dish (PERMISSION_DENIED on get_location — MVP's Mini,
+    /// bench 2026-09-13): the first poll asks and learns `no`, the second does not ask at all
+    /// (a skipped read reports no `gpsEnabled` from the device), and the stored config is untouched.
+    #[tokio::test]
+    async fn a_poll_stops_asking_a_router_that_said_no() {
+        let port = crate::starlink::tests::mock_dish(false).await;
+        let cfg = RouterConfig { vendor: "starlink".into(), host: "127.0.0.1".into(), name: "Dish".into(), port, gps_enabled: true, ..Default::default() };
+        let client = lan_client();
+        let first = poll(&client, &cfg, None).await;
+        assert_eq!(first.gps_supported, Some(GpsSupport::No));
+        assert_eq!(first.gps_enabled, Some(false), "the first poll asked the dish");
+        assert!(gps_unsupported_note(&cfg, None, &first).is_some());
+        let second = poll(&client, &cfg, Some(&first)).await;
+        assert_eq!(second.gps_supported, Some(GpsSupport::No), "`no` is carried forward");
+        assert_eq!(second.gps_enabled, None, "the second poll did not ask the dish for a position");
+        assert!(gps_unsupported_note(&cfg, Some(&first), &second).is_none());
+        assert!(cfg.gps_enabled, "the config is not rewritten");
+        // A dish that shares its position is `yes`, and stays polled.
+        let port = crate::starlink::tests::mock_dish(true).await;
+        let ok = RouterConfig { port, ..cfg.clone() };
+        let snap = poll(&client, &ok, None).await;
+        assert_eq!((snap.gps_supported, snap.fix.is_some()), (Some(GpsSupport::Yes), true));
+        assert!(gps_polling(&ok, Some(&snap)));
+    }
+
+    #[test]
+    fn a_starlink_refusal_is_no_only_for_the_location_policy() {
+        assert_eq!(crate::starlink::gps_support_of_refusal(&crate::starlink::grpc_error(7, "Failed to get location: Disabled due to policy")), GpsSupport::No);
+        assert_eq!(crate::starlink::gps_support_of_refusal(&crate::starlink::grpc_error(14, "")), GpsSupport::Unknown);
+        assert_eq!(crate::starlink::gps_support_of_refusal("the dish refused the connection at that address"), GpsSupport::Unknown);
+    }
+
+    #[test]
+    fn gps_supported_is_on_the_wire_as_lowercase_words() {
+        assert_eq!(serde_json::to_value(GpsSupport::Yes).unwrap(), json!("yes"));
+        assert_eq!(serde_json::to_value(GpsSupport::No).unwrap(), json!("no"));
+        assert_eq!(serde_json::to_value(GpsSupport::Unknown).unwrap(), json!("unknown"));
+        assert_eq!(serde_json::to_value(said(Some(GpsSupport::No))).unwrap()["gpsSupported"], json!("no"));
+    }
+
+    /// A wired Peplink's report, from the Router API documentation's own `status.wan.connection`
+    /// example (fw 8.0.1–8.5.2, verbatim): WAN 1 connected with `uptime` 27037017, WAN2 "No Cable
+    /// Detected" with an uptime of its own that is NOT a connection uptime.
+    #[test]
+    fn a_wired_peplink_report_carries_up_wan_and_uptime() {
+        let body = json!({
+            "stat": "ok",
+            "response": {
+                "1": { "name": "CUST WAN 1", "enable": true, "asLan": false, "message": "Connected", "uptime": 27037017,
+                       "type": "ethernet", "virtualType": "ethernet", "priority": 0, "ip": "192.168.123.144", "statusLed": "green",
+                       "mask": 24, "gateway": "12.23.34.0", "method": "dhcp", "mode": "NAT", "dns": ["12.22.32.12", "12.34.67.89"], "mtu": 576 },
+                "2": { "name": "WAN2", "enable": true, "asLan": false, "message": "No Cable Detected", "uptime": 27066417,
+                       "type": "ethernet", "virtualType": "ethernet", "priority": 0, "statusLed": "red", "method": "static",
+                       "mode": "IP Forwarding", "mtu": 1440 },
+                "order": [1, 2]
+            }
+        });
+        let snap = Snapshot {
+            modem: crate::peplink::parse_modem(&body),
+            wan: crate::peplink::parse_wan(&body),
+            probe: Some(Probe { firmware: Some("8.5.5 build 5824".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert!(snap.modem.is_none(), "a Balance One has no modem");
+        let params = report_params(&snap, None).expect("a wired Peplink reports");
+        let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!((get("up"), get("wan"), get("uptime")), (Some("1"), Some("wired"), Some("27037017")));
+        assert_eq!(get("ip"), Some("192.168.123.144"));
+        let mut names: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["av", "fw", "ip", "up", "uptime", "wan"]);
+        // Nothing up: no connection uptime is reported, whatever the entries carry.
+        let down = json!({ "stat": "ok", "response": { "2": body["response"]["2"].clone(), "order": [2] } });
+        let w = crate::peplink::parse_wan(&down).unwrap();
+        assert_eq!((w.up, w.uptime_s), (false, None));
+        assert_eq!(wan_params(&w, None).iter().find(|(k, _)| k == "uptime"), None);
     }
 }
