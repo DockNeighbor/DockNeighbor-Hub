@@ -623,6 +623,9 @@ struct RouterStatus {
     agent_enrolled: bool,
     gps_enabled: bool,
     gps_dev_id: String,
+    /// Whether the router itself reported having GPS (routers::GpsSupport) — `unknown` until a GPS
+    /// read has said. With `no`, GPS polling is off whatever `gpsEnabled` says.
+    gps_supported: crate::routers::GpsSupport,
     poll_secs: u64,
     enabled: bool,
     /// What the hub can do for this vendor (routers::capabilities) — the app gates its panel on
@@ -646,6 +649,7 @@ fn router_status(r: &hub_config::RouterConfig, state: Option<&crate::routers::Sn
         agent_enrolled: !r.agent_token.is_empty(),
         gps_enabled: r.gps_enabled,
         gps_dev_id: r.gps_dev_id.clone(),
+        gps_supported: state.and_then(|s| s.gps_supported).unwrap_or_default(),
         poll_secs: crate::routers::poll_secs(r),
         enabled: r.enabled,
         state: state.cloned(),
@@ -3450,7 +3454,19 @@ struct ProbeBody {
     gps_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fix: Option<crate::routers::FixOut>,
+    /// `yes` | `no` | `unknown` — whether the router reported GPS (routers::GpsSupport). The app
+    /// offers a router's GPS only on `yes`, defaults it off on `unknown`, and hides it on `no`.
+    gps_supported: crate::routers::GpsSupport,
     capabilities: &'static [&'static str],
+}
+
+/// The refusal for turning GPS on for a router that said it has none (owner ruling 2026-09-17).
+pub(crate) const GPS_UNSUPPORTED: &str = "this router reports that it has no GPS, so GPS cannot be turned on for it";
+
+/// PURE: may GPS be switched ON for a router whose GPS read said `supported`? Only `no` refuses —
+/// `unknown` keeps today's behaviour (the app defaults it off).
+pub(crate) fn gps_on_refusal(want_on: bool, supported: Option<crate::routers::GpsSupport>) -> Option<&'static str> {
+    (want_on && supported == Some(crate::routers::GpsSupport::No)).then_some(GPS_UNSUPPORTED)
 }
 
 /// Everything about a managed router, in one door. Owner/co-owner for anything that signs in with
@@ -3505,6 +3521,7 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                 dish: status.dish,
                 gps_enabled: gps.enabled,
                 fix: gps.fix.as_ref().map(crate::routers::FixOut::from),
+                gps_supported: gps.supported.unwrap_or_default(),
                 capabilities: crate::routers::capabilities(&vendor),
             })
         }
@@ -3584,6 +3601,13 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             if r.name.is_empty() {
                 r.name = probe.model.clone().unwrap_or_else(|| "Router".into());
             }
+            // Ask the router whether it has GPS at all. A request to turn GPS ON for one that says
+            // `no` is refused and nothing is stored. A stored `gpsEnabled` the request does not
+            // mention is left alone (the poll stops asking such a router for a position).
+            let gps_supported = drv.gps(true).await.supported.unwrap_or_default();
+            if let Some(why) = gps_on_refusal(req.gps_enabled == Some(true), Some(gps_supported)) {
+                return err(422, why);
+            }
             // Configure the router's end of GPS too (where the vendor has one — a Peplink does
             // not, and this is a no-op for it). Best-effort: some units/carriers have no GNSS,
             // and a router that cannot be told is still worth managing — the snapshot's
@@ -3611,7 +3635,12 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                 if r.gps_enabled { "on" } else { "off" }
             );
             // Seed the snapshot with the identity we just read, then read the rest now.
-            rt.router_state.write().await.entry(id.clone()).or_default().probe = Some(probe);
+            {
+                let mut states = rt.router_state.write().await;
+                let seed = states.entry(id.clone()).or_default();
+                seed.probe = Some(probe);
+                seed.gps_supported = Some(gps_supported);
+            }
             rt.router_wake.notify_one();
             let states = rt.router_state.read().await;
             ok_json(&router_status(&r, states.get(&id)))
@@ -3687,6 +3716,15 @@ async fn do_routers(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
                     let dev = req.gps_dev_id.map(|d| d.trim().to_string()).unwrap_or(r.gps_dev_id.clone());
                     if on && dev.is_empty() {
                         return err(422, "gpsDevId (the brv_gps_… record) is required when gpsEnabled");
+                    }
+                    if on {
+                        let supported = drv.gps(true).await.supported;
+                        if let Some(s) = supported {
+                            rt.router_state.write().await.entry(id.clone()).or_default().gps_supported = Some(s);
+                        }
+                        if let Some(why) = gps_on_refusal(on, supported) {
+                            return err(422, why);
+                        }
                     }
                     if let Err(why) = drv.set_gps_enabled(on).await {
                         return err(502, &why);
@@ -3969,11 +4007,14 @@ async fn router_poll_loop(rt: Shared) {
         let is_leased = leased(&rt);
         for r in cfg.routers.iter().filter(|r| r.enabled && !r.host.is_empty()) {
             let idle = crate::routers::poll_secs(r);
-            let gps_fast = r.gps_enabled && !r.gps_dev_id.is_empty() && {
+            let prev = rt.router_state.read().await.get(&r.id).cloned();
+            // GPS on in the config, but only sampled while the router has not said it has none.
+            let gps_live = crate::routers::gps_polling(r, prev.as_ref()) && !r.gps_dev_id.is_empty();
+            let gps_fast = gps_live && {
                 let t = rt.telemetry.lock().await;
                 t.watch.as_ref().is_some_and(|w| w.anchor.is_some()) || t.geofences.get(&r.gps_dev_id).is_some_and(|g| g.wants_fast_sampling())
             };
-            let secs = if r.gps_enabled && !r.gps_dev_id.is_empty() {
+            let secs = if gps_live {
                 geofence::sample_secs(gps_fast, is_leased, lan_live(&rt), false, idle)
             } else if is_leased {
                 idle.min(crate::routers::POLL_FLOOR_SECS)
@@ -3984,9 +4025,11 @@ async fn router_poll_loop(rt: Shared) {
             if last_report_ms.get(&r.id).map_or(false, |t| now - t < due_ms) {
                 continue;
             }
-            let prev = rt.router_state.read().await.get(&r.id).cloned();
             let snap = crate::routers::poll(&client, r, prev.as_ref()).await;
             last_report_ms.insert(r.id.clone(), now);
+            if let Some(note) = crate::routers::gps_unsupported_note(r, prev.as_ref(), &snap) {
+                crate::hlog!("{note}");
+            }
             match &snap.error {
                 Some(why) => {
                     if last_error.get(&r.id) != Some(why) {
@@ -4246,6 +4289,76 @@ mod tests {
         let app = router(rt.clone()).into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), rt)
+    }
+
+    /// Owner ruling 2026-09-17: GPS is never turned on for a router that says it has none. The mock
+    /// dish answers get_location PERMISSION_DENIED (MVP's Mini, bench 2026-09-13) — the router
+    /// saying `no`. Probe reports it; add and the gps switch refuse ON with 422 and store nothing;
+    /// add with GPS off succeeds and says `no`; a stored gpsEnabled the edit does not mention stays.
+    #[tokio::test]
+    async fn gps_is_refused_for_a_router_that_reports_none() {
+        let port = crate::starlink::tests::mock_dish(false).await;
+        let base = temp_base("routers_gps_no");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base.clone(), "https://unused.example".into());
+        let owner = Caller { uid: "u1".into(), role: "owner".into() };
+        let call = |body: serde_json::Value| {
+            let rt = rt.clone();
+            let owner = owner.clone();
+            async move {
+                let a = dispatch(&rt, &owner, "POST", "/api/hub/routers", body.to_string().as_bytes()).await;
+                (a.status, serde_json::from_str::<serde_json::Value>(&a.body).unwrap_or_default())
+            }
+        };
+
+        let (st, v) = call(serde_json::json!({ "action": "probe", "vendor": "starlink", "host": "127.0.0.1", "port": port })).await;
+        assert_eq!((st, v["gpsSupported"].as_str()), (200, Some("no")), "{v}");
+
+        let add = |gps: bool| serde_json::json!({ "action": "add", "id": "brv_net_dish", "vendor": "starlink", "host": "127.0.0.1",
+            "port": port, "gpsEnabled": gps, "gpsDevId": "brv_gps_dish" });
+        let (st, v) = call(add(true)).await;
+        assert_eq!(st, 422, "{v}");
+        assert_eq!(v["error"].as_str(), Some(GPS_UNSUPPORTED), "{v}");
+        assert!(hub_config::read_config_in(&base).routers.is_empty(), "a refused add stores nothing");
+
+        let (st, v) = call(add(false)).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!((v["gpsEnabled"].as_bool(), v["gpsSupported"].as_str()), (Some(false), Some("no")), "{v}");
+
+        let (st, v) = call(serde_json::json!({ "action": "gps", "id": "brv_net_dish", "gpsEnabled": true, "gpsDevId": "brv_gps_dish" })).await;
+        assert_eq!((st, v["error"].as_str()), (422, Some(GPS_UNSUPPORTED)), "{v}");
+        assert!(!hub_config::read_config_in(&base).routers[0].gps_enabled, "the refused switch changed nothing");
+        // Switching it OFF is always allowed.
+        let (st, _) = call(serde_json::json!({ "action": "gps", "id": "brv_net_dish", "gpsEnabled": false })).await;
+        assert_eq!(st, 200);
+
+        // An existing config with GPS on (CENTRAL's shape): an edit that does not mention GPS is not
+        // refused and does not rewrite gpsEnabled — the poll stops asking instead.
+        {
+            let mut cfg = hub_config::read_config_in(&base);
+            cfg.routers[0].gps_enabled = true;
+            cfg.routers[0].gps_dev_id = "brv_gps_dish".into();
+            hub_config::write_config_in(&base, &cfg).unwrap();
+        }
+        let (st, v) = call(serde_json::json!({ "action": "add", "id": "brv_net_dish", "name": "Renamed" })).await;
+        assert_eq!(st, 200, "{v}");
+        assert_eq!((v["gpsEnabled"].as_bool(), v["gpsSupported"].as_str()), (Some(true), Some("no")), "{v}");
+
+        // A dish that shares its position: yes, and GPS turns on.
+        let port_ok = crate::starlink::tests::mock_dish(true).await;
+        let (st, v) = call(serde_json::json!({ "action": "add", "id": "brv_net_dish2", "vendor": "starlink", "host": "127.0.0.1",
+            "port": port_ok, "gpsEnabled": true, "gpsDevId": "brv_gps_dish2" })).await;
+        assert_eq!((st, v["gpsEnabled"].as_bool(), v["gpsSupported"].as_str()), (200, Some(true), Some("yes")), "{v}");
+    }
+
+    #[test]
+    fn only_a_no_refuses_gps_on() {
+        use crate::routers::GpsSupport;
+        assert_eq!(gps_on_refusal(true, Some(GpsSupport::No)), Some(GPS_UNSUPPORTED));
+        assert_eq!(gps_on_refusal(true, Some(GpsSupport::Unknown)), None);
+        assert_eq!(gps_on_refusal(true, Some(GpsSupport::Yes)), None);
+        assert_eq!(gps_on_refusal(true, None), None);
+        assert_eq!(gps_on_refusal(false, Some(GpsSupport::No)), None, "turning GPS off is never refused");
     }
 
     #[test]

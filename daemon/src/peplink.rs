@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 
 use crate::gps::{parse_peplink_gps, GpsFix};
 use crate::hub_config::RouterConfig;
-use crate::routers::{as_f64, reachability, str_of, ModemStatus, Probe, WanStatus};
+use crate::routers::{as_f64, reachability, str_of, GpsSupport, ModemStatus, Probe, WanStatus};
 
 /// PURE: the base URL. Peplink admin is https by default (self-signed); http only on :80. Port 0
 /// means "unset" and is 443 — the same rule as the app's peplinkBase.
@@ -132,7 +132,7 @@ pub fn parse_wan(body: &Value) -> Option<WanStatus> {
         return None;
     }
     let Some(w) = entries.iter().copied().find(|w| is_up(w)) else {
-        return Some(WanStatus { wan: "none".into(), up: false, ip: None });
+        return Some(WanStatus { wan: "none".into(), up: false, ip: None, uptime_s: None });
     };
     let t = w.get("type").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
     let wan = if t.contains("cellular") || t.contains("modem") {
@@ -142,7 +142,11 @@ pub fn parse_wan(body: &Value) -> Option<WanStatus> {
     } else {
         "wired"
     };
-    Some(WanStatus { wan: wan.into(), up: true, ip: str_of(w.get("ip")) })
+    // `uptime` is "Uptime in second" in the Router API documentation (fw 8.0.1–8.5.2, WAN_Status_Obj).
+    // It is taken from the CONNECTED entry only: the documented example gives a disconnected WAN
+    // ("No Cable Detected") an uptime too, which is not a connection uptime.
+    let uptime_s = w.get("uptime").and_then(as_f64).filter(|n| *n >= 0.0).map(|n| n as u64);
+    Some(WanStatus { wan: wan.into(), up: true, ip: str_of(w.get("ip")), uptime_s })
 }
 
 /// Cellular detail from the same payload — Peplink nests it under `cellular`. None on a model
@@ -183,6 +187,22 @@ pub fn parse_modem(body: &Value) -> Option<ModemStatus> {
 pub fn parse_location(body: &Value) -> (Option<bool>, Option<GpsFix>) {
     let gps = payload(body).and_then(|r| r.get("gps")).and_then(|v| v.as_bool());
     (gps, parse_peplink_gps(body))
+}
+
+/// PURE: the raw `GET /api/info.location` body → does this unit have GPS? From the Router API
+/// documentation, nothing else:
+///   * fw 8.0.1: "The API will return fail when the device is not support GPS module." → a
+///     `stat:'fail'` answer (not the sign-in failure, which the transport handles first) is `no`.
+///   * every version: `gps` is "The GPS signal is valid or not", beside a `location` object → a
+///     usable fix (the documented example: `gps:true` with its `location`) is `yes`.
+///   * `gps:false` with no usable fix is a unit with GPS and no lock OR one without the module —
+///     the documentation does not tell them apart, so it is `unknown`, never a guess either way.
+pub fn gps_support(body: &Value) -> GpsSupport {
+    match body.get("stat").and_then(|s| s.as_str()) {
+        Some("fail") if !session_expired(body) => GpsSupport::No,
+        Some("ok") if parse_peplink_gps(body).is_some() => GpsSupport::Yes,
+        _ => GpsSupport::Unknown,
+    }
 }
 
 // --- Transport ------------------------------------------------------------------------------------
@@ -283,6 +303,14 @@ impl<'a> Peplink<'a> {
     /// GET a status path; returns the unwrapped `response`. Signs in first when there is no
     /// session yet, and once more when the router says the session is gone.
     pub async fn get(&self, path: &str) -> Result<Value, String> {
+        let body = self.get_envelope(path).await?;
+        peplink_response(&body).cloned()
+    }
+
+    /// GET a path and return the WHOLE envelope — `stat:'fail'` included — once signed in. `Err` is
+    /// transport or sign-in only, so a caller can tell "the router refused this API" from "the
+    /// router could not be asked" (gps_support needs exactly that).
+    pub async fn get_envelope(&self, path: &str) -> Result<Value, String> {
         if self.cookie.lock().await.is_none() {
             self.login().await?;
         }
@@ -296,7 +324,7 @@ impl<'a> Peplink<'a> {
                 }
             }
         };
-        peplink_response(&body).cloned()
+        Ok(body)
     }
 
     /// Prove the sign-in and read identity.
@@ -328,9 +356,10 @@ impl<'a> Peplink<'a> {
         self.get("/api/status.wan.connection").await
     }
 
-    /// `(gps reported?, fix)`; `Ok((_, None))` = reachable, no lock (or no GPS hardware).
-    pub async fn location(&self) -> Result<(Option<bool>, Option<GpsFix>), String> {
-        Ok(parse_location(&self.get("/api/info.location").await?))
+    /// The raw `info.location` envelope — parse_location reads the fix from it, gps_support the
+    /// capability.
+    pub async fn location_envelope(&self) -> Result<Value, String> {
+        self.get_envelope("/api/info.location").await
     }
 }
 
@@ -377,7 +406,7 @@ mod tests {
     #[test]
     fn wan_picks_the_active_uplink_and_classifies_it() {
         let w = parse_wan(&json!({ "stat": "ok", "response": { "1": wired(), "2": down_cell(), "order": [1, 2] } })).unwrap();
-        assert_eq!(w, WanStatus { wan: "wired".into(), up: true, ip: Some("10.0.0.5".into()) });
+        assert_eq!(w, WanStatus { wan: "wired".into(), up: true, ip: Some("10.0.0.5".into()), uptime_s: None });
     }
 
     #[test]
@@ -390,7 +419,7 @@ mod tests {
 
     #[test]
     fn wan_reports_none_when_nothing_is_up_and_nothing_without_a_map() {
-        assert_eq!(parse_wan(&json!({ "response": { "1": down_cell() } })).unwrap(), WanStatus { wan: "none".into(), up: false, ip: None });
+        assert_eq!(parse_wan(&json!({ "response": { "1": down_cell() } })).unwrap(), WanStatus { wan: "none".into(), up: false, ip: None, uptime_s: None });
         assert!(parse_wan(&json!({ "response": {} })).is_none());
         assert!(parse_wan(&json!(null)).is_none());
     }
@@ -577,5 +606,52 @@ mod tests {
         let bad = Peplink::at_base(&client, base, "admin", "wrong");
         let why = bad.probe().await.unwrap_err();
         assert!(why.contains("refused the sign-in") && why.contains("Invalid password"), "{why}");
+    }
+}
+
+#[cfg(test)]
+mod gps_support_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `GET /api/info.location` → GpsSupport, from the Router API documentation's shapes.
+    #[test]
+    fn info_location_decides_gps_support_from_the_documented_answers() {
+        // The documented success example (fw 8.0.1–8.5.2), verbatim.
+        let documented = json!({ "stat": "ok", "response": { "gps": true, "location": {
+            "latitude": 22.340134, "longitude": 114.152588, "altitude": 55.1, "speed": 0.026751, "heading": 356.887,
+            "pdop": 1.3, "hdop": 1, "vdop": 0.8, "timestamp": 1311972720 } } });
+        assert_eq!(gps_support(&documented), GpsSupport::Yes);
+        // fw 8.0.1: "The API will return fail when the device is not support GPS module." The failure
+        // envelope is the documented {stat, code, message}; values as the 8.5 mock above answers.
+        assert_eq!(gps_support(&json!({ "stat": "fail", "code": 404, "message": "API not found" })), GpsSupport::No);
+        assert_eq!(gps_support(&json!({ "stat": "fail" })), GpsSupport::No);
+        // A dropped SESSION is not a missing GPS module.
+        assert_eq!(gps_support(&json!({ "stat": "fail", "code": 401, "message": "Unauthorized" })), GpsSupport::Unknown);
+        // `gps` is "The GPS signal is valid or not": false with no usable fix cannot tell "no lock"
+        // from "no module" — unknown, not a guess.
+        assert_eq!(gps_support(&json!({ "stat": "ok", "response": { "gps": false } })), GpsSupport::Unknown);
+        assert_eq!(gps_support(&json!({ "stat": "ok", "response": { "gps": false, "location": { "latitude": 0, "longitude": 0 } } })), GpsSupport::Unknown);
+        assert_eq!(gps_support(&json!(null)), GpsSupport::Unknown);
+    }
+
+    /// The transport keeps a `stat:'fail'` body instead of turning it into an error, so the GPS read
+    /// can tell "this router has no GPS API" from "this router could not be asked".
+    #[tokio::test]
+    async fn the_envelope_read_keeps_a_refusal_so_it_reads_as_no() {
+        use axum::{routing::{get, post}, Json, Router};
+        let app = Router::new()
+            .route("/api/login", post(|| async { ([(axum::http::header::SET_COOKIE, "bauth=ok1; Path=/")], Json(json!({ "stat": "ok" }))) }))
+            .route("/api/info.location", get(|| async { Json(json!({ "stat": "fail", "code": 404, "message": "API not found" })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::routers::lan_client();
+        let pep = Peplink::at_base(&client, format!("http://127.0.0.1:{port}"), "admin", "x");
+        let body = pep.location_envelope().await.unwrap();
+        assert_eq!(gps_support(&body), GpsSupport::No);
+        // And an unreachable router is not "no GPS".
+        let gone = Peplink::at_base(&client, "http://127.0.0.1:1".into(), "admin", "x");
+        assert!(gone.location_envelope().await.is_err());
     }
 }
