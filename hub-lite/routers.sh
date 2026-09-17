@@ -451,14 +451,24 @@ rt_pl_base() {
   case "$_rtp" in 80) printf 'http://%s' "$1" ;; 443) printf 'https://%s' "$1" ;; *) printf 'https://%s:%s' "$1" "$_rtp" ;; esac
 }
 
+# Per-request curl bounds. The DEFAULT is the interactive door's (/api/hub/routers: probe, add,
+# refresh, apn, gps, password, reboot, read): an app or relay request waits on that answer — a probe
+# is up to five requests inside one CGI run under uhttpd's script timeout — so it keeps 15 s / 5 s.
+# The BACKGROUND poll (rt_poll_report, owner ruling 2026-09-17) raises both: a slow NCOS or Peplink
+# API answer is not a dead router, and no one is waiting on it. 30 s is the daemon's 0.3.52 value.
+RT_MAX_TIME=15
+RT_CONNECT_TIMEOUT=5
+RT_POLL_MAX_TIME=30
+RT_POLL_CONNECT_TIMEOUT=15
+
 # $1 method, $2 url, $3 extra curl-config lines. Body → $RT_W/b, headers → $RT_W/h, status → RT_CODE.
 # ⚠️ `insecure`: an NCOS or Peplink answers its LAN on 443 with a factory self-signed certificate
 # and there is no CA aboard to vouch for it — the daemon's lan_client does the same, and only for an
 # address the owner typed in. Everything goes to curl on STDIN, so no credential is ever in argv.
 rt_req() {
   : > "$RT_W/b"; : > "$RT_W/h"
-  RT_CODE=$({ printf 'url = "%s"\nrequest = "%s"\nsilent\ninsecure\nmax-time = 15\nconnect-timeout = 5\noutput = "%s/b"\ndump-header = "%s/h"\nwrite-out = "%%{http_code}"\n' \
-    "$(rt_cq "$2")" "$1" "$RT_W" "$RT_W"; printf '%s\n' "${3:-}"; } | curl -K - 2>/dev/null)
+  RT_CODE=$({ printf 'url = "%s"\nrequest = "%s"\nsilent\ninsecure\nmax-time = %s\nconnect-timeout = %s\noutput = "%s/b"\ndump-header = "%s/h"\nwrite-out = "%%{http_code}"\n' \
+    "$(rt_cq "$2")" "$1" "$RT_MAX_TIME" "$RT_CONNECT_TIMEOUT" "$RT_W" "$RT_W"; printf '%s\n' "${3:-}"; } | curl -K - 2>/dev/null)
   _rtrc=$?
   case "$RT_CODE" in ''|000)
     case "$_rtrc" in
@@ -713,37 +723,83 @@ $RT_NEW"
     | rt_snap "m\\.|w\\.|f\\.|gpsEnabled$RT_TAB|atMs$RT_TAB|okAtMs$RT_TAB|error$RT_TAB"
 }
 
+# PURE: is this snapshot (stdin) a reading that reports the uplink DOWN — the up=0 the report would
+# carry? With a modem, its connection (rt_params' up); without one, the WAN's own up flag. A snapshot
+# that says neither is not a down reading.
+rt_snap_down() {
+  awk -F "$RT_TAB" '{ S[$1] = $2 } END { if ("m.sim" in S) exit !(S["m.connected"] != 1); if ("w.up" in S) exit !(S["w.up"] != 1); exit 1 }'
+}
+
 # Poll and report — in the background, off the main loop (see rt_tick). `modem.measurement` goes AS
 # the router through send_event with the router's own token; the fix goes as the linked `brv_gps_…`
 # device through the relay spool, because /api/agent lets only a `hub_` token vouch for a GPS source
 # and a hub-lite is a `brv_net_` device — the batch door carries any device under the router's own.
+#
+# 🔴 0.18.1 POLL GRACE (owner ruling 2026-09-17, brvg-hub-lite.sh poll_grace). A failed poll and a read
+# that reports the uplink down are both BAD SAMPLES, and neither reports anything down on its own:
+#   * inside the 45 s grace the report (when the cadence sends one) is the LAST GOOD reading,
+#     $RT_ID.good, unchanged — never the down reading, never a measurement built from the failed read;
+#   * when the grace runs out, down is reported AT ONCE with one log line: a down READ reports itself,
+#     a failed POLL reports the last good reading with up=0. With no good reading since the state dir
+#     was made (boot), a failed poll sends nothing — what a failed poll always did;
+#   * the first good sample reports up AT ONCE, and logs "reachable again" only if down was reported;
+#   * while down, the down report repeats on the check-in cadence (a failed send is not lost);
+#   * a failure is retried on poll_grace's schedule: $RT_ID.due is moved earlier (5, 10, 20, 40, 60 s).
+# The LAN snapshot is untouched by the grace: it still records each poll's `error` as it happens.
 rt_poll_report() {
   rt_work; trap 'rm -rf "$RT_W"' EXIT
-  _rterrf="$RT_DIR/$RT_ID.err"
-  if ! rt_poll; then
-    [ "$(cat "$_rterrf" 2>/dev/null)" = "$RT_ERR" ] || { rt_log "$RT_HOST '$RT_NAME' - $RT_ERR"; printf '%s' "$RT_ERR" > "$_rterrf"; }
-    return 0
-  fi
-  if [ -s "$_rterrf" ] && [ "$(cat "$_rterrf")" != "no agent token" ]; then rt_log "$RT_HOST '$RT_NAME' - reachable again"; fi
-  rm -f "$_rterrf"
-  # 🔴 0.17.0: THE POLL IS A SAMPLE CLOCK. The snapshot (what /api/hub/routers serves on the LAN) is
-  # refreshed every poll; `modem.measurement` goes to the cloud at the CHECK-IN cadence the main loop
-  # writes to $RT_DIR/cadence (900 s unwatched, 60 s while a member watches), plus the first poll after
-  # a start. The byte-counter baseline moves only when a report is SENT, so the KB delta covers every
-  # poll since the last report rather than only the last one.
-  _rtnow=$(date +%s)
+  RT_MAX_TIME=$RT_POLL_MAX_TIME; RT_CONNECT_TIMEOUT=$RT_POLL_CONNECT_TIMEOUT
+  _rtt0=$(date +%s)
+  _rtok=1; rt_poll || _rtok=0
+  rt_graced "$_rtok" "$_rtt0" "$(date +%s)"
+}
+
+# The report half, with the times injected (test.sh drives it directly). $1 1 = the poll succeeded,
+# $2 the poll's start epoch, $3 the epoch it finished; RT_ERR holds the failure.
+rt_graced() {
+  _rtsnapf="$RT_DIR/$RT_ID.snap"; _rtgood="$RT_DIR/$RT_ID.good"; _rtok=$1; _rtnow=$3
+  _rtbad=0
+  if [ "$1" != 1 ] || rt_snap_down < "$_rtsnapf"; then _rtbad=1; fi
+  # shellcheck disable=SC2046
+  set -- $(poll_grace "$(cat "$RT_DIR/$RT_ID.grace" 2>/dev/null)" "$2" "$3" "$_rtbad" "$(rt_poll_secs "$RT_POLL")")
+  _rtact=$1
+  if [ "$4" = 0 ]; then rm -f "$RT_DIR/$RT_ID.grace"; else echo "$3 $4 $5" > "$RT_DIR/$RT_ID.grace"; fi
+  [ "$_rtbad" = 1 ] && echo "$2" > "$RT_DIR/$RT_ID.due"
+  [ "$_rtbad" = 0 ] && cp "$_rtsnapf" "$_rtgood"
+  # What this sample reports, and whether it goes now (an event) or on the check-in cadence.
+  _rtsrc="$_rtsnapf"; _rtforce=0; _rtdownq=0
+  case "$_rtact" in
+    up) rt_log "$RT_HOST '$RT_NAME' - reachable again"; _rtforce=1 ;;
+    hold) [ -f "$_rtgood" ] || return 0; _rtsrc="$_rtgood" ;;
+    down)
+      if [ "$_rtok" = 1 ]; then
+        rt_log "$RT_HOST '$RT_NAME' - uplink down for ${POLL_GRACE_SECS}s - reporting it down"
+      else
+        rt_log "$RT_HOST '$RT_NAME' - no answer for ${POLL_GRACE_SECS}s - reporting it down ($RT_ERR)"
+        [ -f "$_rtgood" ] || return 0
+        _rtsrc="$_rtgood"; _rtdownq=1
+      fi
+      _rtforce=1 ;;
+    # Still down: a down read reports itself on the cadence, as ever; a poll that still fails repeats
+    # the down report (last good, up=0) on the cadence, so a down report whose send failed is retried.
+    still) [ "$_rtok" = 1 ] || { [ -f "$_rtgood" ] || return 0; _rtsrc="$_rtgood"; _rtdownq=1; } ;;
+  esac
   _rtdue=1
   _rtlast=$(cat "$RT_DIR/$RT_ID.sent" 2>/dev/null | tr -cd '0-9')
   _rtcad=$(cat "$RT_DIR/cadence" 2>/dev/null | tr -cd '0-9')
-  [ -n "$_rtlast" ] && [ $(( _rtnow - _rtlast )) -lt $(( ${_rtcad:-900} - 5 )) ] && _rtdue=0
-  _rtctr=$(awk -F "$RT_TAB" '$1 == "m.txBytes" { t = $2 } $1 == "m.rxBytes" { r = $2 } END { if (t != "" && r != "") print t " " r }' "$RT_DIR/$RT_ID.snap")
+  [ "$_rtforce" = 0 ] && [ -n "$_rtlast" ] && [ $(( _rtnow - _rtlast )) -lt $(( ${_rtcad:-900} - 5 )) ] && _rtdue=0
   _rtkb=""
-  if [ -n "$_rtctr" ] && [ "$_rtdue" = 1 ]; then
-    _rtkb=$(rt_kb_delta "$(cat "$RT_DIR/$RT_ID.ctr" 2>/dev/null)" "$_rtctr")
-    echo "$_rtctr" > "$RT_DIR/$RT_ID.ctr"
+  # Plan-burn counters only from a FRESH read: the last good copy's counters are old news.
+  if [ "$_rtsrc" = "$_rtsnapf" ] && [ "$_rtdue" = 1 ]; then
+    _rtctr=$(awk -F "$RT_TAB" '$1 == "m.txBytes" { t = $2 } $1 == "m.rxBytes" { r = $2 } END { if (t != "" && r != "") print t " " r }' "$_rtsnapf")
+    if [ -n "$_rtctr" ]; then
+      _rtkb=$(rt_kb_delta "$(cat "$RT_DIR/$RT_ID.ctr" 2>/dev/null)" "$_rtctr")
+      echo "$_rtctr" > "$RT_DIR/$RT_ID.ctr"
+    fi
   fi
   _rtq=""
-  [ "$_rtdue" = 1 ] && _rtq=$(rt_params "$_rtkb" < "$RT_DIR/$RT_ID.snap")
+  [ "$_rtdue" = 1 ] && _rtq=$(rt_params "$_rtkb" < "$_rtsrc")
+  [ "$_rtdownq" = 1 ] && [ -n "$_rtq" ] && _rtq="up=0${_rtq#up=?}"
   if [ -n "$_rtq" ]; then
     if [ -z "$RT_TOKEN" ]; then
       [ -s "$RT_DIR/$RT_ID.tok" ] || { rt_log "$RT_HOST '$RT_NAME' - no agent token; status is local only until the app enrolls it"; echo 1 > "$RT_DIR/$RT_ID.tok"; }
@@ -760,7 +816,7 @@ rt_poll_report() {
       ) || true
     fi
   fi
-  if [ "$RT_GPS" = 1 ] && [ -n "$RT_GPSDEV" ]; then
+  if [ "$_rtok" = 1 ] && [ "$RT_GPS" = 1 ] && [ -n "$RT_GPSDEV" ]; then
     _rtg=$(awk -F "$RT_TAB" '{ S[$1] = $2 } END { if ("f.lat" in S) { printf "lat=%.6f&lon=%.6f", S["f.lat"], S["f.lon"]; if ("f.acc" in S) printf "&acc=%.1f", S["f.acc"] } }' "$RT_DIR/$RT_ID.snap")
     # The fix by exception (0.17.0, §A7.2): every poll while a member watches (the cadence file says
     # 60), otherwise only the first fix and a move past the deadband (floor 25 m) that is also more
@@ -785,7 +841,7 @@ rt_gps_due() {
   )
 }
 
-# The main loop's hook. Cheap and never blocking: a router that has stopped answering costs 15 s
+# The main loop's hook. Cheap and never blocking: a router that has stopped answering costs 30 s
 # per request, and the loop it would stall also carries the valve volume cutoff — so each due router
 # is read in its own background child (one at a time per router), and only the relay drain the
 # children ask for runs here, where the batch sequence file has a single writer.
@@ -805,6 +861,23 @@ rt_tick() {
     echo $! > "$RT_DIR/$_rti.pid"
   done < "$RT_CONF"
   unset _rtd
+}
+
+# The soonest managed-router read, for the main loop's nap ($1 now; empty with no enabled router). While
+# a read is running, now + 5 s: a failed read moves its own due time earlier (the 5 s first retry) after
+# the loop has already chosen how long to sleep.
+rt_next_due() {
+  [ -s "$RT_CONF" ] || return 0
+  _rtbest=""
+  while IFS="$RT_FS" read -r _rti _rtv _rtd _rth _rtd _rtd _rtd _rtd _rtd _rtd _rtd _rten; do
+    [ "$_rten" = 1 ] && [ -n "$_rth" ] && [ -n "$_rtv" ] || continue
+    _rtx=$(cat "$RT_DIR/$_rti.due" 2>/dev/null | tr -cd '0-9'); _rtx=${_rtx:-$1}
+    _rtpid=$(cat "$RT_DIR/$_rti.pid" 2>/dev/null)
+    [ -n "$_rtpid" ] && kill -0 "$_rtpid" 2>/dev/null && [ "$_rtx" -gt $(( $1 + 5 )) ] && _rtx=$(( $1 + 5 ))
+    { [ -z "$_rtbest" ] || [ "$_rtx" -lt "$_rtbest" ]; } && _rtbest=$_rtx
+  done < "$RT_CONF"
+  unset _rtd
+  printf '%s' "$_rtbest"
 }
 
 # --- The /api/hub/routers door (called by hub-lite-api.sh; uses its reply/fail/valid_*) -----------
