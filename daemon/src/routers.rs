@@ -470,15 +470,42 @@ pub fn dish_params(d: &DishStatus, wan: &WanStatus, probe: Option<&Probe>) -> Ve
     p
 }
 
+/// The `modem.measurement` params for a router with NO modem and NO dish — a wired Peplink (a
+/// Balance on marina Ethernet) or a Cradlepoint on a wired uplink. Only the vendor-blind names the
+/// app's parseCachedModem reads (`up`, `wan`) plus identity (`ip`, `model`, `fw`, `av`). No `sim`,
+/// `rssi`, `sinr`, `dataMb` or any other cellular field: there is no modem, and inventing one would
+/// read as a broken modem ("No SIM") on the card.
+pub fn wan_params(wan: &WanStatus, probe: Option<&Probe>) -> Vec<(String, String)> {
+    let mut p: Vec<(String, String)> = vec![("up".into(), if wan.up { "1" } else { "0" }.into()), ("wan".into(), wan.wan.clone())];
+    let mut push = |k: &str, v: Option<String>| {
+        if let Some(v) = v {
+            p.push((k.to_string(), v));
+        }
+    };
+    push("ip", wan.ip.clone());
+    push("model", probe.and_then(|p| p.model.clone()));
+    push("fw", probe.and_then(|p| p.firmware.clone()));
+    push("av", Some(format!("hub-{}", env!("CARGO_PKG_VERSION"))));
+    p
+}
+
 /// What the poll loop reports for a snapshot, whichever vendor filled it: a modem's params, a
-/// dish's params, or nothing (a read that learned neither reports nothing — never an empty
-/// measurement that would look like a router with no modem).
+/// dish's params, a WAN-only report, or nothing (a read that learned no modem, no dish and no WAN
+/// reports nothing — never an empty measurement that would look like a router with no modem).
+///
+/// 🔴 THE WAN-ONLY ARM WAS MISSING until 0.3.51. CENTRAL's wired Peplink (no modem, no dish) polled
+/// fine and reachable for weeks, but this returned None, so the poll loop never set router_latest,
+/// never spooled an event and the keyframe never carried it — the app's card sat on "Waiting for its
+/// first report…" forever.
 pub fn report_params(snap: &Snapshot, wan_kb_delta: Option<u64>) -> Option<Vec<(String, String)>> {
     if let Some(m) = &snap.modem {
         return Some(modem_params(m, snap.wan.as_ref(), snap.probe.as_ref(), wan_kb_delta));
     }
     if let (Some(d), Some(w)) = (&snap.dish, &snap.wan) {
         return Some(dish_params(d, w, snap.probe.as_ref()));
+    }
+    if let Some(w) = &snap.wan {
+        return Some(wan_params(w, snap.probe.as_ref()));
     }
     None
 }
@@ -1129,6 +1156,66 @@ mod tests {
         assert_eq!(p.model.as_deref(), Some("CBA850"));
         let bad = Ncos::new(&client, "127.0.0.1", port, "admin", "wrong");
         assert_eq!(bad.probe().await.unwrap_err(), "unauthorized");
+    }
+}
+
+#[cfg(test)]
+mod wired_report_tests {
+    use super::*;
+
+    fn get<'a>(params: &'a [(String, String)], k: &str) -> Option<&'a str> {
+        params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+    }
+
+    fn wired(up: bool) -> Snapshot {
+        Snapshot {
+            probe: Some(Probe { model: Some("Balance 20X".into()), firmware: Some("8.5.1".into()), ..Default::default() }),
+            wan: Some(WanStatus { wan: "wired".into(), up, ip: Some("10.1.2.3".into()) }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_wired_router_with_no_modem_and_no_dish_still_reports() {
+        // CENTRAL's Peplink: reachable, polled, and until 0.3.51 NEVER reported.
+        let params = report_params(&wired(true), None).expect("a wired router must produce a report");
+        assert_eq!(get(&params, "up"), Some("1"));
+        assert_eq!(get(&params, "wan"), Some("wired"));
+        assert_eq!(get(&params, "ip"), Some("10.1.2.3"));
+        assert_eq!(get(&params, "model"), Some("Balance 20X"));
+        assert_eq!(get(&params, "fw"), Some("8.5.1"));
+        assert_eq!(get(&params, "av"), Some(format!("hub-{}", env!("CARGO_PKG_VERSION")).as_str()));
+        // Nothing cellular, and nothing a dish says: the report is exactly these six names.
+        let mut names: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["av", "fw", "ip", "model", "up", "wan"]);
+        assert_eq!(get(&report_params(&wired(false), None).unwrap(), "up"), Some("0"));
+    }
+
+    #[test]
+    fn a_modem_or_a_dish_still_wins_over_the_wan_only_report() {
+        let modem = ModemStatus { sim: "ok".into(), rssi: Some(-70.0), connected: Some(true), ..Default::default() };
+        let snap = Snapshot { modem: Some(modem.clone()), ..wired(true) };
+        assert_eq!(
+            report_params(&snap, Some(12)),
+            Some(modem_params(&modem, snap.wan.as_ref(), snap.probe.as_ref(), Some(12)))
+        );
+        let dish = DishStatus { obstruction_pct: Some(0.2), ..Default::default() };
+        let snap = Snapshot { dish: Some(dish.clone()), ..wired(true) };
+        assert_eq!(report_params(&snap, None), Some(dish_params(&dish, snap.wan.as_ref().unwrap(), snap.probe.as_ref())));
+        // A dish with no WAN read still reports nothing, as before.
+        assert!(report_params(&Snapshot { dish: Some(dish), ..Default::default() }, None).is_none());
+    }
+
+    #[test]
+    fn a_wired_uplink_going_down_is_an_event() {
+        let up = report_params(&wired(true), None).unwrap();
+        let down = report_params(&wired(false), None).unwrap();
+        let baseline = crate::cadence::RouterSent::from_params(&up);
+        assert!(!crate::cadence::router_is_event(None, &up), "the first read is a baseline, not an event");
+        assert!(!crate::cadence::router_is_event(Some(&baseline), &up));
+        assert!(crate::cadence::router_is_event(Some(&baseline), &down));
+        assert!(crate::cadence::router_is_event(Some(&crate::cadence::RouterSent::from_params(&down)), &up));
     }
 }
 

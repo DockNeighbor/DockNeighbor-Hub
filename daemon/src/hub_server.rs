@@ -3993,7 +3993,7 @@ async fn router_poll_loop(rt: Shared) {
                     if let Some(c) = counters {
                         last_counters.insert(r.id.clone(), c);
                     }
-                    // A modem's params or a dish's — routers::report_params decides, the loop does not.
+                    // A modem's params, a dish's, or a wired router's WAN-only report — routers::report_params decides, the loop does not.
                     if let Some(params) = crate::routers::report_params(&snap, None) {
                         if r.agent_token.is_empty() {
                             // Readable in the app, but nothing reaches the cloud: say so once.
