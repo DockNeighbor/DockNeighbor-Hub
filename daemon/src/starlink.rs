@@ -46,9 +46,13 @@ use crate::routers::{Probe, WanStatus};
 pub const DEFAULT_HOST: &str = "192.168.100.1";
 pub const DEFAULT_PORT: u16 = 9200;
 const GRPC_PATH: &str = "/SpaceX.API.Device.Device/Handle";
-/// A dish answers get_status in well under a second on the LAN; a call that has not come back in
-/// this long is a dish that is not there.
-const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// The per-call deadline for an INTERACTIVE call (an app action — probe, refresh, reboot — waiting on
+/// the answer, inside the relay's own 30 s call deadline, hub_relay CALL_TIMEOUT). Unchanged at 10 s.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// The per-call deadline for the BACKGROUND poll (router_poll_loop), where nobody is waiting and a slow
+/// answer is still an answer: 30 s, raised from 10 s (owner ruling 2026-09-17 — the dish's gRPC can be
+/// slow, and a slow answer must never read as a dish that is down; router_health decides down).
+pub const POLL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 // --- The wire messages (spacex.api.device, trimmed to what the hub reads) -------------------------
 
@@ -279,6 +283,10 @@ pub struct DishStatus {
     /// The cause of the outage the dish is in, when it is in one (`outage_label`); absent when up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outage: Option<String>,
+    /// How long the dish itself says the current outage has lasted (DishOutage.duration_ns), in ms.
+    /// Hub-internal: router_health counts an outage the dish measured past the grace window at once.
+    #[serde(skip)]
+    pub outage_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
     /// Ping loss to the point of presence, percent.
@@ -358,6 +366,7 @@ pub fn parse_status(r: &pb::DishGetStatusResponse) -> DishStatus {
         obstruction_pct: f(obs.and_then(|o| o.fraction_obstructed)).map(|n| round1(n * 100.0)),
         obstructed: obs.and_then(|o| o.currently_obstructed),
         outage: r.outage.as_ref().map(|o| outage_label(o.cause.unwrap_or(0)).to_string()),
+        outage_ms: r.outage.as_ref().and_then(|o| o.duration_ns).map(|ns| i64::try_from(ns / 1_000_000).unwrap_or(i64::MAX)),
         latency_ms: f(r.pop_ping_latency_ms).map(round1),
         loss_pct: f(r.pop_ping_drop_rate).map(|n| round1(n * 100.0)),
         down_mbps: f(r.downlink_throughput_bps).map(|n| round1(n / 1_000_000.0)),
@@ -490,6 +499,7 @@ pub fn grpc_error(code: i32, message: &str) -> String {
 pub struct Starlink {
     host: String,
     port: u16,
+    timeout: Duration,
 }
 
 impl Starlink {
@@ -498,11 +508,22 @@ impl Starlink {
         Starlink {
             host: if h.is_empty() { DEFAULT_HOST.into() } else { h.into() },
             port: if port == 0 { DEFAULT_PORT } else { port },
+            timeout: CALL_TIMEOUT,
         }
     }
 
+    /// The same dish with another per-call deadline (the background poll's POLL_CALL_TIMEOUT).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     async fn call(&self, req: pb::Request) -> Result<pb::Response, String> {
-        tokio::time::timeout(CALL_TIMEOUT, self.call_inner(req))
+        tokio::time::timeout(self.timeout, self.call_inner(req))
             .await
             .map_err(|_| "the dish did not answer (timed out) — is 192.168.100.1 routed from the hub's network?".to_string())?
     }

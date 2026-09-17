@@ -14,6 +14,7 @@ pub mod batch;
 pub mod cadence;
 pub mod key_sync;
 pub mod routers;
+pub mod router_health;
 pub mod peplink;
 pub mod starlink;
 pub mod sensors;

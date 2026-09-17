@@ -3990,17 +3990,130 @@ async fn sensor_hunt_loop(rt: Shared) {
 /// cadence (routers::poll_secs, faster while its GPS is armed/underway/watched); this is only the tick.
 const ROUTER_TICK_SECS: u64 = 5;
 
+/// The poll loop's memory across passes, per router id.
+#[derive(Default)]
+struct RouterPollState {
+    /// When each router was last polled (the attempt's start).
+    last_poll_ms: HashMap<String, i64>,
+    last_counters: HashMap<String, (u64, u64)>,
+    /// The up/down grace state machine (router_health, owner ruling 2026-09-17).
+    health: HashMap<String, crate::router_health::RouterHealth>,
+    /// Routers reported down BECAUSE their poll kept failing — the ones "reachable again" is said of.
+    unreachable: HashSet<String>,
+    /// Routers whose "no agent token" line has been logged.
+    no_token_noted: HashSet<String>,
+}
+
+impl RouterPollState {
+    fn retain(&mut self, ids: &HashSet<String>) {
+        self.last_poll_ms.retain(|k, _| ids.contains(k));
+        self.last_counters.retain(|k, _| ids.contains(k));
+        self.health.retain(|k, _| ids.contains(k));
+        self.unreachable.retain(|k| ids.contains(k));
+        self.no_token_noted.retain(|k| ids.contains(k));
+    }
+}
+
+/// Fold one poll of a router into what the hub reports, and return the send it calls for (the item,
+/// and whether it is an event). The poll loop spools the send; tests drive this directly with injected
+/// times (`started_ms`/`finished_ms`: when the poll began and came back).
+///
+/// UP/DOWN GOES THROUGH router_health (owner ruling 2026-09-17): a bad sample — a failed poll, or a read
+/// that says the uplink is down — inside the 45 s grace window reports NOTHING new: router_latest keeps
+/// the last good reading, so the keyframe carries it unchanged, and no event is sent. Only when bad
+/// samples have been continuous for 45 s does the down report go out (a read's own `up=0`, or for a
+/// failed poll the last reading with `up=0`), through the same router_is_event path as before. The first
+/// good sample reports up at once.
+async fn router_observed(
+    rt: &Rt,
+    r: &hub_config::RouterConfig,
+    snap: &crate::routers::Snapshot,
+    started_ms: i64,
+    finished_ms: i64,
+    st: &mut RouterPollState,
+) -> Option<(batch::Item, bool)> {
+    use crate::router_health::{down_params, sample_of, Sample, Verdict};
+    let read = if snap.error.is_none() { crate::routers::report_params(snap, None) } else { None };
+    let sample = match snap.error {
+        Some(_) => Sample::Failed,
+        None => sample_of(read.as_deref(), snap.dish.as_ref().and_then(|d| d.outage_ms)),
+    };
+    let health = st.health.entry(r.id.clone()).or_default();
+    let verdict = health.observe(sample, started_ms, finished_ms);
+    let bad_for_s = health.first_failure_at.map_or(0, |t| (finished_ms - t).max(0) / 1000);
+    // One line each way for an unreachable router; a transient failure logs nothing.
+    let mut logged = false;
+    if snap.error.is_none() && st.unreachable.remove(&r.id) {
+        crate::hlog!("routers: {} '{}' - reachable again", r.host, r.name);
+        logged = true;
+    }
+    if let (Verdict::WentDown, Some(why)) = (verdict, &snap.error) {
+        crate::hlog!("routers: {} '{}' - could not be reached for {bad_for_s} s; reporting it down: {why}", r.host, r.name);
+        st.unreachable.insert(r.id.clone());
+        logged = true;
+    }
+    // Plan-burn deltas exist only where a modem reports lifetime counters — real use, whatever the verdict.
+    let counters = snap.modem.as_ref().filter(|_| snap.error.is_none()).and_then(|m| m.tx_bytes.zip(m.rx_bytes));
+    let delta = counters.and_then(|c| crate::routers::wan_kb_delta(st.last_counters.get(&r.id).copied(), c));
+    if let Some(c) = counters {
+        st.last_counters.insert(r.id.clone(), c);
+    }
+    // A modem's params, a dish's, or a wired router's WAN-only report — routers::report_params decides.
+    let params = match (verdict, &snap.error) {
+        (Verdict::Hold, _) => None,
+        (_, None) => read,
+        (Verdict::WentDown, Some(_)) => down_params(rt.telemetry.lock().await.router_latest.get(&r.id).map(Vec::as_slice)),
+        // Already reported down and still unreachable: nothing new to say.
+        (_, Some(_)) => None,
+    };
+    if r.agent_token.is_empty() {
+        if params.is_some() && st.no_token_noted.insert(r.id.clone()) {
+            // Readable in the app, but nothing reaches the cloud: say so once.
+            crate::hlog!("routers: {} '{}' - no agent token; status is local only until the app enrolls it", r.host, r.name);
+        }
+        return None;
+    }
+    let mut t = rt.telemetry.lock().await;
+    *t.wan_pending_kb.entry(r.id.clone()).or_insert(0) += delta.unwrap_or(0);
+    let params = params?;
+    t.router_latest.insert(r.id.clone(), params.clone());
+    let event = cadence::router_is_event(t.router_sent.get(&r.id), &params);
+    if event && !logged {
+        crate::hlog!(
+            "routers: {} '{}' - uplink {} {}",
+            r.host, r.name,
+            params.iter().find(|(k, _)| k == "wan").map_or("?", |(_, v)| v.as_str()),
+            if params.iter().any(|(k, v)| k == "up" && v == "1") { "up" } else { "down" }
+        );
+    }
+    if !t.router_sent.contains_key(&r.id) {
+        // First read after start: the baseline (the keyframe carries it).
+        t.router_sent.insert(r.id.clone(), cadence::RouterSent::from_params(&params));
+    }
+    if event || leased(rt) {
+        let kb = t.wan_pending_kb.insert(r.id.clone(), 0).unwrap_or(0);
+        t.router_sent.insert(r.id.clone(), cadence::RouterSent::from_params(&params));
+        Some((batch::router_item(&r.id, &params, kb), event))
+    } else {
+        None
+    }
+}
+
 /// Read each managed router on its cadence (H2): the `modem.measurement` becomes the router's newest
 /// value for the keyframe, and goes to the cloud AT ONCE only when the uplink kind (`wan`) or its
 /// up/down state moved, or a member is watching. The KB it used since the last SENT report accumulates
 /// and rides whichever send comes first. When its GPS is on, every fix goes through the geofence as the
 /// linked gps_source device. Re-reads config each pass, so a router added, edited or removed from the
-/// app is picked up without a restart. Errors are logged only when they CHANGE.
+/// app is picked up without a restart.
+///
+/// Up/down is router_health's decision (router_observed): a failed poll is retried after 5 s, then
+/// 10/20/40 s, capped at 60 s, and never less often than the router's normal cadence; a router is
+/// reported down only after 45 s of continuous failure (or of reading its uplink down), and up again on
+/// the first good read. The background poll uses the generous poll deadlines (routers::poll_client,
+/// starlink::POLL_CALL_TIMEOUT).
 async fn router_poll_loop(rt: Shared) {
-    let client = crate::routers::lan_client();
-    let mut last_error: HashMap<String, String> = HashMap::new();
-    let mut last_counters: HashMap<String, (u64, u64)> = HashMap::new();
-    let mut last_report_ms: HashMap<String, i64> = HashMap::new();
+    let client = crate::routers::poll_client();
+    let mut st = RouterPollState::default();
     loop {
         let cfg = hub_config::read_config_in(&rt.base);
         let now = now_ms();
@@ -4022,94 +4135,34 @@ async fn router_poll_loop(rt: Shared) {
                 idle
             };
             let due_ms = (secs * 1000) as i64;
-            if last_report_ms.get(&r.id).map_or(false, |t| now - t < due_ms) {
+            let due = st.health.get(&r.id).cloned().unwrap_or_default().due(now, st.last_poll_ms.get(&r.id).copied(), due_ms);
+            if !due {
                 continue;
             }
-            let snap = crate::routers::poll(&client, r, prev.as_ref()).await;
-            last_report_ms.insert(r.id.clone(), now);
+            let started = now_ms();
+            let snap = crate::routers::poll_in_background(&client, r, prev.as_ref()).await;
+            let finished = now_ms();
+            st.last_poll_ms.insert(r.id.clone(), started);
             if let Some(note) = crate::routers::gps_unsupported_note(r, prev.as_ref(), &snap) {
                 crate::hlog!("{note}");
             }
-            match &snap.error {
-                Some(why) => {
-                    if last_error.get(&r.id) != Some(why) {
-                        crate::hlog!("routers: {} '{}' - {why}", r.host, r.name);
-                        last_error.insert(r.id.clone(), why.clone());
-                    }
+            if let Some((item, event)) = router_observed(&rt, r, &snap, started, finished, &mut st).await {
+                if event {
+                    note_activity(&rt);
                 }
-                None => {
-                    if last_error.remove(&r.id).is_some() {
-                        crate::hlog!("routers: {} '{}' - reachable again", r.host, r.name);
-                    }
-                    // Plan-burn deltas exist only where a modem reports lifetime counters.
-                    let counters = snap.modem.as_ref().and_then(|m| m.tx_bytes.zip(m.rx_bytes));
-                    let delta = counters.and_then(|c| crate::routers::wan_kb_delta(last_counters.get(&r.id).copied(), c));
-                    if let Some(c) = counters {
-                        last_counters.insert(r.id.clone(), c);
-                    }
-                    // A modem's params, a dish's, or a wired router's WAN-only report — routers::report_params decides, the loop does not.
-                    if let Some(params) = crate::routers::report_params(&snap, None) {
-                        if r.agent_token.is_empty() {
-                            // Readable in the app, but nothing reaches the cloud: say so once.
-                            if last_error.get(&r.id).map_or(true, |e| e != "no agent token") {
-                                crate::hlog!("routers: {} '{}' - no agent token; status is local only until the app enrolls it", r.host, r.name);
-                                last_error.insert(r.id.clone(), "no agent token".into());
-                            }
-                        } else {
-                            let send = {
-                                let mut t = rt.telemetry.lock().await;
-                                *t.wan_pending_kb.entry(r.id.clone()).or_insert(0) += delta.unwrap_or(0);
-                                t.router_latest.insert(r.id.clone(), params.clone());
-                                let event = cadence::router_is_event(t.router_sent.get(&r.id), &params);
-                                if event {
-                                    crate::hlog!(
-                                        "routers: {} '{}' - uplink {} {}",
-                                        r.host, r.name,
-                                        params.iter().find(|(k, _)| k == "wan").map_or("?", |(_, v)| v.as_str()),
-                                        if params.iter().any(|(k, v)| k == "up" && v == "1") { "up" } else { "down" }
-                                    );
-                                }
-                                if !t.router_sent.contains_key(&r.id) {
-                                    // First read after start: the baseline (the keyframe carries it).
-                                    t.router_sent.insert(r.id.clone(), cadence::RouterSent::from_params(&params));
-                                }
-                                if event || is_leased {
-                                    let kb = t.wan_pending_kb.insert(r.id.clone(), 0).unwrap_or(0);
-                                    t.router_sent.insert(r.id.clone(), cadence::RouterSent::from_params(&params));
-                                    Some((batch::router_item(&r.id, &params, kb), event))
-                                } else {
-                                    None
-                                }
-                            };
-                            if let Some((item, event)) = send {
-                                if event {
-                                    note_activity(&rt);
-                                }
-                                spool_report(&rt, &crate::linktap_runtime::Report {
-                                    device: item.device,
-                                    event: item.event,
-                                    params: item.params,
-                                    token: None,
-                                })
-                                .await;
-                            }
-                        }
-                    }
-                    if r.gps_enabled && !r.gps_dev_id.is_empty() {
-                        if let Some(fix) = &snap.fix {
-                            let fix = crate::gps::GpsFix { lat: fix.lat, lon: fix.lon, acc: fix.acc, ..Default::default() };
-                            gps_observe(&rt, &r.gps_dev_id, &fix).await;
-                        }
-                    }
+                spool_report(&rt, &crate::linktap_runtime::Report { device: item.device, event: item.event, params: item.params, token: None }).await;
+            }
+            if snap.error.is_none() && r.gps_enabled && !r.gps_dev_id.is_empty() {
+                if let Some(fix) = &snap.fix {
+                    let fix = crate::gps::GpsFix { lat: fix.lat, lon: fix.lon, acc: fix.acc, ..Default::default() };
+                    gps_observe(&rt, &r.gps_dev_id, &fix).await;
                 }
             }
             rt.router_state.write().await.insert(r.id.clone(), snap);
         }
         // Forget routers that are gone, so a re-add starts fresh.
         let ids: HashSet<String> = cfg.routers.iter().map(|r| r.id.clone()).collect();
-        last_report_ms.retain(|k, _| ids.contains(k));
-        last_counters.retain(|k, _| ids.contains(k));
-        last_error.retain(|k, _| ids.contains(k));
+        st.retain(&ids);
         {
             let mut t = rt.telemetry.lock().await;
             t.router_latest.retain(|k, _| ids.contains(k));
@@ -4120,7 +4173,7 @@ async fn router_poll_loop(rt: Shared) {
             _ = tokio::time::sleep(Duration::from_secs(ROUTER_TICK_SECS)) => {}
             _ = rt.router_wake.notified() => {
                 // A wake means "read now" — clear the due-times so the next pass polls everything.
-                last_report_ms.clear();
+                st.last_poll_ms.clear();
             }
         }
     }
@@ -6070,4 +6123,146 @@ mod tests {
         assert_eq!(r.status(), 200);
     }
 
+
+    // ── Router up/down grace (owner ruling 2026-09-17) — router_observed with injected times ──────────
+
+    fn grace_router(vendor: &str) -> hub_config::RouterConfig {
+        hub_config::RouterConfig {
+            id: "brv_net_grace".into(), vendor: vendor.into(), name: "Balance".into(), host: "192.168.50.1".into(),
+            agent_token: "agent-tok".into(), ..hub_config::RouterConfig::default()
+        }
+    }
+
+    fn wired(up: bool) -> crate::routers::Snapshot {
+        crate::routers::Snapshot {
+            wan: Some(crate::routers::WanStatus { wan: "wired".into(), up, ip: Some("10.0.0.2".into()), uptime_s: Some(600) }),
+            probe: Some(crate::routers::Probe { model: Some("Balance One".into()), ..Default::default() }),
+            ok_at_ms: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn unreachable_from(last: &crate::routers::Snapshot) -> crate::routers::Snapshot {
+        crate::routers::Snapshot { error: Some("the router did not answer (timed out) — is the hub on the same network?".into()), ..last.clone() }
+    }
+
+    fn dish(outage: Option<&str>, outage_ms: Option<i64>) -> crate::routers::Snapshot {
+        let d = crate::starlink::DishStatus { outage: outage.map(String::from), outage_ms, latency_ms: Some(31.0), ..Default::default() };
+        crate::routers::Snapshot { wan: Some(crate::starlink::wan_of(&d)), dish: Some(d), ..Default::default() }
+    }
+
+    async fn grace_rt(tag: &str, r: &hub_config::RouterConfig) -> (Shared, HubConfig, PathBuf) {
+        let base = temp_base(tag);
+        let cfg = HubConfig { routers: vec![r.clone()], ..seeded_cfg() };
+        hub_config::write_config_in(&base, &cfg).unwrap();
+        (new_rt(base.clone(), "https://unused.example".into()), cfg, base)
+    }
+
+    /// What the keyframe carries for the router right now.
+    async fn keyframe_router(rt: &Rt, cfg: &HubConfig, id: &str) -> Option<Vec<(String, String)>> {
+        build_keyframe(rt, cfg, None).await.into_iter().map(|(i, _)| i).find(|i| i.device == id).map(|i| i.params)
+    }
+
+    fn up_of(params: &[(String, String)]) -> &str {
+        params.iter().find(|(k, _)| k == "up").map(|(_, v)| v.as_str()).unwrap()
+    }
+
+    const SEC: i64 = 1_000;
+
+    #[tokio::test]
+    async fn a_single_failed_poll_reports_nothing_and_the_keyframe_keeps_the_last_good_reading() {
+        let r = grace_router("peplink");
+        let (rt, cfg, base) = grace_rt("grace-single", &r).await;
+        let mut st = RouterPollState::default();
+        let good = wired(true);
+        assert!(router_observed(&rt, &r, &good, 0, 0, &mut st).await.is_none(), "the first read is the baseline");
+        let before = keyframe_router(&rt, &cfg, &r.id).await.expect("the keyframe carries the baseline");
+        assert_eq!(up_of(&before), "1");
+
+        let sent = router_observed(&rt, &r, &unreachable_from(&good), 120 * SEC, 150 * SEC, &mut st).await;
+        assert!(sent.is_none(), "one timed-out poll sends nothing: {sent:?}");
+        assert_eq!(keyframe_router(&rt, &cfg, &r.id).await, Some(before), "the keyframe carries the last good reading, unchanged");
+        assert_eq!(st.health[&r.id].next_retry_at, Some(155 * SEC), "and a quick retry is scheduled");
+        assert!(!st.unreachable.contains(&r.id));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_router_is_reported_down_after_45_s_of_failure_not_44_and_up_on_the_first_success() {
+        let r = grace_router("peplink");
+        let (rt, cfg, base) = grace_rt("grace-45", &r).await;
+        let mut st = RouterPollState::default();
+        let good = wired(true);
+        router_observed(&rt, &r, &good, 0, 0, &mut st).await;
+        let dark = unreachable_from(&good);
+        for t in [100, 105, 115, 135, 144] {
+            assert!(router_observed(&rt, &r, &dark, t * SEC, t * SEC, &mut st).await.is_none(), "{} s of failure is not down", t - 100);
+            assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "1");
+        }
+        let (item, event) = router_observed(&rt, &r, &dark, 145 * SEC, 145 * SEC, &mut st).await.expect("45 s: down goes out");
+        assert!(event, "down is an event");
+        assert_eq!(up_of(&item.params), "0");
+        assert!(item.params.iter().any(|(k, v)| k == "wan" && v == "wired"), "the last reading, with up=0: {:?}", item.params);
+        assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "0", "and the keyframe now says down");
+        assert!(st.unreachable.contains(&r.id));
+        for t in [205, 265] {
+            assert!(router_observed(&rt, &r, &dark, t * SEC, t * SEC, &mut st).await.is_none(), "down is sent once");
+        }
+
+        let (item, event) = router_observed(&rt, &r, &good, 300 * SEC, 300 * SEC, &mut st).await.expect("the first success is up");
+        assert!(event);
+        assert_eq!(up_of(&item.params), "1");
+        assert!(!st.unreachable.contains(&r.id));
+        assert_eq!(st.health[&r.id], crate::router_health::RouterHealth::default(), "normal cadence at once");
+        assert!(router_observed(&rt, &r, &good, 420 * SEC, 420 * SEC, &mut st).await.is_none(), "one up event, not two");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_wan_read_as_down_waits_the_same_45_s() {
+        let r = grace_router("peplink");
+        let (rt, cfg, base) = grace_rt("grace-wan", &r).await;
+        let mut st = RouterPollState::default();
+        router_observed(&rt, &r, &wired(true), 0, 0, &mut st).await;
+        assert!(router_observed(&rt, &r, &wired(false), 100 * SEC, 100 * SEC, &mut st).await.is_none(), "one down read is not down");
+        assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "1");
+        assert!(router_observed(&rt, &r, &wired(true), 105 * SEC, 105 * SEC, &mut st).await.is_none(), "a blip never went out");
+        for t in [200, 205, 215, 235] {
+            assert!(router_observed(&rt, &r, &wired(false), t * SEC, t * SEC, &mut st).await.is_none());
+        }
+        let (item, event) = router_observed(&rt, &r, &wired(false), 245 * SEC, 245 * SEC, &mut st).await.unwrap();
+        assert!(event && up_of(&item.params) == "0");
+        assert!(!st.unreachable.contains(&r.id), "reachable all along: no 'reachable again' to say");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_single_starlink_outage_sample_sends_no_down_event_but_45_s_continuous_does() {
+        let r = grace_router("starlink");
+        let (rt, cfg, base) = grace_rt("grace-dish", &r).await;
+        let mut st = RouterPollState::default();
+        router_observed(&rt, &r, &dish(None, None), 0, 0, &mut st).await;
+        let sent = router_observed(&rt, &r, &dish(Some("obstructed"), Some(2 * SEC)), 120 * SEC, 120 * SEC, &mut st).await;
+        assert!(sent.is_none(), "a 2 s obstruction is not a down event: {sent:?}");
+        let kf = keyframe_router(&rt, &cfg, &r.id).await.unwrap();
+        assert_eq!(up_of(&kf), "1");
+        assert!(!kf.iter().any(|(k, _)| k == "outage"), "the keyframe keeps the last good reading");
+        assert!(router_observed(&rt, &r, &dish(None, None), 125 * SEC, 125 * SEC, &mut st).await.is_none());
+
+        for t in [200, 205, 215, 235] {
+            assert!(router_observed(&rt, &r, &dish(Some("obstructed"), None), t * SEC, t * SEC, &mut st).await.is_none());
+        }
+        let (item, event) = router_observed(&rt, &r, &dish(Some("obstructed"), None), 245 * SEC, 245 * SEC, &mut st).await.unwrap();
+        assert!(event && up_of(&item.params) == "0");
+        assert!(item.params.iter().any(|(k, v)| k == "outage" && v == "obstructed"));
+
+        // The dish's OWN measured duration ≥ 45 s counts at once (router_health header).
+        let (rt2, _cfg2, base2) = grace_rt("grace-dish-measured", &r).await;
+        let mut st2 = RouterPollState::default();
+        router_observed(&rt2, &r, &dish(None, None), 0, 0, &mut st2).await;
+        let (item, event) = router_observed(&rt2, &r, &dish(Some("no satellites"), Some(50 * SEC)), 120 * SEC, 120 * SEC, &mut st2).await.unwrap();
+        assert!(event && up_of(&item.params) == "0");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base2);
+    }
 }
