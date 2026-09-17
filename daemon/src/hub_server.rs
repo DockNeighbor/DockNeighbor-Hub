@@ -1988,6 +1988,9 @@ async fn checkin_once(rt: &Rt, client: &reqwest::Client, cfg: &HubConfig) -> Res
         let first = i == 0;
         match post_batch(rt, client, cfg, batch::Kind::Keyframe, None, &items, if first { ack.as_deref() } else { None }).await {
             PostOutcome::Delivered(body) => {
+                if let Some(note) = batch::failed_items_note(&body, &items) {
+                    crate::hlog!("hub: {note}");
+                }
                 apply_sent_marks(rt, chunk.into_iter().flat_map(|(_, m)| m).collect()).await;
                 handle_batch_reply(rt, client, &body).await;
             }
@@ -2140,6 +2143,9 @@ async fn gps_heartbeat_loop(rt: Shared) {
         }
         match post_batch(&rt, &client, &cfg, batch::Kind::Delta, None, &items, None).await {
             PostOutcome::Delivered(body) => {
+                if let Some(note) = batch::failed_items_note(&body, &items) {
+                    crate::hlog!("hub: {note}");
+                }
                 clock.delivered(sig);
                 if last_err.take().is_some() {
                     crate::hlog!("watch: heartbeat delivered again");
@@ -3133,7 +3139,12 @@ async fn drain_reports(rt: &Rt) {
             break;
         }
         match post_batch(rt, &client, &cfg, batch::Kind::Delta, Some(seq), &items, None).await {
-            PostOutcome::Delivered(body) => handle_batch_reply(rt, &client, &body).await,
+            PostOutcome::Delivered(body) => {
+                if let Some(note) = batch::failed_items_note(&body, &items) {
+                    crate::hlog!("hub: {note}");
+                }
+                handle_batch_reply(rt, &client, &body).await
+            }
             PostOutcome::Refused(why) => {
                 crate::hlog!("hub: {} report(s) dropped ({why}): {}", items.len(), items.iter().map(|i| i.event.as_str()).collect::<Vec<_>>().join(", "));
             }

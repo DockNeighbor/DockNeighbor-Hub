@@ -209,8 +209,60 @@ pub fn from_report(r: &crate::linktap_runtime::Report) -> Item {
     Item { device: r.device.clone(), event: r.event.clone(), params: r.params.clone() }
 }
 
+/// PURE: a note for the log when the worker accepted a batch but rejected some of its items.
+///
+/// 🔴 WHY THIS EXISTS (2026-09-16): a Peplink GPS source's underway fixes were posted, the batch was
+/// answered 200, and nothing was stored — and the hub logged nothing, because it only logged a WHOLE
+/// batch refused or queued. The reply's `failed` count was the only trace, and nobody read it. The worker
+/// counts per-item failures but does not name them, so this lists what the post carried (event@device,
+/// de-duplicated, capped) beside the count: enough to tell which source to look at. `None` when nothing
+/// failed or the reply has no usable count.
+pub fn failed_items_note(reply: &Value, items: &[Item]) -> Option<String> {
+    let failed = match reply.get("failed") {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse::<u64>().unwrap_or(0),
+        _ => 0,
+    };
+    if failed == 0 {
+        return None;
+    }
+    const MAX_LISTED: usize = 12;
+    let mut seen: Vec<String> = Vec::new();
+    for it in items {
+        let tag = format!("{}@{}", it.event, it.device);
+        if !seen.contains(&tag) {
+            seen.push(tag);
+        }
+    }
+    let more = seen.len().saturating_sub(MAX_LISTED);
+    seen.truncate(MAX_LISTED);
+    let mut list = seen.join(", ");
+    if more > 0 {
+        list.push_str(&format!(", +{more} more"));
+    }
+    Some(format!("cloud rejected {failed} of {} report(s) in a delivered batch: {list}", items.len()))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn failed_items_note_names_what_the_post_carried_only_when_something_failed() {
+        let it = |d: &str, e: &str| Item { device: d.into(), event: e.into(), params: vec![] };
+        let items = vec![it("brv_gps_a", "gps.measurement"), it("brv_gps_a", "gps.measurement"), it("hub_1", "hub.status")];
+        assert_eq!(failed_items_note(&json!({"status":"ok","processed":3,"failed":0}), &items), None);
+        assert_eq!(failed_items_note(&json!({"status":"ok"}), &items), None, "no count is not a failure");
+        let note = failed_items_note(&json!({"status":"ok","processed":1,"failed":2}), &items).expect("a failure is logged");
+        assert_eq!(note, "cloud rejected 2 of 3 report(s) in a delivered batch: gps.measurement@brv_gps_a, hub.status@hub_1");
+        assert!(failed_items_note(&json!({"failed":"1"}), &items).is_some(), "a string count still counts");
+    }
+
+    #[test]
+    fn failed_items_note_caps_the_list() {
+        let items: Vec<Item> = (0..20).map(|n| Item { device: format!("sh_{n}"), event: "temperature.measurement".into(), params: vec![] }).collect();
+        let note = failed_items_note(&json!({"failed": 20}), &items).unwrap();
+        assert!(note.ends_with(", +8 more"), "{note}");
+    }
     use super::*;
     use crate::gps::GpsFix;
 
