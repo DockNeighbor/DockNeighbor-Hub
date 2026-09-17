@@ -1332,6 +1332,81 @@ check "feed: the hub-lite's version out of a Packages index" "0.15.2" \
 check "nap: sleeps until the soonest due work" "7" "$(LT_NAP_SLICE="" next_nap 100 107 200 "")"
 check "nap: sliced to 5 s while a valve could be woken" "5" "$(LT_NAP_SLICE=5 next_nap 100 200 300)"
 check "nap: overdue work loops straight round (1 s, never 0 or negative)" "1" "$(LT_NAP_SLICE="" next_nap 100 50)"
+
+echo ""
+echo "# --- 0.18.1: poll grace (owner ruling 2026-09-17) — the daemon 0.3.52's constants -----------------"
+check "grace: the daemon's constants — 45 s continuous, 2 bad samples, retry 5 s first, 60 s cap" "45 2 5 60" \
+  "$POLL_GRACE_SECS $POLL_GRACE_MIN_BAD $POLL_RETRY_FIRST_SECS $POLL_RETRY_CAP_SECS"
+check "grace: ONE failed poll holds (not down), retries 5 s after the failure, and starts the window at its start" "hold 5 0 1 0" \
+  "$(poll_grace "" 0 0 1 600)"
+check "grace: the first retry is 5 s after the failure is KNOWN (a 30 s timeout ends at 130), not after its start" "hold 135 100 1 0" \
+  "$(poll_grace "" 100 130 1 600)"
+# The whole schedule, each sample starting when the previous one asked, every one failing.
+_gs=""; _gt=0; _gsched=""
+for _gi in 1 2 3 4 5 6 7; do
+  # shellcheck disable=SC2046
+  set -- $(poll_grace "$_gs" "$_gt" "$_gt" 1 600)
+  _gsched="$_gsched $_gt:$1"; _gs="$3 $4 $5"; _gt=$2
+done
+check "grace: retries 5, 10, 20 s, then CLAMPED to first+45 (not 40), down at 45 s, then the 60 s cap" \
+  " 0:hold 5:hold 15:hold 35:hold 45:down 105:still 165:still" "$_gsched"
+check "grace: 44 s of continuous failure is still inside the grace" "hold" "$(poll_grace "0 1 0" 44 44 1 600 | cut -d' ' -f1)"
+check "grace: 45 s of continuous failure (2 samples) is down" "down" "$(poll_grace "0 1 0" 45 45 1 600 | cut -d' ' -f1)"
+check "grace: the retry is never later than the healthy cadence (30 s router: 45 + 30, not 45 + 60)" "75" \
+  "$(poll_grace "0 4 0" 45 45 1 30 | cut -d' ' -f2)"
+check "grace: once down there is no deadline clamp — the backoff continues from the count" "still 105" \
+  "$(poll_grace "0 5 1" 45 45 1 600 | cut -d' ' -f1-2)"
+check "grace: a good sample inside the grace is a quiet reset to the healthy cadence" "ok 740 0 0 0" "$(poll_grace "100 3 0" 140 141 0 600)"
+check "grace: the first good sample after DOWN is up, at once" "up 800 0 0 0" "$(poll_grace "0 9 1" 200 201 0 600)"
+check "grace: healthy stays healthy" "ok 700 0 0 0" "$(poll_grace "" 100 100 0 600)"
+
+# The local modem through sample_modem_graced, times injected. A read that answered nothing is "|||".
+MG="$T/mgrace"; mkdir -p "$MG"
+(
+  HUB_LITE_STATE="$MG/state"; MODEM_INTERVAL=600
+  log() { echo "$*" >> "$MG/log"; }
+  : > "$MG/log"
+  good='LTE -69 -102 10 -12|T-Mobile|ok|1048576 1048576'
+  snap() { echo "$1 P=$MODEM_P pending=$MODEM_PENDING next=$MODEM_NEXT_AT event=$MODEM_EVENT logs=$(wc -l < "$MG/log" | tr -d ' ')"; }
+  sample_modem_graced "$good" 0 8; MODEM_PENDING=0
+  snap good > "$MG/out"
+  sample_modem_graced '|||' 600 608
+  snap fail1 >> "$MG/out"
+  for t in 613 623 643 644; do sample_modem_graced '|||' "$t" "$t"; done
+  snap fail44 >> "$MG/out"
+  sample_modem_graced '|||' 645 653
+  snap fail45 >> "$MG/out"
+  MODEM_PENDING=0; MODEM_EVENT=0
+  sample_modem_graced '|||' 713 721
+  snap still >> "$MG/out"
+  sample_modem_graced "$good" 781 789
+  snap up >> "$MG/out"
+  MODEM_EVENT=0; sample_modem_graced "$good" 1381 1389
+  snap next-good >> "$MG/out"
+  grep -c 'reachable again' "$MG/log" >> "$MG/out"
+  # Never a good read since start: the pre-0.18.1 report of an empty read (up=1, no fields) at down.
+  MODEM_GRACE=""; MODEM_GOOD_P=""; MODEM_P=""; MODEM_PENDING=0
+  sample_modem_graced '|||' 0 8; snap never-hold >> "$MG/out"
+  # (set +u: the collector runs without -u, and an empty read's `set -- $_sig` leaves $1 unset.)
+  set +u; sample_modem_graced '|||' 45 53; set -u; snap never-down >> "$MG/out"
+)
+MGP='up=1&mode=LTE&rssi=-69&rsrp=-102&sinr=10&rsrq=-12&carrier=T-Mobile&sim=ok&dataMb=2'
+check "modem grace: a good read is reported and becomes the last good" "good P=$MGP pending=0 next=600 event=0 logs=0" "$(sed -n 1p "$MG/out")"
+check "modem grace: ONE failed read keeps the last good reading, reports nothing new, retries in 5 s, logs nothing" \
+  "fail1 P=$MGP pending=0 next=613 event=0 logs=0" "$(sed -n 2p "$MG/out")"
+check "modem grace: failing for 44 s is not down — last good kept, retry clamped to first+45 = 645" \
+  "fail44 P=$MGP pending=0 next=645 event=0 logs=0" "$(sed -n 3p "$MG/out")"
+check "modem grace: 45 s continuous is down — the last good reading with up=0, pending, a check-in asked for, ONE log line" \
+  "fail45 P=up=0${MGP#up=1} pending=1 next=713 event=1 logs=1" "$(sed -n 4p "$MG/out")"
+check "modem grace: still failing after down repeats nothing and logs nothing" \
+  "still P=up=0${MGP#up=1} pending=0 next=781 event=0 logs=1" "$(sed -n 5p "$MG/out")"
+check "modem grace: the first good read is up AT ONCE — pending, a check-in asked for, normal cadence" \
+  "up P=$MGP pending=1 next=1381 event=1 logs=2" "$(sed -n 6p "$MG/out")"
+check "modem grace: the next good read is ordinary (no event, no log)" "next-good P=$MGP pending=1 next=1981 event=0 logs=2" "$(sed -n 7p "$MG/out")"
+check "modem grace: 'reachable again' is logged once, and only because down had been reported" "1" "$(sed -n 8p "$MG/out")"
+check "modem grace: no good read since start — nothing reported inside the grace" "never-hold P= pending=0 next=13 event=0 logs=2" "$(sed -n 9p "$MG/out")"
+check "modem grace: no good read since start — at down, the pre-0.18.1 empty report (up=1, no fields)" \
+  "never-down P=up=1 pending=1 next=63 event=1 logs=3" "$(sed -n 10p "$MG/out")"
 ( CONF="$T/si.conf"; printf 'KEEP=1\nGPS_INTERVAL=120\n' > "$CONF"; set_intervals 300 600 >/dev/null 2>&1 )
 check "set_intervals: writes \$CONF (not a hard-coded /etc path) and keeps other keys" "KEEP=1 GPS_INTERVAL=\"300\" MODEM_INTERVAL=\"600\"" "$(tr '\n' ' ' < "$T/si.conf" | sed 's/ $//')"
 
@@ -1757,6 +1832,108 @@ check "report: the fix is spooled as the brv_gps_ device" "brv_gps_cp1	gps.measu
 check "report: the loop is asked to drain" "yes" "$([ -f "$RDIR/drain" ] && echo yes || echo no)"
 check "report: no secret in any log line" "0" "$(grep -c 'cret\|aaaaaaaa' "$RLOG")"
 
+# 0.18.1 poll grace on a managed router: rt_graced with injected times, the stub router's real
+# snapshot as the good reading, a failed poll as rt_poll leaves it (snapshot kept, RT_ERR set), and a
+# down read as the snapshot with the modem not connected.
+RG="$T/rgrace"; mkdir -p "$RG"; cp "$RDIR/brv_net_cp1.snap" "$RG/good.snap"
+(
+  # shellcheck disable=SC1091
+  . "$HL_DIR/brvg-hub-lite.sh"
+  RT_CONF="$RCONF"; RT_DIR="$RDIR"; BRVG_RT_LOG="$RG/log"; BRVG_RELAY_SPOOL="$RG/spool"
+  VID=v_test; WORKER_URL=https://api.example.test; DEVICE_ID=brv_net_hublite; DEVICE_TOKEN=hubtok_0123456789abcdef; PENDING_ACK=""
+  curl() { eval "echo \"\${$#}\"" | sed 's/.*&event=modem.measurement&t=[a-z]*&//' >> "$RG/sent"; printf '{}'; }
+  : > "$RG/log"; : > "$RG/sent"
+  rm -f "$RDIR/brv_net_cp1.grace" "$RDIR/brv_net_cp1.good" "$RDIR/brv_net_cp1.sent" "$RDIR/brv_net_cp1.ctr" "$RDIR/cadence"
+  rt_load brv_net_cp1
+  n() { printf '%s sent=%s logs=%s' "$1" "$(wc -l < "$RG/sent" | tr -d ' ')" "$(wc -l < "$RG/log" | tr -d ' ')"; }
+  fail() { RT_ERR="the router did not answer (timed out) — is the hub on the same network?"; rt_graced 0 "$1" "$2"; }
+  good() { cp "$RG/good.snap" "$RDIR/brv_net_cp1.snap"; rt_graced 1 "$1" "$2"; }
+  downread() { sed 's/^m\.connected\t1$/m.connected\t0/' "$RG/good.snap" | grep -v '^m\.connected' > "$RDIR/brv_net_cp1.snap"; rt_graced 1 "$1" "$2"; }
+
+  # `quiet T` = a report was sent at T-1, so the check-in cadence sends nothing on its own at T.
+  quiet() { echo $(( $1 - 1 )) > "$RDIR/brv_net_cp1.sent"; }
+  good 1000 1001; n good > "$RG/out"; echo >> "$RG/out"
+  # The check-in cadence says a report is due, so the grace's report shows what it reports.
+  echo 0 > "$RDIR/brv_net_cp1.sent"
+  fail 2000 2015; n fail1 >> "$RG/out"; echo >> "$RG/out"
+  echo " due=$(cat "$RDIR/brv_net_cp1.due") grace=$(cat "$RDIR/brv_net_cp1.grace")" >> "$RG/out"
+  quiet 2020; good 2020 2021; n recovered-quietly >> "$RG/out"; echo " grace=$(cat "$RDIR/brv_net_cp1.grace" 2>/dev/null)" >> "$RG/out"
+  quiet 3000; fail 3000 3001; quiet 3044; fail 3044 3045; n fail44 >> "$RG/out"; echo >> "$RG/out"
+  quiet 3045; fail 3045 3060; n fail45 >> "$RG/out"; echo >> "$RG/out"
+  quiet 3120; fail 3120 3121; n still >> "$RG/out"; echo >> "$RG/out"
+  quiet 3200; good 3200 3201; n up >> "$RG/out"; echo >> "$RG/out"
+  quiet 3300; good 3300 3301; n next-good >> "$RG/out"; echo >> "$RG/out"
+  echo 0 > "$RDIR/brv_net_cp1.sent"
+  downread 4000 4001; n down1 >> "$RG/out"; echo >> "$RG/out"
+  quiet 4045; downread 4045 4046; n down45 >> "$RG/out"; echo >> "$RG/out"
+)
+RGGOOD=$(sed -n 1p "$RG/sent")
+check "router grace: the good reading is reported" "1" "$(printf '%s' "$RGGOOD" | grep -c '^up=1&mode=LTE&rssi=-71&.*&av=hub-lite-0\.18\.1$')"
+check "router grace: ONE failed poll — the LAST GOOD reading, unchanged, is what the due report sends; nothing logged" \
+  "fail1 sent=2 logs=0|$RGGOOD" "$(sed -n 2p "$RG/out")|$(sed -n 2p "$RG/sent")"
+check "router grace: the failed poll is retried 5 s after it failed, and the window starts at its start" " due=2020 grace=2000 1 0" "$(sed -n 3p "$RG/out")"
+check "router grace: a good poll inside the grace resets it quietly" "recovered-quietly sent=2 logs=0 grace=" "$(sed -n 4p "$RG/out")"
+check "router grace: failing for 44 s reports nothing down and logs nothing" "fail44 sent=2 logs=0" "$(sed -n 5p "$RG/out")"
+check "router grace: 45 s continuous is DOWN at once (off-cadence), with ONE log line" "fail45 sent=3 logs=1" "$(sed -n 6p "$RG/out")"
+check "router grace: the down report is the last good reading with up=0" "up=0${RGGOOD#up=1}" "$(sed -n 3p "$RG/sent")"
+check "router grace: the down log line names the reason" "1" "$(grep -c "^routers: 127.0.0.1 'CBA850' - no answer for 45s - reporting it down (the router did not answer (timed out)" "$RG/log")"
+check "router grace: still failing after down sends nothing inside the cadence and logs nothing" "still sent=3 logs=1" "$(sed -n 7p "$RG/out")"
+check "router grace: the first good poll after down is UP at once, with one 'reachable again'" "up sent=4 logs=2|$RGGOOD|1" \
+  "$(sed -n 8p "$RG/out")|$(sed -n 4p "$RG/sent")|$(grep -c "reachable again" "$RG/log")"
+check "router grace: the next good poll is ordinary — no send inside the cadence, no log" "next-good sent=4 logs=2" "$(sed -n 9p "$RG/out")"
+check "router grace: ONE down READ sends no up=0 (the due report is the last good reading)" "down1 sent=5 logs=2|$RGGOOD" \
+  "$(sed -n 10p "$RG/out")|$(sed -n 5p "$RG/sent")"
+check "router grace: 45 s of down READS reports down at once — the read itself, up=0 — with one log line" "down45 sent=6 logs=3|1|1" \
+  "$(sed -n 11p "$RG/out")|$(sed -n 6p "$RG/sent" | grep -c '^up=0&mode=LTE&rssi=-71&')|$(grep -c "uplink down for 45s - reporting it down" "$RG/log")"
+check "router grace: the failure reason is logged ONCE, on the down line — never per failed poll (5 failed polls here)" "1" "$(grep -c 'did not answer' "$RG/log")"
+rm -f "$RDIR/brv_net_cp1.grace" "$RDIR/brv_net_cp1.good" "$RDIR/brv_net_cp1.due"
+cp "$RG/good.snap" "$RDIR/brv_net_cp1.snap"
+
+# End to end through rt_poll_report: a router that refuses the connection is ONE failed poll — no
+# report, no log, and its due time moved to 5 s after the failure (between the poll's start + 5 and
+# its end + 5, whatever the clock did in between).
+(
+  # shellcheck disable=SC1091
+  . "$HL_DIR/brvg-hub-lite.sh"
+  RT_CONF="$RCONF"; RT_DIR="$RDIR"; BRVG_RT_LOG="$RG/log3"; BRVG_RELAY_SPOOL="$RG/spool3"
+  VID=v_test; WORKER_URL=https://api.example.test; DEVICE_ID=brv_net_hublite; DEVICE_TOKEN=hubtok_0123456789abcdef
+  curl() { if [ "$1" = "-K" ]; then command curl "$@"; else echo sent >> "$RG/sent3"; printf '{}'; fi; }
+  : > "$RG/log3"; : > "$RG/sent3"; echo 0 > "$RDIR/brv_net_cp1.sent"
+  _s=$(date +%s)
+  ( rt_load brv_net_cp1 && RT_HOST=127.0.0.1 && RT_PORT=1 && rt_poll_report )
+  _e=$(date +%s); _d=$(cat "$RDIR/brv_net_cp1.due")
+  echo "$([ "$_d" -ge $(( _s + 5 )) ] && [ "$_d" -le $(( _e + 5 )) ] && echo retry-5s) $(cut -d' ' -f2,3 "$RDIR/brv_net_cp1.grace") sent=$(wc -l < "$RG/sent3" | tr -d ' ') logs=$(wc -l < "$RG/log3" | tr -d ' ')" > "$RG/e2e"
+  # The loop's nap sees the retry: rt_next_due is the soonest enabled router's due time.
+  echo $(( _e + 3 )) > "$RDIR/brv_net_cp1.due"; rm -f "$RDIR/brv_net_cp1.pid"
+  echo "next=$(( $(rt_next_due "$_e") - _e ))" >> "$RG/e2e"
+  sleep 60 & echo $! > "$RDIR/brv_net_cp1.pid"; echo $(( _e + 100 )) > "$RDIR/brv_net_cp1.due"
+  echo "running=$(( $(rt_next_due "$_e") - _e ))" >> "$RG/e2e"
+  kill "$(cat "$RDIR/brv_net_cp1.pid")" 2>/dev/null; rm -f "$RDIR/brv_net_cp1.pid"
+)
+check "router grace e2e: one refused connection — retry due in 5 s, one bad sample, no report, no log" "retry-5s 1 0 sent=0 logs=0" "$(sed -n 1p "$RG/e2e")"
+check "router grace e2e: rt_next_due hands the loop the router's due time" "next=3" "$(sed -n 2p "$RG/e2e")"
+check "router grace e2e: while a read is running the loop naps at most 5 s (it may move its due earlier)" "running=5" "$(sed -n 3p "$RG/e2e")"
+rm -f "$RDIR/brv_net_cp1.grace" "$RDIR/brv_net_cp1.good" "$RDIR/brv_net_cp1.due" "$RDIR/brv_net_cp1.sent"
+cp "$RG/good.snap" "$RDIR/brv_net_cp1.snap"
+
+# The raised background-poll timeouts are what curl is given; the interactive door keeps its own.
+(
+  # shellcheck disable=SC1091
+  . "$HL_DIR/brvg-hub-lite.sh"
+  RT_CONF="$RCONF"; RT_DIR="$RDIR"; BRVG_RT_LOG="$RG/log2"; BRVG_RELAY_SPOOL="$RG/spool2"
+  VID=v_test; WORKER_URL=https://api.example.test; DEVICE_ID=brv_net_hublite; DEVICE_TOKEN=hubtok_0123456789abcdef
+  curl() { if [ "$1" = "-K" ]; then tee -a "$RG/cfg.$RG_WHO" | command curl "$@"; else printf '{}'; fi; }
+  rm -f "$RG"/cfg.*
+  RG_WHO=poll; ( rt_load brv_net_cp1 && rt_poll_report )
+  RG_WHO=door; ( rt_load brv_net_cp1 && rt_work && rt_poll; rm -rf "$RT_W" )
+)
+check "timeouts: the background poll gives curl max-time 30 / connect-timeout 15 on every request" "30 15" \
+  "$(grep '^max-time = ' "$RG/cfg.poll" | sort -u | sed 's/.*= //' | paste -sd' ' -) $(grep '^connect-timeout = ' "$RG/cfg.poll" | sort -u | sed 's/.*= //' | paste -sd' ' -)"
+check "timeouts: the interactive door (refresh's rt_poll) keeps 15 / 5" "15 5" \
+  "$(grep '^max-time = ' "$RG/cfg.door" | sort -u | sed 's/.*= //' | paste -sd' ' -) $(grep '^connect-timeout = ' "$RG/cfg.door" | sort -u | sed 's/.*= //' | paste -sd' ' -)"
+check "timeouts: both actually polled the stub (requests were made)" "yes" \
+  "$([ "$(grep -c '^url = ' "$RG/cfg.poll")" -ge 2 ] && [ "$(grep -c '^url = ' "$RG/cfg.door")" -ge 2 ] && echo yes || echo no)"
+
 # The loop hook: a due router is read in the BACKGROUND (never stalling the valve loop), once.
 (
   RT_CONF="$RCONF"; RT_DIR="$RDIR"; BRVG_RT_LOG="$RLOG"; BRVG_RELAY_SPOOL="$T/rt.spool"; VID=v_test; WORKER_URL=https://api.example.test
@@ -2114,9 +2291,9 @@ check "check-in: three check-ins, three POSTs to /api/agent/batch and no GET at 
 check "check-in: the watch signature rides the batch URL — agentBatchRoute reads ?anchorsig=, never the item's param" "3" \
   "$(grep -c '^POST https://api.example.test/api/agent/batch?vid=v_test&device=brv_net_test&t=tok_SECRET_0123456789&anchorsig=[0-9]*$' "$C17/urls.ci")"
 check "check-in: the hub.checkin item carries the modem sample — the cloud stores it as modem.measurement" "2" \
-  "$(grep -c '"device":"brv_net_test","event":"hub.checkin","params":{"up":"1","rssi":"-70","sinr":"12","dataMb":"1234","av":"0\.18\.0"' "$C17/bodies.ci")"
+  "$(grep -c '"device":"brv_net_test","event":"hub.checkin","params":{"up":"1","rssi":"-70","sinr":"12","dataMb":"1234","av":"0\.18\.1"' "$C17/bodies.ci")"
 check "check-in: with no sample pending the item is a PLAIN check-in (av alone is not a reading)" "1" \
-  "$(grep -c '"event":"hub.checkin","params":{"av":"0\.18\.0"}' "$C17/bodies.ci")"
+  "$(grep -c '"event":"hub.checkin","params":{"av":"0\.18\.1"}' "$C17/bodies.ci")"
 check "check-in: the pending modem sample rides ONE check-in only (once per sample, as in 0.17.0)" "2" \
   "$(grep -c '"rssi":"-70"' "$C17/bodies.ci")"
 check "check-in: the check-in batch is kind delta — a conditionally-built modem sample is not a keyframe" "3" \

@@ -195,6 +195,14 @@ If the app shows no position from the router, the order to check is: does `/dev/
 - `GPS_INTERVAL` (default 120 s, floor 30) and `MODEM_INTERVAL` (default 600 s, floor 60) are
   **sample** clocks, not send clocks. Managed routers (`routers.sh`) poll on their own clock but
   report at the check-in cadence.
+- **Poll grace (0.18.1, owner ruling 2026-09-17; the daemon 0.3.52's constants).** A failed poll or a
+  read reporting the uplink down (up=0) is a bad sample, for a managed router and for this router's
+  own modem. Nothing is reported down until bad samples have been continuous for 45 s (and at least
+  two of them); meanwhile the last good reading is what is reported, and a failure is retried 5, 10,
+  20, 40, then every 60 s (never slower than the normal cadence, and landing on the 45 s mark). Down
+  then goes out at once with one log line; the first good sample reports up at once. The background
+  router poll gives curl 30 s per request (connect 15 s); the interactive `/api/hub/routers` door
+  keeps 15 s / 5 s.
 - GPS **report-by-exception** (telemetry design §A7.2): local drag, zone and underway detection run
   on every sample; a position is SENT only when unarmed and it moved `GPS_DEADBAND_M` (default 50 m,
   floor 25 m) from the last sent one and more than twice its accuracy; every sample while leased;

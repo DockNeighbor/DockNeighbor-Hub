@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.18.0"
+HUB_LITE_VERSION="0.18.1"
 HUB_LITE_BACKUP="/etc/brvg-hub-lite.prev"
 
 # The LAST telemetry this hub-lite composed, as JSON, for the LAN management door to serve
@@ -1972,14 +1972,110 @@ collect_wan_usage() {
   printf '%s' "$_out"
 }
 
+# --- Poll grace (0.18.1, owner ruling 2026-09-17: "router polling is too aggressive and router cards
+# flap") -----------------------------------------------------------------------------------------
+# One rule for a managed router (routers.sh) and for this router's own modem, with the SAME constants
+# as the daemon's 0.3.52:
+#   * A single failed poll or timeout NEVER marks a device down. Neither does a single read that
+#     reports the uplink down (up=0). Both are "bad samples".
+#   * Down only when bad samples have been CONTINUOUS for POLL_GRACE_SECS (first bad sample's start
+#     to this bad sample's start) AND there have been at least POLL_GRACE_MIN_BAD of them.
+#   * Retry quickly and back off: 5, 10, 20, 40, then 60 s after each failure — never later than the
+#     device's normal cadence, and while not yet down never later than first bad + 45 s, so down is
+#     decided at ~45 s rather than at the next backoff step.
+#   * The first good sample recovers at once.
+POLL_GRACE_SECS=45
+POLL_GRACE_MIN_BAD=2
+POLL_RETRY_FIRST_SECS=5
+POLL_RETRY_CAP_SECS=60
+
+# PURE: one sample through the grace state machine. Takes every time it needs (no clock read here).
+#   $1 state "first_bad_at consecutive down" ("" = healthy)   $2 the sample's START epoch
+#   $3 the epoch the outcome was known (after the poll)        $4 bad: 1 | 0
+#   $5 the device's normal cadence in seconds
+# → "action next_at first_bad_at consecutive down", action one of
+#   ok    good sample, was not down          up    good sample after a DOWN report — send the up now
+#   hold  bad, still inside the grace         down  bad, and the grace just ran out — report down now
+#   still bad, already reported down
+poll_grace() {
+  _pg_first=0; _pg_n=0; _pg_down=0
+  case "$1" in
+    *" "*" "*) _pg_first=${1%% *}; _pg_r=${1#* }; _pg_n=${_pg_r%% *}; _pg_down=${_pg_r#* } ;;
+  esac
+  if [ "$4" != 1 ]; then
+    _pg_a=ok; [ "$_pg_down" = 1 ] && _pg_a=up
+    echo "$_pg_a $(( $2 + $5 )) 0 0 0"
+    return 0
+  fi
+  [ "$_pg_n" -gt 0 ] 2>/dev/null || _pg_first=$2
+  _pg_n=$(( _pg_n + 1 ))
+  if [ "$_pg_down" = 1 ]; then
+    _pg_a=still
+  elif [ "$_pg_n" -ge "$POLL_GRACE_MIN_BAD" ] && [ $(( $2 - _pg_first )) -ge "$POLL_GRACE_SECS" ]; then
+    _pg_a=down; _pg_down=1
+  else
+    _pg_a=hold
+  fi
+  # Backoff for the n-th consecutive bad sample: 5 * 2^(n-1), capped.
+  _pg_b=$POLL_RETRY_FIRST_SECS; _pg_i=1
+  while [ "$_pg_i" -lt "$_pg_n" ] && [ "$_pg_b" -lt "$POLL_RETRY_CAP_SECS" ]; do _pg_b=$(( _pg_b * 2 )); _pg_i=$(( _pg_i + 1 )); done
+  [ "$_pg_b" -gt "$POLL_RETRY_CAP_SECS" ] && _pg_b=$POLL_RETRY_CAP_SECS
+  _pg_next=$(( $3 + _pg_b ))
+  # Never less often than the healthy cadence.
+  [ $(( $2 + $5 )) -lt "$_pg_next" ] && _pg_next=$(( $2 + $5 ))
+  # Not down yet: the retry lands no later than the moment down can be decided.
+  [ "$_pg_down" = 0 ] && [ $(( _pg_first + POLL_GRACE_SECS )) -lt "$_pg_next" ] && _pg_next=$(( _pg_first + POLL_GRACE_SECS ))
+  echo "$_pg_a $_pg_next $_pg_first $_pg_n $_pg_down"
+}
+
 # 0.17.0: the modem is SAMPLED every MODEM_INTERVAL (the LAN door's state file stays fresh) and the
 # newest sample is SENT on the check-in, at most once per sample. Two functions because the two clocks
 # are different; push_modem is both, for a command follow-up that wants the new state out now.
+#
+# 0.18.1: the sample goes through poll_grace. A read of the modem's AT port that answered NOTHING (no
+# signal, no carrier, no SIM state) is a bad sample: inside the grace the last good sample stays the
+# one reported (MODEM_P is left alone), after 45 s the down report is that sample with up=0, and the
+# first good read reports up again at once. MODEM_NEXT_AT is when to read again ("" = the normal
+# MODEM_INTERVAL); MODEM_EVENT=1 asks the loop for a check-in now (a down or an up to report).
+# This modem's read never reports up=0 by itself (it has no connection state to read), so for it only
+# a failed read is a bad sample.
 MODEM_P=""; MODEM_PENDING=0
+MODEM_GRACE=""; MODEM_GOOD_P=""; MODEM_NEXT_AT=""; MODEM_EVENT=0
 
 sample_modem() {
+  MODEM_NEXT_AT=""
+  _sm_t0=$(date +%s)
   _m=$(collect_modem)
   [ -z "$_m" ] && return 0
+  _sm_t1=$(date +%s)
+  sample_modem_graced "$_m" "$_sm_t0" "$_sm_t1"
+}
+
+# $1 collect_modem's line, $2 the read's start epoch, $3 the epoch it finished. Separate from the
+# clock reads so test.sh can drive it with injected times.
+sample_modem_graced() {
+  _m=$1
+  _sm_bad=0; [ "${_m%|*}" = "||" ] && _sm_bad=1
+  # shellcheck disable=SC2046
+  set -- $(poll_grace "$MODEM_GRACE" "$2" "$3" "$_sm_bad" "$MODEM_INTERVAL")
+  _sm_act=$1; MODEM_NEXT_AT=$2; MODEM_GRACE="$3 $4 $5"; [ "$4" = 0 ] && MODEM_GRACE=""
+  case "$_sm_act" in
+    hold|still) return 0 ;;
+    down)
+      log "modem: no answer from the modem for ${POLL_GRACE_SECS}s - reporting it down"
+      MODEM_EVENT=1
+      if [ -n "$MODEM_GOOD_P" ]; then
+        MODEM_P="up=0${MODEM_GOOD_P#up=1}"; MODEM_PENDING=1
+        write_state "modem.measurement" "$MODEM_P&av=$HUB_LITE_VERSION"
+        return 0
+      fi
+      # No good sample since this hub-lite started: the pre-0.18.1 behaviour, the empty read as it
+      # was always reported (up=1 and no fields), falls through below.
+      ;;
+    up)
+      log "modem: reachable again"
+      MODEM_EVENT=1 ;;
+  esac
   _sig=${_m%%|*}; _rest=${_m#*|}
   _carrier=${_rest%%|*}; _rest=${_rest#*|}
   _sim=${_rest%%|*}; _data=${_rest#*|}
@@ -2002,6 +2098,7 @@ sample_modem() {
     fi
   fi
   MODEM_P="$_p"; MODEM_PENDING=1
+  [ "$_sm_bad" = 0 ] && MODEM_GOOD_P="$_p"
   # State at SAMPLE time: what this router knows about itself is true whether or not the WAN is up,
   # and the LAN door is exactly the door that still works when the cloud send fails.
   write_state "modem.measurement" "$_p&av=$HUB_LITE_VERSION"
@@ -3269,11 +3366,18 @@ main() {
       LT_NAP_SLICE=30
     fi
     # 4. The modem: a SAMPLE clock. The newest sample goes out on the next check-in (send_modem).
+    #    0.18.1: a failed read is retried on poll_grace's schedule (MODEM_NEXT_AT, 5 s first), and a
+    #    down or an up it has to report asks for the check-in now (MODEM_EVENT).
     if [ "$(date +%s)" -ge "$_next_modem" ]; then
       sample_modem
-      # The hub watchdog is a LAN probe; it only sends when it releases or recovers.
+      _next_modem=${MODEM_NEXT_AT:-$(( $(date +%s) + MODEM_INTERVAL ))}
+      [ "$MODEM_EVENT" = 1 ] && { MODEM_EVENT=0; _next_checkin=0; }
+    fi
+    # The hub watchdog is a LAN probe; it only sends when it releases or recovers. Its own clock, at
+    # the modem's healthy cadence, so a modem retry every few seconds does not probe the hub with it.
+    if [ "$(date +%s)" -ge "${_next_watch:-0}" ]; then
       watch_hub
-      _next_modem=$(( $(date +%s) + MODEM_INTERVAL ))
+      _next_watch=$(( $(date +%s) + MODEM_INTERVAL ))
     fi
     # 5. THE CHECK-IN (D6): 15 min unwatched, 1 min while a lease is live — and since 0.18.0 ONE POST
     #    /api/agent/batch, not a check-in GET plus a modem GET. The modem sample, the idle valves, the
@@ -3318,9 +3422,10 @@ main() {
       log "command follow-up: reporting the new state"
       gps_tick force   # a follow-up / report_now wants a fresh line, deadband notwithstanding
       sample_modem
+      MODEM_EVENT=0   # the check-in below carries whatever it had to report
       do_checkin "$(date +%s)"
       _next_gps=$(( $(date +%s) + $(gps_sample_secs "$(date +%s)") ))
-      _next_modem=$(( $(date +%s) + MODEM_INTERVAL ))
+      _next_modem=${MODEM_NEXT_AT:-$(( $(date +%s) + MODEM_INTERVAL ))}
       _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK") ))
     fi
     command -v rt_tick >/dev/null 2>&1 && rt_tick   # managed routers: due reads run in the background (routers.sh)
@@ -3328,7 +3433,9 @@ main() {
     lt_configured && _lt_due=$_next_lt
     _hb_due=""
     hb_armed && _hb_due=$(hb_due_at "$(date +%s)")
-    sleep "$(next_nap "$(date +%s)" "$_next_gps" "$_next_modem" "$_next_checkin" "$_hb_due" "$_lt_due")"
+    _rt_due=""
+    command -v rt_next_due >/dev/null 2>&1 && _rt_due=$(rt_next_due "$(date +%s)")
+    sleep "$(next_nap "$(date +%s)" "$_next_gps" "$_next_modem" "$_next_checkin" "$_hb_due" "$_lt_due" "$_rt_due")"
   done
 }
 
