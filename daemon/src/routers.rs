@@ -38,15 +38,33 @@ pub fn poll_secs(cfg: &RouterConfig) -> u64 {
     if cfg.poll_secs == 0 { DEFAULT_POLL_SECS } else { u64::from(cfg.poll_secs).max(POLL_FLOOR_SECS) }
 }
 
+/// The per-request deadline on an INTERACTIVE router call (lan_client: an app action waiting on the
+/// answer, inside the relay's 30 s call deadline, hub_relay CALL_TIMEOUT). Unchanged at 15 s.
+pub const LAN_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// The per-request deadline on the BACKGROUND poll's calls to a Cradlepoint NCOS or Peplink API
+/// (poll_client): 30 s, raised from 15 s (owner ruling 2026-09-17 — router APIs can be slow, a Peplink
+/// poll signs in before it reads, and a slow answer must never read as a router that is down;
+/// router_health decides down, after 45 s of continuous failure).
+pub const POLL_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// An HTTP client for LAN gear. ⚠️ ACCEPTS SELF-SIGNED CERTIFICATES on purpose: a Cradlepoint
 /// serves its NCOS API on 443 with a factory self-signed certificate (owner: "cradlepoints have
 /// https redirects by default, ssl/443 should be default"), and there is no CA on a boat LAN to
 /// vouch for it. This client is used ONLY for addresses the owner typed into the hub; the cloud
 /// client in hub_server keeps full verification.
 pub fn lan_client() -> reqwest::Client {
+    lan_client_with(LAN_HTTP_TIMEOUT)
+}
+
+/// The same LAN client for the background router poll, with the generous POLL_HTTP_TIMEOUT.
+pub fn poll_client() -> reqwest::Client {
+    lan_client_with(POLL_HTTP_TIMEOUT)
+}
+
+fn lan_client_with(timeout: std::time::Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(timeout)
         .build()
         .expect("reqwest client")
 }
@@ -782,6 +800,15 @@ impl<'a> Driver<'a> {
         Driver::new(client, &cfg.vendor, &cfg.host, cfg.port, &cfg.username, &cfg.password)
     }
 
+    /// The driver the background poll uses: the HTTP deadline is the client's (poll_client), and a
+    /// dish gets the poll's own gRPC deadline (starlink::POLL_CALL_TIMEOUT).
+    pub fn for_poll(client: &'a reqwest::Client, cfg: &RouterConfig) -> Result<Self, String> {
+        Ok(match Driver::for_router(client, cfg)? {
+            Driver::Starlink(s) => Driver::Starlink(s.with_timeout(crate::starlink::POLL_CALL_TIMEOUT)),
+            d => d,
+        })
+    }
+
     pub fn vendor(&self) -> &'static str {
         match self {
             Driver::Cradlepoint(_) => "cradlepoint",
@@ -953,12 +980,22 @@ pub fn gps_unsupported_note(cfg: &RouterConfig, prev: Option<&Snapshot>, now: &S
     })
 }
 
-/// One full read of a device — the poll loop's unit of work and the `refresh` action.
+/// One full read of a device for the `refresh` action (an app waiting: lan_client, interactive deadlines).
 pub async fn poll(client: &reqwest::Client, cfg: &RouterConfig, prev: Option<&Snapshot>) -> Snapshot {
+    poll_with(Driver::for_router(client, cfg), cfg, prev).await
+}
+
+/// One full read of a device for the background poll loop — pass poll_client(); a dish gets the poll's
+/// gRPC deadline. Whether a failure here is REPORTED is router_health's decision, not this read's.
+pub async fn poll_in_background(client: &reqwest::Client, cfg: &RouterConfig, prev: Option<&Snapshot>) -> Snapshot {
+    poll_with(Driver::for_poll(client, cfg), cfg, prev).await
+}
+
+async fn poll_with(drv: Result<Driver<'_>, String>, cfg: &RouterConfig, prev: Option<&Snapshot>) -> Snapshot {
     let now = crate::hub_server::now_ms();
     let mut snap = prev.cloned().unwrap_or_default();
     snap.at_ms = now;
-    let drv = match Driver::for_router(client, cfg) {
+    let drv = match drv {
         Ok(d) => d,
         Err(why) => {
             snap.error = Some(why);
@@ -1483,5 +1520,66 @@ mod gps_capability_tests {
         let w = crate::peplink::parse_wan(&down).unwrap();
         assert_eq!((w.up, w.uptime_s), (false, None));
         assert_eq!(wan_params(&w, None).iter().find(|(k, _)| k == "uptime"), None);
+    }
+}
+
+/// The poll's deadlines (owner ruling 2026-09-17: generous per-request timeouts for router APIs).
+#[cfg(test)]
+mod poll_deadline_tests {
+    use super::*;
+
+    /// A LAN device that accepts the connection and never answers — a router API that is slow.
+    async fn silent_device() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        (port, hold)
+    }
+
+    fn silent_cfg(vendor: &str, port: u16) -> RouterConfig {
+        RouterConfig { id: "brv_net_slow".into(), vendor: vendor.into(), host: "127.0.0.1".into(), port, password: "x".into(), ..RouterConfig::default() }
+    }
+
+    /// Time the background poll of a silent device takes to give up, on the paused clock.
+    async fn background_poll_gives_up_after(vendor: &str) -> std::time::Duration {
+        let (port, hold) = silent_device().await;
+        let t0 = tokio::time::Instant::now();
+        let snap = poll_in_background(&poll_client(), &silent_cfg(vendor, port), None).await;
+        let took = t0.elapsed();
+        hold.abort();
+        assert!(snap.error.as_deref().is_some_and(|e| e.contains("timed out")), "{vendor}: {:?}", snap.error);
+        took
+    }
+
+    #[test]
+    fn the_poll_deadlines_are_the_raised_values_and_interactive_ones_are_unchanged() {
+        assert_eq!(POLL_HTTP_TIMEOUT, std::time::Duration::from_secs(30), "Cradlepoint/Peplink poll: 15 s → 30 s");
+        assert_eq!(crate::starlink::POLL_CALL_TIMEOUT, std::time::Duration::from_secs(30), "Starlink poll: 10 s → 30 s");
+        // An app action waits inside the relay's 30 s call deadline: those stay where they were.
+        assert_eq!(LAN_HTTP_TIMEOUT, std::time::Duration::from_secs(15));
+        assert_eq!(crate::starlink::CALL_TIMEOUT, std::time::Duration::from_secs(10));
+        let client = lan_client();
+        let dish = silent_cfg("starlink", 9200);
+        match (Driver::for_poll(&client, &dish).unwrap(), Driver::for_router(&client, &dish).unwrap()) {
+            (Driver::Starlink(p), Driver::Starlink(a)) => {
+                assert_eq!(p.timeout(), crate::starlink::POLL_CALL_TIMEOUT, "the poll's dish uses the poll deadline");
+                assert_eq!(a.timeout(), crate::starlink::CALL_TIMEOUT);
+            }
+            _ => panic!("a starlink config is a Starlink driver"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_background_poll_waits_the_full_30_s_on_a_slow_router_api() {
+        for vendor in ["cradlepoint", "peplink", "starlink"] {
+            let took = background_poll_gives_up_after(vendor).await;
+            assert!(took >= std::time::Duration::from_secs(30), "{vendor} gave up after {took:?} — the poll deadline is 30 s");
+            assert!(took < std::time::Duration::from_secs(31), "{vendor} took {took:?}: one request, one deadline");
+        }
     }
 }
