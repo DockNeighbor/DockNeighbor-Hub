@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.18.1"
+HUB_LITE_VERSION="0.18.2"
 HUB_LITE_BACKUP="/etc/brvg-hub-lite.prev"
 
 # The LAST telemetry this hub-lite composed, as JSON, for the LAN management door to serve
@@ -2028,6 +2028,57 @@ poll_grace() {
   echo "$_pg_a $_pg_next $_pg_first $_pg_n $_pg_down"
 }
 
+# --- STATE vs LIVE-ONLY telemetry (0.18.2, owner ruling Jonathan 2026-09-19) --------------------
+# Noisy live telemetry is NOT sent to the cloud unless someone is watching live (a watch LEASE is
+# active: lease_active, from LIVE_LEASE/LIVE_UNTIL). The hub-lite keeps sampling and caching these
+# values — the LAN door's state file (write_state) and meas.<dev> still carry every field — but
+# outside a lease a report carries only STATE.
+#
+# ⚠️ THE LIST IS THE CLOUD'S: DockNeighbor-Cloud `src/liveTelemetryFields.ts` (LIVE_TELEMETRY). Change it
+# there first, then here and in the daemon (brvg-hub daemon/src/batch.rs MODEM_LIVE_ONLY). ONE copy on
+# the hub-lite: routers.sh is sourced by this file and uses these same two variables.
+#
+# UNKNOWN FIELDS ARE STATE: only a field NAMED here is held back, so one a vendor adds tomorrow is sent
+# (the worker's own test fails on an unclassified field rather than letting it vanish).
+#
+# `wanKb_*` is NOT here on purpose, although the Cloud list marks it live-only by prefix: the worker
+# accounts every delta into the billing-cycle total from the RAW report before it strips its copy on
+# the reading, so a delta goes out whenever there is one, leased or not.
+#
+# Nothing decides "send now" from a live-only field: a modem sample is sent once per check-in and its
+# early check-in (MODEM_EVENT) is poll_grace's up/down only; a managed router's off-cadence send is
+# poll_grace's up/down only (rt_graced); a valve's is lt_should_send's watering/rf signature.
+# modem.measurement (this router's modem, a managed router, a hub.checkin carrying modem fields):
+LIVE_ONLY_MODEM="rssi rsrp rsrq sinr signal latency ping loss obstruction obstructed uptime downMbps upMbps sats"
+# linktap.measurement: the valve's radio signal.
+LIVE_ONLY_LINKTAP="signal"
+
+# PURE: $2 ("k=v&k=v") without the keys named in $1 (space-separated), order kept. Empty segments go.
+strip_live_only() {
+  _slo_out=""; _slo_rest=$2
+  while [ -n "$_slo_rest" ]; do
+    case "$_slo_rest" in
+      *'&'*) _slo_kv=${_slo_rest%%&*}; _slo_rest=${_slo_rest#*&} ;;
+      *) _slo_kv=$_slo_rest; _slo_rest="" ;;
+    esac
+    [ -n "$_slo_kv" ] || continue
+    case " $1 " in *" ${_slo_kv%%=*} "*) continue ;; esac
+    _slo_out="${_slo_out:+$_slo_out&}$_slo_kv"
+  done
+  printf '%s' "$_slo_out"
+}
+
+# The params of event $1 AS THEY MAY GO ON THE WIRE: $2 unchanged while a lease is live (or for an
+# event the ruling does not cover), otherwise without its live-only fields. $3 now (default: the clock).
+wire_params() {
+  case "$1" in
+    modem.measurement|hub.checkin) _wp_l=$LIVE_ONLY_MODEM ;;
+    linktap.measurement) _wp_l=$LIVE_ONLY_LINKTAP ;;
+    *) printf '%s' "$2"; return 0 ;;
+  esac
+  if lease_active "${3:-}"; then printf '%s' "$2"; else strip_live_only "$_wp_l" "$2"; fi
+}
+
 # 0.17.0: the modem is SAMPLED every MODEM_INTERVAL (the LAN door's state file stays fresh) and the
 # newest sample is SENT on the check-in, at most once per sample. Two functions because the two clocks
 # are different; push_modem is both, for a command follow-up that wants the new state out now.
@@ -2129,9 +2180,13 @@ CHECKIN_MODEM_SENT=""
 
 send_modem() {
   [ "$MODEM_PENDING" = "1" ] && [ -n "$MODEM_P" ] || return 0
+  # CHECKIN_MODEM_SENT is already the wire copy, and compose_checkin_item already wrote the LAN copy.
   _p="${CHECKIN_MODEM_SENT:-}"; CHECKIN_MODEM_SENT=""
-  [ -n "$_p" ] || _p=$(modem_send_params)
-  write_state "modem.measurement" "$_p"
+  if [ -z "$_p" ]; then
+    _p=$(modem_send_params)
+    write_state "modem.measurement" "$_p"   # the LAN door keeps every field, leased or not
+    _p=$(wire_params "modem.measurement" "$_p")
+  fi
   send_event "modem.measurement" "$_p" && MODEM_PENDING=0
 }
 
@@ -2210,7 +2265,9 @@ lt_post() {
 # Append one line to the relay spool. BRVG_RELAY_SPOOL is read at CALL time, because the receiver
 # CGI and the tests set it per call.
 lt_spool() {
-  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "$3" >> "${BRVG_RELAY_SPOOL:-$RELAY_SPOOL}"
+  # Live-only fields (a valve's `signal`) are dropped HERE when nobody is watching (wire_params) —
+  # the spool is the wire's copy; the LAN door's meas.<dev> keeps them.
+  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "$(wire_params "$2" "$3")" >> "${BRVG_RELAY_SPOOL:-$RELAY_SPOOL}"
   # The poll loop drains promptly after a tick that spooled something (0.17.0: nothing is spooled
   # on a quiet idle poll any more, so "something was spooled" is itself the signal).
   LT_SENT=1
@@ -3065,13 +3122,15 @@ keys_on_checkin() {
 compose_checkin_item() {
   CHECKIN_MODEM_SENT=""
   if [ "${MODEM_PENDING:-0}" = "1" ] && [ -n "${MODEM_P:-}" ]; then
-    CHECKIN_ITEM=$(modem_send_params)
+    _cci=$(modem_send_params)
+    # The LAN door's copy, exactly as send_modem writes it: what this router says about itself must
+    # be the same through both doors, and the LAN door is the one that still works with the WAN down.
+    # EVERY field: the live-only rule is about the cloud, not the boat.
+    write_state "modem.measurement" "$_cci"
+    CHECKIN_ITEM=$(wire_params "modem.measurement" "$_cci")
     # Handed to send_modem if this batch is refused and the tick finishes the 0.17.0 way: the WAN
     # deltas are consumed by the compose above and recomposing would report zero (see send_modem).
     CHECKIN_MODEM_SENT="$CHECKIN_ITEM"
-    # The LAN door's copy, exactly as send_modem writes it: what this router says about itself must
-    # be the same through both doors, and the LAN door is the one that still works with the WAN down.
-    write_state "modem.measurement" "$CHECKIN_ITEM"
     return 0
   fi
   CHECKIN_ITEM="av=$HUB_LITE_VERSION"

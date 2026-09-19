@@ -1818,13 +1818,18 @@ check "cp reboot" '200 {"ok":true}' "$(status_of "$r") $(body_of "$r")"
   wc -l < "$T/rt.spool" | tr -d ' ' >> "$T/rt.n2"
   # A member starts watching: the main loop's check-in writes a 60 s cadence, and the last report is older.
   echo 60 > "$RDIR/cadence"; echo $(( $(date +%s) - 90 )) > "$RDIR/brv_net_cp1.sent"
+  # The poll child inherits the main loop's lease state (rt_tick forks it).
+  LIVE_LEASE=1; LIVE_UNTIL=$(( $(date +%s) + 300 ))
   ( rt_load brv_net_cp1 && rt_poll_report )
   echo "$DEVICE_ID $DEVICE_TOKEN ack=$PENDING_ACK" > "$T/rt.after"
 )
 check "report (0.17.0): the second poll inside the check-in cadence sends NO modem report and spools no unmoved fix" "1
 1" "$(cat "$T/rt.n2")"
-check "report: modem.measurement goes AS the router, with the router's own token (first poll, then the leased cadence)" "2" \
-  "$(grep -c '^https://api.example.test/api/agent?vid=v_test&device=brv_net_cp1&event=modem.measurement&t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&up=1&mode=LTE&rssi=-71&rsrp=-101&sinr=7.4&rsrq=-12&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-' "$T/rt.urls")"
+check "report: modem.measurement goes AS the router, with the router's own token — nobody watching, STATE only (0.18.2)" "1" \
+  "$(grep -c '^https://api.example.test/api/agent?vid=v_test&device=brv_net_cp1&event=modem.measurement&t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&up=1&mode=LTE&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-[0-9.]*$' "$T/rt.urls")"
+check "report: while a member watches, the router's whole reading goes, signal included (0.18.2)" "1" \
+  "$(grep -c '^https://api.example.test/api/agent?vid=v_test&device=brv_net_cp1&event=modem.measurement&t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&up=1&mode=LTE&rssi=-71&rsrp=-101&sinr=7.4&rsrq=-12&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-[0-9.]*$' "$T/rt.urls")"
+check "report: the router's LAN snapshot still holds its signal (only the wire copy is trimmed)" "1" "$(grep -c '^m\.rsrp	-101$' "$RDIR/brv_net_cp1.snap")"
 check "report: a command queued for the ROUTER never runs on the hub-lite" "0" "$(wc -l < "$T/rt.ran" | tr -d ' ')"
 check "report: the hub-lite's own identity and ack list are untouched" "brv_net_hublite hubtok_0123456789abcdef ack=" "$(cat "$T/rt.after")"
 check "report: the first poll has no plan-burn baseline, the second a zero delta sends none" "0" "$(grep -c wanKb_cellular "$T/rt.urls")"
@@ -1868,7 +1873,8 @@ RG="$T/rgrace"; mkdir -p "$RG"; cp "$RDIR/brv_net_cp1.snap" "$RG/good.snap"
   quiet 4045; downread 4045 4046; n down45 >> "$RG/out"; echo >> "$RG/out"
 )
 RGGOOD=$(sed -n 1p "$RG/sent")
-check "router grace: the good reading is reported" "1" "$(printf '%s' "$RGGOOD" | grep -c '^up=1&mode=LTE&rssi=-71&.*&av=hub-lite-0\.18\.1$')"
+check "router grace: the good reading is reported — STATE only, nobody is watching (0.18.2)" "1|0" \
+  "$(printf '%s' "$RGGOOD" | grep -c "^up=1&mode=LTE&carrier=Verizon&.*&av=hub-lite-$(printf '%s' "$HUB_LITE_VERSION" | sed 's/\./\\./g')$")|$(printf '%s' "$RGGOOD" | grep -c 'rssi\|rsrp\|rsrq\|sinr')"
 check "router grace: ONE failed poll — the LAST GOOD reading, unchanged, is what the due report sends; nothing logged" \
   "fail1 sent=2 logs=0|$RGGOOD" "$(sed -n 2p "$RG/out")|$(sed -n 2p "$RG/sent")"
 check "router grace: the failed poll is retried 5 s after it failed, and the window starts at its start" " due=2020 grace=2000 1 0" "$(sed -n 3p "$RG/out")"
@@ -1884,7 +1890,7 @@ check "router grace: the next good poll is ordinary — no send inside the caden
 check "router grace: ONE down READ sends no up=0 (the due report is the last good reading)" "down1 sent=5 logs=2|$RGGOOD" \
   "$(sed -n 10p "$RG/out")|$(sed -n 5p "$RG/sent")"
 check "router grace: 45 s of down READS reports down at once — the read itself, up=0 — with one log line" "down45 sent=6 logs=3|1|1" \
-  "$(sed -n 11p "$RG/out")|$(sed -n 6p "$RG/sent" | grep -c '^up=0&mode=LTE&rssi=-71&')|$(grep -c "uplink down for 45s - reporting it down" "$RG/log")"
+  "$(sed -n 11p "$RG/out")|$(sed -n 6p "$RG/sent" | grep -c '^up=0&mode=LTE&carrier=Verizon&')|$(grep -c "uplink down for 45s - reporting it down" "$RG/log")"
 check "router grace: the failure reason is logged ONCE, on the down line — never per failed poll (5 failed polls here)" "1" "$(grep -c 'did not answer' "$RG/log")"
 rm -f "$RDIR/brv_net_cp1.grace" "$RDIR/brv_net_cp1.good" "$RDIR/brv_net_cp1.due"
 cp "$RG/good.snap" "$RDIR/brv_net_cp1.snap"
@@ -2290,12 +2296,16 @@ check "check-in: three check-ins, three POSTs to /api/agent/batch and no GET at 
   "$(grep -c '^POST' "$C17/urls.ci") $(grep -c '^GET' "$C17/urls.ci")"
 check "check-in: the watch signature rides the batch URL — agentBatchRoute reads ?anchorsig=, never the item's param" "3" \
   "$(grep -c '^POST https://api.example.test/api/agent/batch?vid=v_test&device=brv_net_test&t=tok_SECRET_0123456789&anchorsig=[0-9]*$' "$C17/urls.ci")"
+HLV_RE=$(printf '%s' "$HUB_LITE_VERSION" | sed 's/\./\\./g')
+# 0.18.2: both modem-carrying check-ins were composed before any reply said a member was watching,
+# so they carry the sample's STATE (up, dataMb) and not its signal (rssi, sinr).
 check "check-in: the hub.checkin item carries the modem sample — the cloud stores it as modem.measurement" "2" \
-  "$(grep -c '"device":"brv_net_test","event":"hub.checkin","params":{"up":"1","rssi":"-70","sinr":"12","dataMb":"1234","av":"0\.18\.1"' "$C17/bodies.ci")"
+  "$(grep -c '"device":"brv_net_test","event":"hub.checkin","params":{"up":"1","dataMb":"1234","av":"'"$HLV_RE"'"' "$C17/bodies.ci")"
 check "check-in: with no sample pending the item is a PLAIN check-in (av alone is not a reading)" "1" \
-  "$(grep -c '"event":"hub.checkin","params":{"av":"0\.18\.1"}' "$C17/bodies.ci")"
+  "$(grep -c '"event":"hub.checkin","params":{"av":"'"$HLV_RE"'"}' "$C17/bodies.ci")"
 check "check-in: the pending modem sample rides ONE check-in only (once per sample, as in 0.17.0)" "2" \
-  "$(grep -c '"rssi":"-70"' "$C17/bodies.ci")"
+  "$(grep -c '"dataMb":"1234"' "$C17/bodies.ci")"
+check "check-in: nobody watching, no signal on the wire (0.18.2)" "0" "$(grep -c '"rssi"\|"sinr"' "$C17/bodies.ci")"
 check "check-in: the check-in batch is kind delta — a conditionally-built modem sample is not a keyframe" "3" \
   "$(grep -c '"kind":"delta"' "$C17/bodies.ci")"
 check "check-in: every check-in still settles the link" "manage lease=0 live=0|manage lease=1 live=1|manage lease=0 live=0" \
@@ -2549,6 +2559,69 @@ check "lt tick: the stop and an RF loss are sent; the quiet poll after is not" "
   echo "$(grep -c 'linktap.measurement' "$T/spool3")" > "$T/lt3.ci"
 )
 check "lt check-in: the idle reading rides the check-in, once per idle period (not every leased minute)" "2" "$(cat "$T/lt3.ci")"
+
+# A valve's signal is live-only (0.18.2): a change in it alone is not a transition, and nobody
+# watching, it stays off the wire while the LAN door's copy keeps it.
+: > "$T/spool3"
+lt3 '{"is_watering":0,"volume":0,"is_rf_linked":true,"battery":88,"signal":40}'
+lt3 '{"is_watering":0,"volume":0,"is_rf_linked":true,"battery":88,"signal":85}'
+check "lt tick: a signal change alone spools nothing new, and nothing spooled carries signal" "1 0" \
+  "$(grep -c 'linktap.measurement' "$T/spool3") $(grep -c 'signal=' "$T/spool3")"
+check "lt tick: the LAN door's copy still has the signal" "1" "$(grep -c 'signal=85' "$T/lt3/meas.$DEV")"
+
+# --- 0.18.2: live-only telemetry is sent only while a member is watching (owner ruling 2026-09-19) ---
+# The list is DockNeighbor-Cloud src/liveTelemetryFields.ts; one copy here, used by routers.sh too.
+check "live-only: the modem list (Cloud liveTelemetryFields.ts, modem.measurement liveOnly)" \
+  "rssi rsrp rsrq sinr signal latency ping loss obstruction obstructed uptime downMbps upMbps sats" "$LIVE_ONLY_MODEM"
+check "live-only: the linktap list" "signal" "$LIVE_ONLY_LINKTAP"
+LO_FULL="up=1&mode=LTE&rssi=-71&rsrp=-101&sinr=7.4&rsrq=-12&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&uptime=3600&band=B13&av=hub-lite-x&wanKb_cellular=64&wanSrc=lte&update=0.18.3"
+LO_STATE="up=1&mode=LTE&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&band=B13&av=hub-lite-x&wanKb_cellular=64&wanSrc=lte&update=0.18.3"
+check "live-only: nobody watching — the modem reading without its live-only fields; state, wanKb_*, and an unclassified field (band) kept, in order" \
+  "$LO_STATE" "$(LIVE_LEASE=0; LIVE_UNTIL=0; wire_params modem.measurement "$LO_FULL" 1000)"
+check "live-only: a live lease sends everything" "$LO_FULL" "$(LIVE_LEASE=1; LIVE_UNTIL=2000; wire_params modem.measurement "$LO_FULL" 1000)"
+check "live-only: a lease that has run out is no lease" "$LO_STATE" "$(LIVE_LEASE=1; LIVE_UNTIL=999; wire_params modem.measurement "$LO_FULL" 1000)"
+check "live-only: a hub.checkin carrying modem fields follows the modem rule" "$LO_STATE" "$(LIVE_LEASE=0; wire_params hub.checkin "$LO_FULL" 1000)"
+_lo_left=$(LIVE_LEASE=0; wire_params modem.measurement "$LO_FULL" 1000)
+_lo_bad=""; for _k in $LIVE_ONLY_MODEM; do case "&$_lo_left" in *"&$_k="*) _lo_bad="$_lo_bad $_k" ;; esac; done
+check "live-only: no live-only key survives, whatever the list holds" "" "$_lo_bad"
+check "live-only: a valve's signal is live-only" "watering=1&vol_l=3.20&battery=93&rf=1&flow_lpm=5.50" \
+  "$(LIVE_LEASE=0; wire_params linktap.measurement "watering=1&vol_l=3.20&battery=93&signal=69&rf=1&flow_lpm=5.50" 1000)"
+check "live-only: other events are untouched (a GPS fix's sats, a sensor's signal)" "lat=41.1&lon=-81.1&sats=9|tC=21&signal=-60" \
+  "$(LIVE_LEASE=0; wire_params gps.measurement "lat=41.1&lon=-81.1&sats=9" 1000)|$(LIVE_LEASE=0; wire_params temperature.measurement "tC=21&signal=-60" 1000)"
+check "live-only: empty segments go, nothing else changes" "a=1&b=2" "$(strip_live_only "rssi" "a=1&&rssi=5&b=2&")"
+(
+  hl17
+  MODEM_P="up=1&mode=LTE&rssi=-70&sinr=12&carrier=Verizon&sim=ok&dataMb=1234"; MODEM_PENDING=1
+  collect_wan_usage() { printf '&wanKb_cellular=64&wanSrc=lte'; }
+  LIVE_LEASE=0; LIVE_UNTIL=0
+  compose_checkin_item
+  echo "$CHECKIN_ITEM" > "$C17/lo.item"
+  grep -c '"rssi":"-70"' "$HUB_LITE_STATE" > "$C17/lo.state"
+  # The legacy fallback resends exactly what the check-in composed.
+  send_event() { echo "$1 $2" >> "$C17/lo.sent"; }; : > "$C17/lo.sent"
+  send_modem
+  # And a fallback with no composed item composes its own, by the same rule.
+  MODEM_PENDING=1; send_modem
+  LIVE_LEASE=1; LIVE_UNTIL=$(( $(date +%s) + 300 ))
+  MODEM_PENDING=1; compose_checkin_item
+  echo "$CHECKIN_ITEM" >> "$C17/lo.item"
+  : > "$C17/spool"; lt_spool lt_x linktap.measurement "watering=0&battery=90&signal=60&rf=1"
+  LIVE_LEASE=0; lt_spool lt_x linktap.measurement "watering=0&battery=90&signal=60&rf=1"
+  lt_spool lt_x linktap.cycle.change "mode=normal&reason=done"
+  cut -f2- "$C17/spool" > "$C17/lo.spool"
+)
+check "live-only: nobody watching, the check-in item is the modem's STATE with the WAN delta" \
+  "up=1&mode=LTE&carrier=Verizon&sim=ok&dataMb=1234&av=$HUB_LITE_VERSION&wanKb_cellular=64&wanSrc=lte" "$(sed -n 1p "$C17/lo.item")"
+check "live-only: the LAN door's copy keeps the signal" "1" "$(cat "$C17/lo.state")"
+check "live-only: the legacy fallback sends the composed item, and composes its own by the same rule" \
+  "modem.measurement up=1&mode=LTE&carrier=Verizon&sim=ok&dataMb=1234&av=$HUB_LITE_VERSION&wanKb_cellular=64&wanSrc=lte
+modem.measurement up=1&mode=LTE&carrier=Verizon&sim=ok&dataMb=1234&av=$HUB_LITE_VERSION&wanKb_cellular=64&wanSrc=lte" "$(cat "$C17/lo.sent")"
+check "live-only: while a member watches, the check-in carries the whole sample" \
+  "up=1&mode=LTE&rssi=-70&sinr=12&carrier=Verizon&sim=ok&dataMb=1234&av=$HUB_LITE_VERSION&wanKb_cellular=64&wanSrc=lte" "$(sed -n 2p "$C17/lo.item")"
+check "live-only: a valve's measurement is spooled with its signal only while watched; other valve events untouched" \
+  "lt_x	linktap.measurement	watering=0&battery=90&signal=60&rf=1
+lt_x	linktap.measurement	watering=0&battery=90&rf=1
+lt_x	linktap.cycle.change	mode=normal&reason=done" "$(cat "$C17/lo.spool")"
 
 # --- the batch envelope never claims "keyframe" (the cloud's full-value contract) ---
 (
