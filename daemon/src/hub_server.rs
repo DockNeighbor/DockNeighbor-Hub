@@ -2841,43 +2841,79 @@ const GPS_POLL_SECS: u64 = 60;
 /// Poll the configured LAN GPS source and run every fix through the geofence (H4) — the hub as GPS
 /// acquirer (owner 2026-09-11). What reaches the cloud is the geofence's decision, spooled so a fix
 /// taken while the uplink is down is still delivered. Errors are logged only when they CHANGE, so a
-/// boat with no lock (or a wrong password) does not fill the log once a minute.
+/// boat with no lock (or a wrong password) does not fill the log once a minute. An NMEA source that
+/// stops answering backs off quietly instead (gps::SourceBackoff — it is off at the dock).
 async fn gps_poll_loop(rt: Shared) {
     // The LAN client: a Cradlepoint on 443 presents a self-signed certificate, which the cloud
     // client rightly refuses — and did, silently, until this loop got its own (routers::lan_client).
     let client = crate::routers::lan_client();
-    let mut last_note: Option<String> = None; // dedupe the log line across identical passes
+    let mut st = GpsSourceState::default();
     loop {
         let g = hub_config::read_config_in(&rt.base).gps;
-        if !g.host.is_empty() && g.enabled && !g.dev_id.is_empty() {
-            let result = match g.kind.as_str() {
-                "cradlepoint" => crate::gps::poll_cradlepoint(&client, &g.host, g.port, &g.username, &g.password).await,
-                "nmea" => crate::gps::poll_nmea(&g.host, g.port, &g.protocol).await,
-                other => Err(format!("no driver for GPS source kind '{other}'")),
-            };
-            match result {
-                Ok(fix) => {
-                    if last_note.is_some() { crate::hlog!("gps: {} - fix acquired", g.host); last_note = None; }
-                    gps_observe(&rt, &g.dev_id, &fix).await;
-                }
-                Err(why) => {
-                    if last_note.as_deref() != Some(why.as_str()) {
-                        crate::hlog!("gps: {} - {why}", g.host);
-                        last_note = Some(why);
-                    }
-                }
-            }
-        } else {
-            last_note = None; // no source configured — reset so a later fault logs once
-        }
+        let backoff = gps_source_pass(&rt, &client, &g, &mut st).await;
         let fast = {
             let t = rt.telemetry.lock().await;
             t.watch.as_ref().is_some_and(|w| w.anchor.is_some()) || t.geofences.get(&g.dev_id).is_some_and(|x| x.wants_fast_sampling())
         };
-        let secs = geofence::sample_secs(fast, leased(&rt), lan_live(&rt), g.kind == "nmea", GPS_POLL_SECS);
+        // A failing NMEA source waits out its backoff; the first answer is back on the normal cadence.
+        let secs = backoff.unwrap_or_else(|| geofence::sample_secs(fast, leased(&rt), lan_live(&rt), g.kind == "nmea", GPS_POLL_SECS));
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
             _ = rt.gps_wake.notified() => {}
+        }
+    }
+}
+
+/// The GPS source loop's memory across passes.
+#[derive(Default)]
+struct GpsSourceState {
+    /// The last error logged (non-NMEA kinds log an error when it changes).
+    last_note: Option<String>,
+    /// The NMEA source's quiet backoff.
+    nmea: crate::gps::SourceBackoff,
+}
+
+/// One read of the configured GPS source. Returns `Some(secs)` while a failing NMEA source is backing
+/// off (wait that long), `None` for the normal cadence.
+async fn gps_source_pass(rt: &Rt, client: &reqwest::Client, g: &hub_config::GpsConfig, st: &mut GpsSourceState) -> Option<u64> {
+    if g.host.is_empty() || !g.enabled || g.dev_id.is_empty() {
+        // No source configured — reset so a later fault logs once.
+        *st = GpsSourceState::default();
+        return None;
+    }
+    let result = match g.kind.as_str() {
+        "cradlepoint" => crate::gps::poll_cradlepoint(client, &g.host, g.port, &g.username, &g.password).await,
+        "nmea" => crate::gps::poll_nmea(&g.host, g.port, &g.protocol).await,
+        other => Err(format!("no driver for GPS source kind '{other}'")),
+    };
+    match (g.kind.as_str(), result) {
+        ("nmea", Ok(fix)) => {
+            if let Some(note) = st.nmea.succeeded(&g.host) {
+                crate::hlog!("{note}");
+            }
+            gps_observe(rt, &g.dev_id, &fix).await;
+            None
+        }
+        ("nmea", Err(why)) => {
+            let (note, secs) = st.nmea.failed(&g.host, &why);
+            if let Some(note) = note {
+                crate::hlog!("{note}");
+            }
+            Some(secs)
+        }
+        (_, Ok(fix)) => {
+            if st.last_note.take().is_some() {
+                crate::hlog!("gps: {} - fix acquired", g.host);
+            }
+            gps_observe(rt, &g.dev_id, &fix).await;
+            None
+        }
+        (_, Err(why)) => {
+            if st.last_note.as_deref() != Some(why.as_str()) {
+                crate::hlog!("gps: {} - {why}", g.host);
+                st.last_note = Some(why);
+            }
+            None
         }
     }
 }
@@ -5170,6 +5206,46 @@ mod tests {
         assert_eq!(sorted(posted(&posts, "brv_net_lte")), sorted(lte), "leased: the whole reading");
         linktap_act(&rt, &http_client(), "aaaabbbbccccdddd", cycle::Action::None, vec![valve.clone()]).await;
         assert_eq!(sorted(posted(&posts, "lt_aaaabbbbccccdddd")), sorted(valve.params));
+    }
+
+    #[tokio::test]
+    async fn a_silent_nmea_source_backs_off_quietly_sends_nothing_and_resumes_on_its_first_fix() {
+        use tokio::io::AsyncWriteExt;
+        let (worker, posts) = stub_batch_worker(serde_json::json!({"status": "ok"})).await;
+        let base = temp_base("nmea_backoff");
+        // A port nobody is listening on: the navigation system is switched off.
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut g = hub_config::GpsConfig { kind: "nmea".into(), host: "127.0.0.1".into(), port, dev_id: "brv_gps_hwsyh5oqq".into(), enabled: true, ..Default::default() };
+        let cfg = HubConfig { gps: g.clone(), ..seeded_cfg() };
+        hub_config::write_config_in(&base, &cfg).unwrap();
+        let rt = new_rt(base, worker);
+        let client = crate::routers::lan_client();
+        let mut st = GpsSourceState::default();
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            waits.push(gps_source_pass(&rt, &client, &g, &mut st).await);
+        }
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300].map(Some), "a growing retry, capped at 5 minutes");
+        assert!(rt.pending_reports.lock().await.is_empty() && rt.inflight_delta.lock().await.is_none(), "nothing spooled");
+        assert!(posts.lock().unwrap().is_empty(), "nothing sent to the cloud about its absence");
+        {
+            let t = rt.telemetry.lock().await;
+            assert!(t.gps_latest.is_empty() && t.geofences.get(&g.dev_id).and_then(|x| x.last()).is_none(), "no sample, so no unreliable-fix episode");
+        }
+
+        // The navigation system is switched on.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        g.port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let body = "GPRMC,123519,A,4807.038,N,01131.000,E,000.0,084.4,230394,003.1,W";
+            let sum = body.bytes().fold(0u8, |a, b| a ^ b);
+            s.write_all(format!("${body}*{sum:02X}\r\n").as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        assert_eq!(gps_source_pass(&rt, &client, &g, &mut st).await, None, "the first answer is back on the normal cadence");
+        assert!(!st.nmea.failing());
+        assert!(rt.telemetry.lock().await.gps_latest.contains_key(&g.dev_id), "and its fix went through the geofence");
     }
 
     #[tokio::test]
