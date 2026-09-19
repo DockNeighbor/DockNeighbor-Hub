@@ -286,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "brvg-hub"
-version = "0.3.52"
+version = "0.3.53"
 dependencies = [
  "axum",
  "base64",

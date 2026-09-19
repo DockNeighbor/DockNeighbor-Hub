@@ -1923,14 +1923,14 @@ async fn build_keyframe(rt: &Rt, cfg: &HubConfig, update: Option<&str>) -> Vec<(
         if let Some(params) = t.router_latest.get(&r.id) {
             let kb = t.wan_pending_kb.get(&r.id).copied().unwrap_or(0);
             out.push((
-                batch::router_item(&r.id, params, kb),
+                batch::for_the_wire(batch::router_item(&r.id, params, kb), leased),
                 vec![SentMark::Router { id: r.id.clone(), kb, sent: cadence::RouterSent::from_params(params) }],
             ));
         }
     }
     for (dev, params) in valves {
         let device = format!("lt_{dev}");
-        out.push((batch::valve_item(&dev, &params), vec![SentMark::Valve { device, sent: cadence::ValveSent::from_params(&params) }]));
+        out.push((batch::for_the_wire(batch::valve_item(&dev, &params), leased), vec![SentMark::Valve { device, sent: cadence::ValveSent::from_params(&params) }]));
     }
     let mut gps: Vec<(&String, &(crate::gps::GpsFix, i64))> = t.gps_latest.iter().collect();
     gps.sort_by(|a, b| a.0.cmp(b.0));
@@ -2043,6 +2043,9 @@ async fn post_batch(
         }
     }
     let body = batch::envelope(kind, seq, &rt.boot_id, items, env!("CARGO_PKG_VERSION"));
+    if cfg.debug_log_batches {
+        crate::hlog!("{}", batch::debug_line(&url, &body));
+    }
     match client.post(url).json(&body).send().await {
         Err(e) => PostOutcome::Transient(format!("failed to send: {}", e.without_url())),
         Ok(res) => {
@@ -3132,7 +3135,10 @@ async fn drain_reports(rt: &Rt) {
                     break;
                 }
                 let n = q.len().min(batch::MAX_ITEMS);
-                let items: Vec<batch::Item> = q.drain(..n).map(|r| batch::from_report(&r)).collect();
+                // Live-only fields leave only while a member is watching (batch::for_the_wire). Decided
+                // HERE, before the post is kept as inflight, so a retry still resends byte-for-byte.
+                let is_leased = leased(rt);
+                let items: Vec<batch::Item> = q.drain(..n).map(|r| batch::for_the_wire(batch::from_report(&r), is_leased)).collect();
                 (rt.batch_seq.fetch_add(1, Ordering::SeqCst), items)
             }
         };
@@ -5048,6 +5054,130 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), posts)
+    }
+
+    // --- Live-only telemetry (owner ruling 2026-09-19): sent only while a member is watching ------
+
+    /// A hub with an LTE Cradlepoint, a Starlink, a wired Peplink and a watering LinkTap valve, all
+    /// with a current reading (from the real builders), and 812 KB of LTE use not yet reported.
+    async fn live_only_rt(tag: &str) -> (Shared, BatchPosts, HubConfig) {
+        let (worker, posts) = stub_batch_worker(serde_json::json!({"status": "ok"})).await;
+        let base = temp_base(tag);
+        let router = |id: &str, vendor: &str| hub_config::RouterConfig {
+            id: id.into(), vendor: vendor.into(), host: "192.0.2.1".into(), agent_token: format!("agt_{id}"), ..Default::default()
+        };
+        let cfg = HubConfig {
+            routers: vec![router("brv_net_lte", "cradlepoint"), router("brv_net_dish", "starlink"), router("brv_net_wired", "peplink")],
+            ..seeded_cfg()
+        };
+        hub_config::write_config_in(&base, &cfg).unwrap();
+        let rt = new_rt(base, worker);
+        let mut lt = crate::linktap_runtime::Runtime::new(
+            linktap::Gateway { host: "127.0.0.1:9".into(), gw_id: "GW02".into() },
+            &["aaaabbbbccccdddd".to_string()],
+            cycle::Profile { duration_secs: 3600, volume_cap_l: 100.0, auto_restart: false },
+        );
+        lt.observe("aaaabbbbccccdddd", &batch::fixtures::valve_payload(), now_ms());
+        *rt.linktap.lock().await = Some(lt);
+        {
+            let mut t = rt.telemetry.lock().await;
+            t.router_latest.insert("brv_net_lte".into(), batch::fixtures::lte());
+            t.router_latest.insert("brv_net_dish".into(), batch::fixtures::dish());
+            t.router_latest.insert("brv_net_wired".into(), batch::fixtures::wired());
+            t.wan_pending_kb.insert("brv_net_lte".into(), 812);
+        }
+        (rt, posts, cfg)
+    }
+
+    /// The params of `device` in the last post, as (key, value) in wire order.
+    fn posted(posts: &BatchPosts, device: &str) -> Vec<(String, String)> {
+        let posts = posts.lock().unwrap();
+        let (_, body) = posts.last().expect("a post");
+        let it = body["items"].as_array().unwrap().iter().find(|i| i["device"] == device).unwrap_or_else(|| panic!("{device} not posted: {body}"));
+        it["params"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect()
+    }
+
+    /// What the valve's reading holds right now (the keyframe's source).
+    async fn valve_reading(rt: &Rt) -> Vec<(String, String)> {
+        rt.linktap.lock().await.as_ref().unwrap().last_measurement("aaaabbbbccccdddd").unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn an_unleased_keyframe_carries_state_only_and_a_leased_one_carries_everything() {
+        let (rt, posts, cfg) = live_only_rt("live_only_keyframe").await;
+        let sources = [
+            ("brv_net_lte", "modem.measurement", batch::fixtures::lte()),
+            ("brv_net_dish", "modem.measurement", batch::fixtures::dish()),
+            ("brv_net_wired", "modem.measurement", batch::fixtures::wired()),
+            ("lt_aaaabbbbccccdddd", "linktap.measurement", valve_reading(&rt).await),
+        ];
+
+        // Nobody watching.
+        assert!(!leased(&rt));
+        checkin_once(&rt, &http_client(), &cfg).await.unwrap();
+        for (device, event, src) in &sources {
+            let live = batch::live_only_fields(event);
+            let sent = posted(&posts, device);
+            let keys: Vec<&str> = sent.iter().map(|(k, _)| k.as_str()).collect();
+            assert!(src.iter().any(|(k, _)| live.contains(&k.as_str())), "{device}: the reading must carry live fields to prove anything");
+            for k in &keys {
+                assert!(!live.contains(k), "{device}: live-only `{k}` went out with nobody watching");
+            }
+            for (k, v) in src.iter().filter(|(k, _)| !live.contains(&k.as_str())) {
+                assert!(sent.contains(&(k.clone(), v.clone())), "{device}: state `{k}` must always go out: {sent:?}");
+            }
+        }
+        assert!(posted(&posts, "brv_net_lte").contains(&("wanKb_cellular".into(), "812".into())), "the WAN delta goes out unleased");
+        assert_eq!(rt.telemetry.lock().await.router_latest["brv_net_dish"], batch::fixtures::dish(), "the hub still caches every field");
+
+        // A member opens the app.
+        rt.lease_until_ms.store(cadence::lease_extend(0, now_ms(), None), Ordering::SeqCst);
+        rt.telemetry.lock().await.wan_pending_kb.insert("brv_net_lte".into(), 40);
+        checkin_once(&rt, &http_client(), &cfg).await.unwrap();
+        for (device, _, src) in &sources {
+            let sent = posted(&posts, device);
+            for p in src {
+                assert!(sent.contains(p), "{device}: leased, `{}` must go out: {sent:?}", p.0);
+            }
+        }
+        assert!(posted(&posts, "brv_net_lte").contains(&("wanKb_cellular".into(), "40".into())));
+    }
+
+    #[tokio::test]
+    async fn an_immediate_router_event_and_a_valve_poll_drop_live_only_fields_unless_leased() {
+        let (rt, posts, _) = live_only_rt("live_only_delta").await;
+        let mut lte = batch::fixtures::lte();
+        lte.push(("wanKb_cellular".into(), "64".into()));
+        let router = crate::linktap_runtime::Report { token: None, device: "brv_net_lte".into(), event: "modem.measurement".into(), params: lte.clone() };
+        spool_report(&rt, &router).await;
+        let sent = posted(&posts, "brv_net_lte");
+        assert!(!sent.iter().any(|(k, _)| batch::MODEM_LIVE_ONLY.contains(&k.as_str())), "{sent:?}");
+        assert!(sent.contains(&("wan".into(), "lte".into())) && sent.contains(&("up".into(), "1".into())));
+        assert!(sent.contains(&("wanKb_cellular".into(), "64".into())), "a delta is accounted on every report");
+
+        // A watering valve reports every poll; its signal stays home.
+        let valve = crate::linktap_runtime::Report { token: None, device: "lt_aaaabbbbccccdddd".into(), event: "linktap.measurement".into(), params: valve_reading(&rt).await };
+        linktap_act(&rt, &http_client(), "aaaabbbbccccdddd", cycle::Action::None, vec![valve.clone()]).await;
+        let sent = posted(&posts, "lt_aaaabbbbccccdddd");
+        assert!(!sent.iter().any(|(k, _)| k == "signal") && sent.contains(&("battery".into(), "93".into())), "{sent:?}");
+
+        rt.lease_until_ms.store(cadence::lease_extend(0, now_ms(), None), Ordering::SeqCst);
+        spool_report(&rt, &router).await;
+        let sorted = |mut v: Vec<(String, String)>| {
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(posted(&posts, "brv_net_lte")), sorted(lte), "leased: the whole reading");
+        linktap_act(&rt, &http_client(), "aaaabbbbccccdddd", cycle::Action::None, vec![valve.clone()]).await;
+        assert_eq!(sorted(posted(&posts, "lt_aaaabbbbccccdddd")), sorted(valve.params));
+    }
+
+    #[tokio::test]
+    async fn the_debug_switch_is_off_by_default_and_never_logs_the_token() {
+        assert!(!HubConfig::default().debug_log_batches);
+        let url = batch::batch_url("https://api.example.com", "v1", "hub_abc123", &seeded_cfg().token, None, 0).unwrap();
+        let line = batch::debug_line(&url, &batch::envelope(batch::Kind::Keyframe, None, "b", &[], "x"));
+        assert!(!line.contains(&seeded_cfg().token), "{line}");
     }
 
     #[tokio::test]

@@ -117,6 +117,14 @@ pub struct HubConfig {
     /// the built-in /console stay up, because they are how the apps manage the hub.
     #[serde(default)]
     pub web_ui_disabled: bool,
+    /// DEBUG, OFF BY DEFAULT: log every outgoing `/api/agent/batch` post (URL and JSON body) to the
+    /// hub log, with the hub token and anything secret-looking redacted (batch::debug_line) — so a
+    /// real keyframe can be captured from a hub in the field on request, without a rebuild. Set
+    /// `"debug_log_batches": true` in hub.json; the config is re-read on every post, so it takes
+    /// effect on the next post and needs no restart. Turn it back off after the capture: a keyframe
+    /// line is a few KB every 15 minutes and the log rotates at 2 MB.
+    #[serde(default)]
+    pub debug_log_batches: bool,
     /// A GPS/location source on the LAN (a cellular router's GPS, a NMEA feed) the hub POLLS and
     /// reports as `gps.measurement`. Empty host ⇒ no source configured. The hub is the acquirer,
     /// not the app: a browser cannot reach a LAN router over HTTPS, and only the hub is always
@@ -243,6 +251,7 @@ impl Default for HubConfig {
             linktap: LinkTapConfig::default(),
             shelly_secret: String::new(),
             web_ui_disabled: false,
+            debug_log_batches: false,
             gps: GpsConfig::default(),
             routers: Vec::new(),
             sensor_jobs: Vec::new(),
@@ -521,6 +530,7 @@ mod tests {
     fn a_hub_json_written_before_the_web_switch_keeps_serving_the_web_app() {
         let old: HubConfig = serde_json::from_str(r#"{"hub_id":"hub_1","vid":"v1","name":"Central","enabled":true}"#).unwrap();
         assert!(!old.web_ui_disabled, "absent field must mean the local web app stays ON");
+        assert!(!old.debug_log_batches, "absent field must mean batch bodies are NOT logged");
     }
 
     #[test]
@@ -537,6 +547,7 @@ mod tests {
             },
             shelly_secret: "wh-secret".into(),
             web_ui_disabled: true,
+            debug_log_batches: true,
             gps: GpsConfig {
                 kind: "cradlepoint".into(), host: "192.168.10.1".into(), port: 443,
                 username: "admin".into(), password: "routerpw".into(),
