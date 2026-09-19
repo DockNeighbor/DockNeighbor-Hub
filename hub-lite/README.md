@@ -203,6 +203,12 @@ If the app shows no position from the router, the order to check is: does `/dev/
   then goes out at once with one log line; the first good sample reports up at once. The background
   router poll gives curl 30 s per request (connect 15 s); the interactive `/api/hub/routers` door
   keeps 15 s / 5 s.
+- **Live-only telemetry (0.18.2, owner ruling 2026-09-19).** Noisy live figures go to the cloud only
+  while a member is watching (a live lease): a modem's or managed router's `rssi rsrp rsrq sinr signal
+  latency ping loss obstruction obstructed uptime downMbps upMbps sats` and a valve's `signal`
+  (`LIVE_ONLY_MODEM` / `LIVE_ONLY_LINKTAP` in `brvg-hub-lite.sh`, the Cloud's
+  `src/liveTelemetryFields.ts`). Outside a lease a report carries only STATE. `wanKb_*` deltas are
+  always sent. A field not in the list is sent. The LAN door's state and snapshots keep every field.
 - GPS **report-by-exception** (telemetry design §A7.2): local drag, zone and underway detection run
   on every sample; a position is SENT only when unarmed and it moved `GPS_DEADBAND_M` (default 50 m,
   floor 25 m) from the last sent one and more than twice its accuracy; every sample while leased;

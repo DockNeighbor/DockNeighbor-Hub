@@ -812,7 +812,9 @@ rt_graced() {
         DEVICE_ID="$RT_ID"; DEVICE_TOKEN="$RT_TOKEN"; PENDING_ACK=""
         run_commands() { :; }; apply_anchor() { :; }; apply_watch() { :; }; apply_live_fields() { :; }
         lt_apply_profiles() { cat >/dev/null; }; lt_apply_allowed() { :; }
-        send_event modem.measurement "$_rtq" && echo "$_rtnow" > "$RT_DIR/$RT_ID.sent"
+        # Live-only fields (signal, uptime…) only while a member is watching — brvg-hub-lite.sh
+        # LIVE_ONLY_MODEM / wire_params, the one list. The router's .snap keeps them for the LAN door.
+        send_event modem.measurement "$(wire_params modem.measurement "$_rtq")" && echo "$_rtnow" > "$RT_DIR/$RT_ID.sent"
       ) || true
     fi
   fi
