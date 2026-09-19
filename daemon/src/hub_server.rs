@@ -1923,14 +1923,14 @@ async fn build_keyframe(rt: &Rt, cfg: &HubConfig, update: Option<&str>) -> Vec<(
         if let Some(params) = t.router_latest.get(&r.id) {
             let kb = t.wan_pending_kb.get(&r.id).copied().unwrap_or(0);
             out.push((
-                batch::router_item(&r.id, params, kb),
+                batch::for_the_wire(batch::router_item(&r.id, params, kb), leased),
                 vec![SentMark::Router { id: r.id.clone(), kb, sent: cadence::RouterSent::from_params(params) }],
             ));
         }
     }
     for (dev, params) in valves {
         let device = format!("lt_{dev}");
-        out.push((batch::valve_item(&dev, &params), vec![SentMark::Valve { device, sent: cadence::ValveSent::from_params(&params) }]));
+        out.push((batch::for_the_wire(batch::valve_item(&dev, &params), leased), vec![SentMark::Valve { device, sent: cadence::ValveSent::from_params(&params) }]));
     }
     let mut gps: Vec<(&String, &(crate::gps::GpsFix, i64))> = t.gps_latest.iter().collect();
     gps.sort_by(|a, b| a.0.cmp(b.0));
@@ -2043,6 +2043,9 @@ async fn post_batch(
         }
     }
     let body = batch::envelope(kind, seq, &rt.boot_id, items, env!("CARGO_PKG_VERSION"));
+    if cfg.debug_log_batches {
+        crate::hlog!("{}", batch::debug_line(&url, &body));
+    }
     match client.post(url).json(&body).send().await {
         Err(e) => PostOutcome::Transient(format!("failed to send: {}", e.without_url())),
         Ok(res) => {
@@ -2838,43 +2841,79 @@ const GPS_POLL_SECS: u64 = 60;
 /// Poll the configured LAN GPS source and run every fix through the geofence (H4) — the hub as GPS
 /// acquirer (owner 2026-09-11). What reaches the cloud is the geofence's decision, spooled so a fix
 /// taken while the uplink is down is still delivered. Errors are logged only when they CHANGE, so a
-/// boat with no lock (or a wrong password) does not fill the log once a minute.
+/// boat with no lock (or a wrong password) does not fill the log once a minute. An NMEA source that
+/// stops answering backs off quietly instead (gps::SourceBackoff — it is off at the dock).
 async fn gps_poll_loop(rt: Shared) {
     // The LAN client: a Cradlepoint on 443 presents a self-signed certificate, which the cloud
     // client rightly refuses — and did, silently, until this loop got its own (routers::lan_client).
     let client = crate::routers::lan_client();
-    let mut last_note: Option<String> = None; // dedupe the log line across identical passes
+    let mut st = GpsSourceState::default();
     loop {
         let g = hub_config::read_config_in(&rt.base).gps;
-        if !g.host.is_empty() && g.enabled && !g.dev_id.is_empty() {
-            let result = match g.kind.as_str() {
-                "cradlepoint" => crate::gps::poll_cradlepoint(&client, &g.host, g.port, &g.username, &g.password).await,
-                "nmea" => crate::gps::poll_nmea(&g.host, g.port, &g.protocol).await,
-                other => Err(format!("no driver for GPS source kind '{other}'")),
-            };
-            match result {
-                Ok(fix) => {
-                    if last_note.is_some() { crate::hlog!("gps: {} - fix acquired", g.host); last_note = None; }
-                    gps_observe(&rt, &g.dev_id, &fix).await;
-                }
-                Err(why) => {
-                    if last_note.as_deref() != Some(why.as_str()) {
-                        crate::hlog!("gps: {} - {why}", g.host);
-                        last_note = Some(why);
-                    }
-                }
-            }
-        } else {
-            last_note = None; // no source configured — reset so a later fault logs once
-        }
+        let backoff = gps_source_pass(&rt, &client, &g, &mut st).await;
         let fast = {
             let t = rt.telemetry.lock().await;
             t.watch.as_ref().is_some_and(|w| w.anchor.is_some()) || t.geofences.get(&g.dev_id).is_some_and(|x| x.wants_fast_sampling())
         };
-        let secs = geofence::sample_secs(fast, leased(&rt), lan_live(&rt), g.kind == "nmea", GPS_POLL_SECS);
+        // A failing NMEA source waits out its backoff; the first answer is back on the normal cadence.
+        let secs = backoff.unwrap_or_else(|| geofence::sample_secs(fast, leased(&rt), lan_live(&rt), g.kind == "nmea", GPS_POLL_SECS));
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(secs)) => {}
             _ = rt.gps_wake.notified() => {}
+        }
+    }
+}
+
+/// The GPS source loop's memory across passes.
+#[derive(Default)]
+struct GpsSourceState {
+    /// The last error logged (non-NMEA kinds log an error when it changes).
+    last_note: Option<String>,
+    /// The NMEA source's quiet backoff.
+    nmea: crate::gps::SourceBackoff,
+}
+
+/// One read of the configured GPS source. Returns `Some(secs)` while a failing NMEA source is backing
+/// off (wait that long), `None` for the normal cadence.
+async fn gps_source_pass(rt: &Rt, client: &reqwest::Client, g: &hub_config::GpsConfig, st: &mut GpsSourceState) -> Option<u64> {
+    if g.host.is_empty() || !g.enabled || g.dev_id.is_empty() {
+        // No source configured — reset so a later fault logs once.
+        *st = GpsSourceState::default();
+        return None;
+    }
+    let result = match g.kind.as_str() {
+        "cradlepoint" => crate::gps::poll_cradlepoint(client, &g.host, g.port, &g.username, &g.password).await,
+        "nmea" => crate::gps::poll_nmea(&g.host, g.port, &g.protocol).await,
+        other => Err(format!("no driver for GPS source kind '{other}'")),
+    };
+    match (g.kind.as_str(), result) {
+        ("nmea", Ok(fix)) => {
+            if let Some(note) = st.nmea.succeeded(&g.host) {
+                crate::hlog!("{note}");
+            }
+            gps_observe(rt, &g.dev_id, &fix).await;
+            None
+        }
+        ("nmea", Err(why)) => {
+            let (note, secs) = st.nmea.failed(&g.host, &why);
+            if let Some(note) = note {
+                crate::hlog!("{note}");
+            }
+            Some(secs)
+        }
+        (_, Ok(fix)) => {
+            if st.last_note.take().is_some() {
+                crate::hlog!("gps: {} - fix acquired", g.host);
+            }
+            gps_observe(rt, &g.dev_id, &fix).await;
+            None
+        }
+        (_, Err(why)) => {
+            if st.last_note.as_deref() != Some(why.as_str()) {
+                crate::hlog!("gps: {} - {why}", g.host);
+                st.last_note = Some(why);
+            }
+            None
         }
     }
 }
@@ -3132,7 +3171,10 @@ async fn drain_reports(rt: &Rt) {
                     break;
                 }
                 let n = q.len().min(batch::MAX_ITEMS);
-                let items: Vec<batch::Item> = q.drain(..n).map(|r| batch::from_report(&r)).collect();
+                // Live-only fields leave only while a member is watching (batch::for_the_wire). Decided
+                // HERE, before the post is kept as inflight, so a retry still resends byte-for-byte.
+                let is_leased = leased(rt);
+                let items: Vec<batch::Item> = q.drain(..n).map(|r| batch::for_the_wire(batch::from_report(&r), is_leased)).collect();
                 (rt.batch_seq.fetch_add(1, Ordering::SeqCst), items)
             }
         };
@@ -5048,6 +5090,170 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{addr}"), posts)
+    }
+
+    // --- Live-only telemetry (owner ruling 2026-09-19): sent only while a member is watching ------
+
+    /// A hub with an LTE Cradlepoint, a Starlink, a wired Peplink and a watering LinkTap valve, all
+    /// with a current reading (from the real builders), and 812 KB of LTE use not yet reported.
+    async fn live_only_rt(tag: &str) -> (Shared, BatchPosts, HubConfig) {
+        let (worker, posts) = stub_batch_worker(serde_json::json!({"status": "ok"})).await;
+        let base = temp_base(tag);
+        let router = |id: &str, vendor: &str| hub_config::RouterConfig {
+            id: id.into(), vendor: vendor.into(), host: "192.0.2.1".into(), agent_token: format!("agt_{id}"), ..Default::default()
+        };
+        let cfg = HubConfig {
+            routers: vec![router("brv_net_lte", "cradlepoint"), router("brv_net_dish", "starlink"), router("brv_net_wired", "peplink")],
+            ..seeded_cfg()
+        };
+        hub_config::write_config_in(&base, &cfg).unwrap();
+        let rt = new_rt(base, worker);
+        let mut lt = crate::linktap_runtime::Runtime::new(
+            linktap::Gateway { host: "127.0.0.1:9".into(), gw_id: "GW02".into() },
+            &["aaaabbbbccccdddd".to_string()],
+            cycle::Profile { duration_secs: 3600, volume_cap_l: 100.0, auto_restart: false },
+        );
+        lt.observe("aaaabbbbccccdddd", &batch::fixtures::valve_payload(), now_ms());
+        *rt.linktap.lock().await = Some(lt);
+        {
+            let mut t = rt.telemetry.lock().await;
+            t.router_latest.insert("brv_net_lte".into(), batch::fixtures::lte());
+            t.router_latest.insert("brv_net_dish".into(), batch::fixtures::dish());
+            t.router_latest.insert("brv_net_wired".into(), batch::fixtures::wired());
+            t.wan_pending_kb.insert("brv_net_lte".into(), 812);
+        }
+        (rt, posts, cfg)
+    }
+
+    /// The params of `device` in the last post, as (key, value) in wire order.
+    fn posted(posts: &BatchPosts, device: &str) -> Vec<(String, String)> {
+        let posts = posts.lock().unwrap();
+        let (_, body) = posts.last().expect("a post");
+        let it = body["items"].as_array().unwrap().iter().find(|i| i["device"] == device).unwrap_or_else(|| panic!("{device} not posted: {body}"));
+        it["params"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect()
+    }
+
+    /// What the valve's reading holds right now (the keyframe's source).
+    async fn valve_reading(rt: &Rt) -> Vec<(String, String)> {
+        rt.linktap.lock().await.as_ref().unwrap().last_measurement("aaaabbbbccccdddd").unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn an_unleased_keyframe_carries_state_only_and_a_leased_one_carries_everything() {
+        let (rt, posts, cfg) = live_only_rt("live_only_keyframe").await;
+        let sources = [
+            ("brv_net_lte", "modem.measurement", batch::fixtures::lte()),
+            ("brv_net_dish", "modem.measurement", batch::fixtures::dish()),
+            ("brv_net_wired", "modem.measurement", batch::fixtures::wired()),
+            ("lt_aaaabbbbccccdddd", "linktap.measurement", valve_reading(&rt).await),
+        ];
+
+        // Nobody watching.
+        assert!(!leased(&rt));
+        checkin_once(&rt, &http_client(), &cfg).await.unwrap();
+        for (device, event, src) in &sources {
+            let live = batch::live_only_fields(event);
+            let sent = posted(&posts, device);
+            let keys: Vec<&str> = sent.iter().map(|(k, _)| k.as_str()).collect();
+            assert!(src.iter().any(|(k, _)| live.contains(&k.as_str())), "{device}: the reading must carry live fields to prove anything");
+            for k in &keys {
+                assert!(!live.contains(k), "{device}: live-only `{k}` went out with nobody watching");
+            }
+            for (k, v) in src.iter().filter(|(k, _)| !live.contains(&k.as_str())) {
+                assert!(sent.contains(&(k.clone(), v.clone())), "{device}: state `{k}` must always go out: {sent:?}");
+            }
+        }
+        assert!(posted(&posts, "brv_net_lte").contains(&("wanKb_cellular".into(), "812".into())), "the WAN delta goes out unleased");
+        assert_eq!(rt.telemetry.lock().await.router_latest["brv_net_dish"], batch::fixtures::dish(), "the hub still caches every field");
+
+        // A member opens the app.
+        rt.lease_until_ms.store(cadence::lease_extend(0, now_ms(), None), Ordering::SeqCst);
+        rt.telemetry.lock().await.wan_pending_kb.insert("brv_net_lte".into(), 40);
+        checkin_once(&rt, &http_client(), &cfg).await.unwrap();
+        for (device, _, src) in &sources {
+            let sent = posted(&posts, device);
+            for p in src {
+                assert!(sent.contains(p), "{device}: leased, `{}` must go out: {sent:?}", p.0);
+            }
+        }
+        assert!(posted(&posts, "brv_net_lte").contains(&("wanKb_cellular".into(), "40".into())));
+    }
+
+    #[tokio::test]
+    async fn an_immediate_router_event_and_a_valve_poll_drop_live_only_fields_unless_leased() {
+        let (rt, posts, _) = live_only_rt("live_only_delta").await;
+        let mut lte = batch::fixtures::lte();
+        lte.push(("wanKb_cellular".into(), "64".into()));
+        let router = crate::linktap_runtime::Report { token: None, device: "brv_net_lte".into(), event: "modem.measurement".into(), params: lte.clone() };
+        spool_report(&rt, &router).await;
+        let sent = posted(&posts, "brv_net_lte");
+        assert!(!sent.iter().any(|(k, _)| batch::MODEM_LIVE_ONLY.contains(&k.as_str())), "{sent:?}");
+        assert!(sent.contains(&("wan".into(), "lte".into())) && sent.contains(&("up".into(), "1".into())));
+        assert!(sent.contains(&("wanKb_cellular".into(), "64".into())), "a delta is accounted on every report");
+
+        // A watering valve reports every poll; its signal stays home.
+        let valve = crate::linktap_runtime::Report { token: None, device: "lt_aaaabbbbccccdddd".into(), event: "linktap.measurement".into(), params: valve_reading(&rt).await };
+        linktap_act(&rt, &http_client(), "aaaabbbbccccdddd", cycle::Action::None, vec![valve.clone()]).await;
+        let sent = posted(&posts, "lt_aaaabbbbccccdddd");
+        assert!(!sent.iter().any(|(k, _)| k == "signal") && sent.contains(&("battery".into(), "93".into())), "{sent:?}");
+
+        rt.lease_until_ms.store(cadence::lease_extend(0, now_ms(), None), Ordering::SeqCst);
+        spool_report(&rt, &router).await;
+        let sorted = |mut v: Vec<(String, String)>| {
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(posted(&posts, "brv_net_lte")), sorted(lte), "leased: the whole reading");
+        linktap_act(&rt, &http_client(), "aaaabbbbccccdddd", cycle::Action::None, vec![valve.clone()]).await;
+        assert_eq!(sorted(posted(&posts, "lt_aaaabbbbccccdddd")), sorted(valve.params));
+    }
+
+    #[tokio::test]
+    async fn a_silent_nmea_source_backs_off_quietly_sends_nothing_and_resumes_on_its_first_fix() {
+        use tokio::io::AsyncWriteExt;
+        let (worker, posts) = stub_batch_worker(serde_json::json!({"status": "ok"})).await;
+        let base = temp_base("nmea_backoff");
+        // A port nobody is listening on: the navigation system is switched off.
+        let port = { let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); l.local_addr().unwrap().port() };
+        let mut g = hub_config::GpsConfig { kind: "nmea".into(), host: "127.0.0.1".into(), port, dev_id: "brv_gps_hwsyh5oqq".into(), enabled: true, ..Default::default() };
+        let cfg = HubConfig { gps: g.clone(), ..seeded_cfg() };
+        hub_config::write_config_in(&base, &cfg).unwrap();
+        let rt = new_rt(base, worker);
+        let client = crate::routers::lan_client();
+        let mut st = GpsSourceState::default();
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            waits.push(gps_source_pass(&rt, &client, &g, &mut st).await);
+        }
+        assert_eq!(waits, [5, 10, 20, 40, 80, 160, 300, 300].map(Some), "a growing retry, capped at 5 minutes");
+        assert!(rt.pending_reports.lock().await.is_empty() && rt.inflight_delta.lock().await.is_none(), "nothing spooled");
+        assert!(posts.lock().unwrap().is_empty(), "nothing sent to the cloud about its absence");
+        {
+            let t = rt.telemetry.lock().await;
+            assert!(t.gps_latest.is_empty() && t.geofences.get(&g.dev_id).and_then(|x| x.last()).is_none(), "no sample, so no unreliable-fix episode");
+        }
+
+        // The navigation system is switched on.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        g.port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let body = "GPRMC,123519,A,4807.038,N,01131.000,E,000.0,084.4,230394,003.1,W";
+            let sum = body.bytes().fold(0u8, |a, b| a ^ b);
+            s.write_all(format!("${body}*{sum:02X}\r\n").as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        assert_eq!(gps_source_pass(&rt, &client, &g, &mut st).await, None, "the first answer is back on the normal cadence");
+        assert!(!st.nmea.failing());
+        assert!(rt.telemetry.lock().await.gps_latest.contains_key(&g.dev_id), "and its fix went through the geofence");
+    }
+
+    #[tokio::test]
+    async fn the_debug_switch_is_off_by_default_and_never_logs_the_token() {
+        assert!(!HubConfig::default().debug_log_batches);
+        let url = batch::batch_url("https://api.example.com", "v1", "hub_abc123", &seeded_cfg().token, None, 0).unwrap();
+        let line = batch::debug_line(&url, &batch::envelope(batch::Kind::Keyframe, None, "b", &[], "x"));
+        assert!(!line.contains(&seeded_cfg().token), "{line}");
     }
 
     #[tokio::test]

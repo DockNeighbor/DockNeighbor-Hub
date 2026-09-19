@@ -299,6 +299,58 @@ pub async fn poll_nmea(host: &str, port: u16, protocol: &str) -> Result<GpsFix, 
     }
 }
 
+// ── A LAN NMEA source that stops answering ─────────────────────────────────────────────────────
+//
+// OWNER FACT (Jonathan, 2026-09-19): the NMEA box is part of the boat's navigation system and is
+// switched OFF at the dock, so "unreachable" is NORMAL there, not a fault. While it keeps failing the
+// hub backs off quietly — first retry after NMEA_RETRY_FIRST_SECS, doubling to NMEA_RETRY_CAP_SECS —
+// with ONE log line when it goes quiet and ONE when a fix is acquired again. No per-attempt lines, no
+// event, no alert, and nothing reaches the cloud about its absence (a failed poll never reaches the
+// geofence, so it is not an "unreliable fix" episode either). The first answer returns the loop to its
+// normal sampling cadence at once, and that fix goes through the geofence like any other — straight
+// into an armed anchor watch or an underway track.
+//
+// The cap is 5 minutes (the coordinator's suggestion; nothing in the code argued for another value):
+// the navigation system coming back on is noticed within 5 minutes, and at the cap a boat at the dock
+// costs one TCP connect attempt every 5 minutes. A lease or a watch change rings gps_wake, which cuts
+// the wait short, so a member opening the app retries at once.
+//
+// Only the NMEA kind. A Cradlepoint source (and a managed router's GPS, routers.rs) is unaffected.
+
+/// The first retry after a failed NMEA poll.
+pub const NMEA_RETRY_FIRST_SECS: u64 = 5;
+/// The longest wait between retries while the NMEA source keeps failing.
+pub const NMEA_RETRY_CAP_SECS: u64 = 300;
+
+/// PURE: the quiet backoff for one NMEA source. `failures` is the current run of consecutive failures.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SourceBackoff {
+    failures: u32,
+}
+
+impl SourceBackoff {
+    /// A failed poll: the line to log (only for the first failure of a run) and the seconds to wait.
+    pub fn failed(&mut self, host: &str, why: &str) -> (Option<String>, u64) {
+        self.failures = self.failures.saturating_add(1);
+        let note = (self.failures == 1).then(|| {
+            format!("gps: {host} - the GPS source is not answering ({why}); normal while the navigation system is off - the hub keeps checking in the background")
+        });
+        let secs = NMEA_RETRY_FIRST_SECS.saturating_mul(1u64 << (self.failures - 1).min(16)).min(NMEA_RETRY_CAP_SECS);
+        (note, secs)
+    }
+
+    /// A fix: the line to log when this ends a run of failures (else nothing). The run is over.
+    pub fn succeeded(&mut self, host: &str) -> Option<String> {
+        let was_quiet = self.failures > 0;
+        self.failures = 0;
+        was_quiet.then(|| format!("gps: {host} - the GPS source is answering again; fix acquired"))
+    }
+
+    pub fn failing(&self) -> bool {
+        self.failures > 0
+    }
+}
+
 /// A UDP socket on `0.0.0.0:port` that SHARES the port. The hub often runs on the same PC as the
 /// navigation program (TimeZero, OpenCPN) that already listens on 10110 or 2000; a plain bind would
 /// fail with "address in use" and the hub could never hear the feed the plotter is using.
@@ -417,6 +469,34 @@ mod nmea_tests {
 
     const RMC_BODY: &str = "GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W";
     const GGA_BODY: &str = "GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,";
+
+    #[test]
+    fn a_failing_nmea_source_logs_once_and_backs_off_to_five_minutes() {
+        let mut b = SourceBackoff::default();
+        let mut logs = 0;
+        let mut waits = Vec::new();
+        for _ in 0..12 {
+            let (note, secs) = b.failed("172.31.0.112", "172.31.0.112:10110 did not answer within 5 s");
+            logs += usize::from(note.is_some());
+            waits.push(secs);
+        }
+        assert_eq!(logs, 1, "one line when it goes quiet, none per attempt");
+        assert_eq!(waits, vec![5, 10, 20, 40, 80, 160, 300, 300, 300, 300, 300, 300]);
+        assert!(b.failing());
+        let note = b.succeeded("172.31.0.112").expect("the first fix after the quiet run is logged");
+        assert!(note.contains("answering again"), "{note}");
+        assert!(!b.failing());
+        assert_eq!(b.succeeded("172.31.0.112"), None, "an ordinary fix logs nothing");
+        // A new run starts over: one line, first retry after 5 s.
+        let (note, secs) = b.failed("172.31.0.112", "unreachable network");
+        assert!(note.is_some());
+        assert_eq!(secs, NMEA_RETRY_FIRST_SECS);
+        // A very long run never overflows.
+        let mut long = SourceBackoff::default();
+        for _ in 0..100_000 {
+            assert!(long.failed("h", "x").1 <= NMEA_RETRY_CAP_SECS);
+        }
+    }
 
     #[test]
     fn checksum_accepts_a_good_sentence_rejects_a_bad_one_and_tolerates_none() {

@@ -428,6 +428,34 @@ mod tests {
         assert!(c.due(sig, 700_000, 700_001, 300));
     }
 
+    /// Live-only fields (batch::MODEM_LIVE_ONLY, LINKTAP_LIVE_ONLY) never drive change detection:
+    /// they are not sent without a lease, so an "event" on one would send a reading with the very
+    /// field that moved stripped off. Moving every one of them is not an event; `up`/`wan` still are.
+    #[test]
+    fn live_only_fields_never_make_an_event() {
+        let base = crate::batch::fixtures::dish();
+        let last = RouterSent::from_params(&base);
+        let bump = |p: &[(String, String)], live: &[&str]| -> Vec<(String, String)> {
+            p.iter().map(|(k, v)| (k.clone(), if live.contains(&k.as_str()) { format!("{v}9") } else { v.clone() })).collect()
+        };
+        for p in [base.clone(), crate::batch::fixtures::lte()] {
+            let last = RouterSent::from_params(&p);
+            assert!(!router_is_event(Some(&last), &bump(&p, crate::batch::MODEM_LIVE_ONLY)), "{p:?}");
+        }
+        let flipped: Vec<(String, String)> = base.iter().map(|(k, v)| (k.clone(), if k == "up" { if v == "1" { "0".into() } else { "1".into() } } else { v.clone() })).collect();
+        assert!(router_is_event(Some(&last), &flipped), "up/down is still an event");
+        let rewired: Vec<(String, String)> = base.iter().map(|(k, v)| (k.clone(), if k == "wan" { format!("{v}-other") } else { v.clone() })).collect();
+        assert!(router_is_event(Some(&last), &rewired), "a WAN change is still an event");
+
+        let valve: Vec<(String, String)> = [("watering", "0"), ("rf", "1"), ("signal", "69"), ("battery", "93")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let vlast = ValveSent::from_params(&valve);
+        assert!(!valve_transition(Some(&vlast), &bump(&valve, crate::batch::LINKTAP_LIVE_ONLY)));
+        assert!(!valve_measurement_due(Some(&vlast), &bump(&valve, crate::batch::LINKTAP_LIVE_ONLY)));
+    }
+
     #[test]
     fn a_lease_takes_the_latest_expiry_and_clamps_the_ttl() {
         let now = 1_000_000;
