@@ -25,13 +25,25 @@
 //   never checks a failing router LESS often than its normal cadence either (`due`).
 // - Until down is decided, a retry is clamped to land on the grace deadline (first bad sample + 45 s),
 //   so down is decided at ~45 s rather than at whichever backoff step comes after it.
-// - A Starlink that reports, in the same answer, an outage it has itself measured at ≥ 45 s
-//   (DishOutage.duration_ns) counts at once — the dish has already watched the window elapse (a hub
-//   restarted mid-outage need not wait another 45 s). A dish that does not report a duration waits
-//   the window like everything else. That shortcut is now reachable ONLY by a genuine link outage:
-//   since 0.3.54 a dish CONDITION (booting, stowed, sleeping…) never produces `up=0` at all
-//   (starlink::LINK_OUTAGE_CAUSES), so it cannot bypass the window however long the dish has been
-//   in it — proven in starlink.rs.
+// - A device that reports, in the same answer, an outage it has itself MEASURED at ≥ 45 s counts at
+//   once — it has already watched the window elapse, so a hub restarted mid-outage need not wait
+//   another 45 s. A device that reports no duration waits the window like everything else.
+//
+// ⚠️ A STARLINK HAS ITS OWN, LONGER THRESHOLD, AND FOR A DISH IT IS THE ONE THAT DECIDES.
+// Owner ruling (Jonathan, 2026-09-24): an outage is "no internet for over 2 minutes", and every
+// cause the dish reports counts ("all of them except connectd"). starlink::OUTAGE_MIN_MS is
+// therefore 120 s, and starlink::wan_of only ever produces `up=0` for a dish whose outage is
+// ALREADY past it (starlink::carry_outage times the run).
+//
+// The 45 s window below NEVER ADDS to those two minutes. The first down sample a dish can produce
+// carries a measured duration over 120 s, which is ≥ DOWN_GRACE_MS, so the measured-duration
+// shortcut above reports it down in that same poll instead of waiting a further 45 s. A dish goes
+// down at ~2 min, not at 2 min 45 s, and never at 45 s. Proven in starlink.rs and at the poll loop
+// in hub_server.rs.
+//
+// 45 s still governs everything else, INCLUDING a dish poll that FAILED: a reading the hub could
+// not make is not an outage — it is a lost reading, held as `upSrc=unread` — and it waits the same
+// 45 s as any other router, whatever the vendor.
 //
 // PURE: no clock, no I/O. hub_server's router_poll_loop is the shell: it samples, calls `observe`
 // with the times it read, and reports what the verdict says.

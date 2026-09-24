@@ -281,15 +281,25 @@ pub struct DishStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub obstructed: Option<bool>,
     /// The cause of the outage the dish is in, when it is in one (`outage_label`); absent when up.
+    /// Reported whether or not the outage has lasted long enough to be a WAN outage (OUTAGE_MIN_MS),
+    /// so the history reads "stowed" for three hours and "obstructed" for four minutes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outage: Option<String>,
-    /// How long the dish itself says the current outage has lasted (DishOutage.duration_ns), in ms.
-    /// Hub-internal: router_health counts an outage the dish measured past the grace window at once.
+    /// How long the CURRENT outage has lasted, in ms. As parsed it is the dish's own measurement
+    /// (DishOutage.duration_ns); `carry_outage` then reconciles it with the run the hub has watched
+    /// itself, and `wan_of` compares the result against OUTAGE_MIN_MS. Hub-internal — it is also
+    /// what lets router_health count a dish's down sample without adding its own 45 s window.
     #[serde(skip)]
     pub outage_ms: Option<i64>,
-    /// The raw DishOutage.Cause behind `outage`. Hub-internal (`outage` carries its label on the
-    /// wire): `is_link_outage` reads this to decide whether the WAN is down or the DISH is merely
-    /// busy with itself. Some(0) is an outage whose cause the dish did not give.
+    /// When the hub first saw the outage now in progress, epoch ms; None while the dish reports no
+    /// outage. Hub-internal, carried from the previous Snapshot by `carry_outage` so a dish that
+    /// reports an outage with no duration of its own is still timed. Lost across a hub restart —
+    /// the dish's own measured duration is what covers that case.
+    #[serde(skip)]
+    pub outage_since_ms: Option<i64>,
+    /// The raw DishOutage.Cause behind `outage` (`outage` carries its label on the wire). Hub-internal:
+    /// its PRESENCE is what says the dish is in an outage at all. Some(0) is an outage whose cause the
+    /// dish did not give — still an outage, per the owner's ruling (see OUTAGE_MIN_MS).
     #[serde(skip)]
     pub outage_cause: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -372,6 +382,8 @@ pub fn parse_status(r: &pb::DishGetStatusResponse) -> DishStatus {
         obstructed: obs.and_then(|o| o.currently_obstructed),
         outage: r.outage.as_ref().map(|o| outage_label(o.cause.unwrap_or(0)).to_string()),
         outage_ms: r.outage.as_ref().and_then(|o| o.duration_ns).map(|ns| i64::try_from(ns / 1_000_000).unwrap_or(i64::MAX)),
+        // Filled by `carry_outage` from the previous poll: one `get_status` cannot know it.
+        outage_since_ms: None,
         outage_cause: r.outage.as_ref().map(|o| o.cause.unwrap_or(0)),
         latency_ms: f(r.pop_ping_latency_ms).map(round1),
         loss_pct: f(r.pop_ping_drop_rate).map(|n| round1(n * 100.0)),
@@ -401,38 +413,66 @@ pub fn parse_probe(info: &pb::DeviceInfo) -> Probe {
     }
 }
 
-/// THE OUTAGE CAUSES THAT ARE A WAN OUTAGE — the one table, and the only place `up=0` is decided
-/// for a dish.
+/// WHEN A DISH OUTAGE IS A WAN OUTAGE — the one rule, and the only place `up=0` is decided for a
+/// dish. An outage is TWO MINUTES LONG, not a particular cause.
 ///
-/// ⚠️ THE OWNER'S RULING ON THIS SPLIT IS PENDING. Jonathan, 2026-09-24: "the way you are measuring
-/// up/down on routers is wrong. It's too aggressive and not actually logging the state." Until he
-/// rules on the wording and the split, this table is deliberately conservative: only a cause that
-/// means THERE IS NO PATH TO THE INTERNET sets `up=0`. Everything else is the DISH's own condition
-/// and is reported as such — the `outage` param still carries the label, exactly as before, so
-/// nothing is hidden; the dish simply stops claiming the WAN went down because it was booting.
+/// THE OWNER'S RULING (Jonathan, 2026-09-24). Asked what an outage is, he said an outage is
+/// "no internet for over 2 minutes". Asked which of the causes the dish reports should count, he
+/// said "all of them except connectd". So EVERY cause the dish gives is a WAN outage once it has
+/// been continuous for MORE THAN two minutes — booting, stowed, thermal shutdown, no schedule, no
+/// satellites, obstructed, no downlink, no pings, actuator activity, cable test, sleeping, sky
+/// search, RF inhibited, a code this hub has never seen, and an outage the dish will not explain at
+/// all (`Some(0)`). The ONE non-outage is the dish reporting no outage at all: connected.
 ///
-/// A WAN outage (this table):
-///   5 no satellites, 6 obstructed, 7 no downlink, 8 no pings — the dish has no usable path.
+/// 🔴 THIS REPLACES THE INTERIM TABLE SHIPPED IN 0.3.54, which split the causes into "no path to
+/// the internet" (5, 6, 7, 8 → `up=0`) and "the dish's own condition" (everything else → `up=1`,
+/// however long it lasted) while the ruling was pending. There is no such split any more: the clock
+/// decides, not the cause. A dish that has been stowed for three hours has had no internet for
+/// three hours, and the owner wants that logged as the outage it is.
 ///
-/// A DISH CONDITION, reported without `up=0`:
-///   1 booting, 2 stowed, 3 thermal shutdown, 4 no schedule, 9 actuator activity, 10 cable test,
-///   11 sleeping, 13 sky search, 14 RF inhibited.
+/// The cause is still reported either way, above the threshold and below it (`outage`, DishStatus),
+/// so the history reads "stowed" over three hours and "obstructed" over four minutes rather than a
+/// bare down — nothing is hidden, and nothing is invented.
 ///
-/// AND AN UNRECOGNISED CAUSE IS NOT A LINK OUTAGE either — the ruling is that down needs positive
-/// evidence, so a cause code this hub has never seen (including the dish reporting an outage with
-/// no cause at all, `Some(0)`) reports its label without asserting the WAN is down.
-pub const LINK_OUTAGE_CAUSES: &[i32] = &[5, 6, 7, 8];
+/// "Over 2 minutes" is strict: an outage measured at exactly 120 s is not yet one.
+pub const OUTAGE_MIN_MS: i64 = 120_000;
 
-/// PURE: does this DishOutage.Cause mean the WAN is down? See LINK_OUTAGE_CAUSES.
-pub fn is_link_outage(cause: i32) -> bool {
-    LINK_OUTAGE_CAUSES.contains(&cause)
+/// PURE: how long the dish's CURRENT outage has lasted, folded across polls.
+///
+/// `d` is this poll's reading, `prev` the last reading of the SAME dish from a poll that succeeded,
+/// and `now_ms` when this poll was taken. On return `d.outage_ms` is the outage's age and
+/// `d.outage_since_ms` is when this run began, for the next poll to carry.
+///
+/// TWO CLOCKS, AND WHY BOTH. The dish's own measurement (DishOutage.duration_ns, already in
+/// `outage_ms` as parsed) is what lets a hub that RESTARTED mid-outage count it at once instead of
+/// starting a fresh two minutes — it has watched the outage the hub did not. The hub's own run is
+/// what covers a dish that reports an outage with no duration at all. The age is the greater of the
+/// two: neither clock may shorten an outage the other has already seen.
+///
+/// A run continues while the dish reports ANY outage, so a cause that CHANGES mid-run (sky search
+/// → no satellites) does not restart the two minutes — the internet was out across both — and the
+/// label reported is always the current one. A poll the hub could not make ends the run instead of
+/// extending it (`prev` is passed only for a poll that succeeded): the hub cannot claim continuity
+/// it did not observe, and where the dish measured the outage itself that measurement still counts.
+pub fn carry_outage(d: &mut DishStatus, prev: Option<&DishStatus>, now_ms: i64) {
+    if d.outage_cause.is_none() {
+        d.outage_since_ms = None;
+        return;
+    }
+    let since = prev.filter(|p| p.outage_cause.is_some()).and_then(|p| p.outage_since_ms).unwrap_or(now_ms);
+    d.outage_since_ms = Some(since);
+    let hub_ms = now_ms.saturating_sub(since).max(0);
+    d.outage_ms = Some(d.outage_ms.filter(|m| *m >= 0).map_or(hub_ms, |m| m.max(hub_ms)));
 }
 
-/// PURE: the uplink the dish IS. Down ONLY on a cause in LINK_OUTAGE_CAUSES; a dish condition
-/// (booting, stowed, sleeping, moving, thermally shut down…) reports its `outage` label with the
-/// WAN still up. See that table for why, and for the pending owner ruling.
+/// PURE: the uplink the dish IS. Down when the dish is in an outage — ANY outage, whatever its
+/// cause — AND that outage has lasted more than OUTAGE_MIN_MS. An outage the dish has not held for
+/// two minutes is not one yet, and no outage at all is up.
+///
+/// `d.outage_ms` is the age `carry_outage` reconciled. An outage with no age yet is on its first
+/// sighting by a hub the dish told nothing about it, which is below the threshold by definition.
 pub fn wan_of(d: &DishStatus) -> WanStatus {
-    let up = !d.outage_cause.is_some_and(is_link_outage);
+    let up = !(d.outage_cause.is_some() && d.outage_ms.is_some_and(|ms| ms > OUTAGE_MIN_MS));
     WanStatus { wan: "starlink".into(), up, up_known: true, ip: None, uptime_s: None }
 }
 
@@ -696,14 +736,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_outage_names_its_cause_and_reads_as_down() {
+    fn an_outage_names_its_cause_and_carries_the_duration_the_dish_measured() {
         let mut s = bench_status();
         s.outage = Some(pb::DishOutage { cause: Some(5), start_timestamp_ns: None, duration_ns: Some(30_000_000_000), did_switch: None });
         s.pop_ping_drop_rate = Some(0.0125);
         let d = parse_status(&s);
         assert_eq!(d.outage.as_deref(), Some("no satellites"));
+        assert_eq!(d.outage_cause, Some(5));
+        assert_eq!(d.outage_ms, Some(30_000));
         assert_eq!(d.loss_pct, Some(1.3)); // 1.25 rounds half away from zero
-        assert!(!wan_of(&d).up);
+        assert!(wan_of(&d).up, "thirty seconds is not yet 'no internet for over 2 minutes'");
         assert_eq!(outage_label(6), "obstructed");
         assert_eq!(outage_label(13), "sky search");
         assert_eq!(outage_label(12), "unknown"); // reserved on api 43
@@ -714,57 +756,161 @@ pub(crate) mod tests {
         assert!(wan_of(&bare).up, "no outage reported is up — the dish says so by omission");
     }
 
-    /// D5 — A DISH CONDITION IS NOT A WAN OUTAGE. Every cause used to set `up=0`.
-    #[test]
-    fn only_a_genuine_link_outage_takes_the_wan_down_a_dish_condition_does_not() {
-        let with_cause = |cause: i32, ns: Option<u64>| {
-            let mut s = bench_status();
-            s.outage = Some(pb::DishOutage { cause: Some(cause), start_timestamp_ns: None, duration_ns: ns, did_switch: None });
-            parse_status(&s)
-        };
-        // The genuine ones: no path to the internet.
-        for cause in LINK_OUTAGE_CAUSES {
-            let d = with_cause(*cause, None);
-            assert!(!wan_of(&d).up, "cause {cause} ({}) is a WAN outage", outage_label(*cause));
-            assert!(is_link_outage(*cause));
-        }
-        // 🔴 The dish's OWN conditions. Every one of these reported the WAN down until 0.3.54.
-        for cause in [1, 2, 3, 4, 9, 10, 11, 13, 14] {
-            let d = with_cause(cause, None);
-            let label = outage_label(cause);
-            assert!(wan_of(&d).up, "cause {cause} ({label}) is the dish's condition, not a link outage");
-            assert!(!is_link_outage(cause));
-            // And it is STILL REPORTED — nothing is hidden, the dish just stops claiming a WAN down.
-            assert_eq!(d.outage.as_deref(), Some(label), "the cause is reported exactly as before");
-            let params = crate::routers::dish_params(&d, &wan_of(&d), None);
-            assert!(params.contains(&("outage".to_string(), label.to_string())), "{params:?}");
-            assert_eq!(params.iter().find(|(k, _)| k == "up").map(|(_, v)| v.as_str()), Some("1"));
-        }
-        // A cause this hub has never met, and an outage with no cause at all: not link outages.
-        assert!(wan_of(&with_cause(99, None)).up, "an unrecognised cause is not evidence of a down link");
-        let mut s = bench_status();
-        s.outage = Some(pb::DishOutage { cause: None, start_timestamp_ns: None, duration_ns: None, did_switch: None });
-        let d = parse_status(&s);
-        assert_eq!(d.outage_cause, Some(0));
-        assert!(wan_of(&d).up, "an outage the dish did not explain is not a WAN down");
+    /// Every DishOutage.Cause the dish can name, plus a code this hub has never seen and an outage
+    /// the dish would not explain at all (`Some(0)` — `cause` absent). The owner's ruling is "all of
+    /// them except connectd", so this list is the whole of it.
+    const EVERY_CAUSE: [i32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 99];
 
-        // THE GRACE SHORTCUT (router_health: a dish-measured outage ≥ 45 s skips the window) can no
-        // longer be reached by a dish condition, because a dish condition never produces `up=0`.
-        let booting = with_cause(1, Some(600_000_000_000)); // ten minutes of "booting"
-        assert_eq!(booting.outage_ms, Some(600_000));
-        let params = crate::routers::dish_params(&booting, &wan_of(&booting), None);
-        assert_eq!(
-            crate::router_health::sample_of(Some(&params), booting.outage_ms),
-            crate::router_health::Sample::Up,
-            "a ten-minute boot does not bypass the grace window, because it is not a down sample at all"
-        );
-        // A genuine one still does, which is what the shortcut is for.
-        let starved = with_cause(5, Some(600_000_000_000));
-        let params = crate::routers::dish_params(&starved, &wan_of(&starved), None);
-        assert_eq!(
-            crate::router_health::sample_of(Some(&params), starved.outage_ms),
-            crate::router_health::Sample::ReportedDown { measured_ms: Some(600_000) }
-        );
+    /// One reading of a dish in `cause`, with the duration the dish itself measured (ns) when it
+    /// gives one. `outage_since_ms` is unset — `carry_outage` is what fills it.
+    fn dish_in(cause: i32, ns: Option<u64>) -> DishStatus {
+        let mut s = bench_status();
+        s.outage = Some(pb::DishOutage { cause: Some(cause), start_timestamp_ns: None, duration_ns: ns, did_switch: None });
+        parse_status(&s)
+    }
+
+    /// Poll a dish that reports an outage with NO duration of its own at each of `secs`, folding the
+    /// hub's own clock forward; returns the `up` each reading produced.
+    fn hub_timed(cause: i32, secs: &[i64]) -> Vec<bool> {
+        let mut prev: Option<DishStatus> = None;
+        let mut ups = Vec::new();
+        for t in secs {
+            let mut d = dish_in(cause, None);
+            carry_outage(&mut d, prev.as_ref(), t * 1_000);
+            ups.push(wan_of(&d).up);
+            prev = Some(d);
+        }
+        ups
+    }
+
+    fn param<'a>(p: &'a [(String, String)], k: &str) -> Option<&'a str> {
+        p.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
+    }
+
+    /// THE OWNER'S RULING (Jonathan, 2026-09-24): an outage is "no internet for over 2 minutes", and
+    /// which causes count is "all of them except connectd". 119 s is not an outage, 121 s is, and
+    /// EVERY cause behaves the same way — there is no table any more.
+    #[test]
+    fn every_cause_is_an_outage_after_two_minutes_and_none_of_them_before() {
+        for cause in EVERY_CAUSE {
+            assert_eq!(
+                hub_timed(cause, &[0, 119, 120, 121, 3 * 3600]),
+                vec![true, true, true, false, false],
+                "cause {cause} ({}): 119 s is not an outage, 121 s is, and 120 s exactly is not OVER two minutes",
+                outage_label(cause)
+            );
+        }
+    }
+
+    /// The cause is reported EITHER WAY — below the threshold and above it — so the history reads
+    /// "stowed" over three hours and "obstructed" over four minutes, never a bare down.
+    #[test]
+    fn the_dishs_own_cause_is_reported_whether_or_not_it_is_yet_an_outage() {
+        for cause in EVERY_CAUSE {
+            let label = outage_label(cause);
+            let mut young = dish_in(cause, None);
+            carry_outage(&mut young, None, 0);
+            let p = crate::routers::dish_params(&young, &wan_of(&young), None);
+            assert_eq!(param(&p, "outage"), Some(label), "cause {cause} below the threshold: {p:?}");
+            assert_eq!(param(&p, "up"), Some("1"), "cause {cause} below the threshold is not a down");
+
+            let mut old = dish_in(cause, Some(3 * 3600 * 1_000_000_000));
+            carry_outage(&mut old, None, 0);
+            let p = crate::routers::dish_params(&old, &wan_of(&old), None);
+            assert_eq!(param(&p, "outage"), Some(label), "cause {cause} past the threshold still names itself: {p:?}");
+            assert_eq!(param(&p, "up"), Some("0"), "cause {cause} ({label}) over two minutes IS a WAN outage");
+        }
+    }
+
+    /// A duration THE DISH measured past two minutes counts at once — a hub that restarted
+    /// mid-outage does not restart the clock.
+    #[test]
+    fn a_duration_the_dish_measured_past_two_minutes_counts_at_once() {
+        // No previous reading at all: the hub has just come up, and the dish is the only clock.
+        let mut stowed = dish_in(2, Some(3 * 3600 * 1_000_000_000));
+        carry_outage(&mut stowed, None, 9_999_999);
+        assert_eq!(stowed.outage_ms, Some(3 * 3600 * 1_000));
+        assert!(!wan_of(&stowed).up, "the dish had already watched the two minutes elapse");
+
+        // The same boundary, measured by the dish instead of by the hub.
+        for (ns, up) in [(119_000_000_000u64, true), (120_000_000_000, true), (121_000_000_000, false)] {
+            let mut d = dish_in(6, Some(ns));
+            carry_outage(&mut d, None, 0);
+            assert_eq!(wan_of(&d).up, up, "a dish-measured {ns} ns");
+        }
+        // Neither clock may shorten what the other has already seen: an hour of hub-watched outage
+        // is not undone by a dish that reports the current cause as seconds old.
+        let mut first = dish_in(13, None);
+        carry_outage(&mut first, None, 0);
+        let mut later = dish_in(5, Some(4_000_000_000));
+        carry_outage(&mut later, Some(&first), 3_600_000);
+        assert_eq!(later.outage_ms, Some(3_600_000), "the cause changed mid-run; the internet never came back");
+        assert!(!wan_of(&later).up);
+    }
+
+    /// No outage at all is up, and it ENDS the run: the next outage starts its own two minutes.
+    #[test]
+    fn no_outage_at_all_is_up_and_clears_the_run() {
+        let mut out = dish_in(6, None);
+        carry_outage(&mut out, None, 0);
+        let mut still = dish_in(6, None);
+        carry_outage(&mut still, Some(&out), 200_000);
+        assert!(!wan_of(&still).up, "200 s of one unbroken run");
+
+        let mut clear = parse_status(&bench_status());
+        carry_outage(&mut clear, Some(&still), 210_000);
+        assert_eq!((clear.outage_cause, clear.outage_since_ms, clear.outage_ms), (None, None, None));
+        assert!(wan_of(&clear).up);
+
+        let mut again = dish_in(6, None);
+        carry_outage(&mut again, Some(&clear), 211_000);
+        assert!(wan_of(&again).up, "a new outage starts its own two minutes");
+        assert_eq!(again.outage_since_ms, Some(211_000));
+    }
+
+    /// HOW THE TWO THRESHOLDS MEET. The dish's own two minutes decide; router_health's 45 s window
+    /// never adds to them, because the first down sample a dish can produce already carries a
+    /// measured duration past 45 s, which trips the measured-duration shortcut in the same poll.
+    #[test]
+    fn a_dish_down_sample_skips_the_45_s_router_grace_instead_of_adding_to_it() {
+        use crate::router_health::{sample_of, RouterHealth, Sample, Verdict};
+        let mut d = dish_in(2, None); // stowed, and the dish will not say for how long
+        carry_outage(&mut d, None, 0);
+        let mut down = dish_in(2, None);
+        carry_outage(&mut down, Some(&d), 121_000);
+        assert_eq!(down.outage_ms, Some(121_000));
+        let params = crate::routers::dish_params(&down, &wan_of(&down), None);
+        let sample = sample_of(Some(&params), down.outage_ms);
+        assert_eq!(sample, Sample::ReportedDown { measured_ms: Some(121_000) });
+        // THE RELATIONSHIP, not the number: whatever the two thresholds are set to, a dish's down
+        // sample always arrives already past the router window, so the window cannot add to it.
+        let measured = match sample {
+            Sample::ReportedDown { measured_ms } => measured_ms.expect("a dish down sample always carries its age"),
+            other => panic!("a dish past two minutes is a down sample, not {other:?}"),
+        };
+        assert!(measured >= crate::router_health::DOWN_GRACE_MS, "{measured} ms is not past the {} ms router window", crate::router_health::DOWN_GRACE_MS);
+        let mut h = RouterHealth::default();
+        assert_eq!(h.observe(sample, 121_000, 121_000), Verdict::WentDown, "down at ~2 min, not at 2 min 45 s");
+
+        // And below the threshold there is no bad sample at all, so no window is ever opened.
+        let params = crate::routers::dish_params(&d, &wan_of(&d), None);
+        assert_eq!(sample_of(Some(&params), d.outage_ms), Sample::Up);
+        let mut g = RouterHealth::default();
+        assert_eq!(g.observe(Sample::Up, 0, 0), Verdict::Report { recovered: false });
+        assert_eq!(g, RouterHealth::default());
+    }
+
+    /// An outage the dish will not explain (`cause` absent) is an outage all the same — the owner's
+    /// ruling admits only one non-outage, and it is the dish reporting no outage at all.
+    #[test]
+    fn an_outage_the_dish_did_not_explain_is_still_an_outage() {
+        let mut s = bench_status();
+        s.outage = Some(pb::DishOutage { cause: None, start_timestamp_ns: None, duration_ns: Some(600_000_000_000), did_switch: None });
+        let mut d = parse_status(&s);
+        carry_outage(&mut d, None, 0);
+        assert_eq!(d.outage_cause, Some(0));
+        assert_eq!(d.outage.as_deref(), Some("unknown"));
+        assert!(!wan_of(&d).up, "ten minutes of an unexplained outage is ten minutes with no internet");
     }
 
     #[test]
@@ -844,11 +990,20 @@ pub(crate) mod tests {
     /// on MVP's Mini, bench 2026-09-13: "Disabled due to policy") unless the test flips
     /// `allow_location` — a Priority-plan dish.
     pub(crate) async fn mock_dish(allow_location: bool) -> u16 {
+        mock_dish_with(allow_location, None, None).await
+    }
+
+    /// The same mock, reporting an outage in every `get_status`: `cause` is a DishOutage.Cause and
+    /// `duration_ns` the duration the dish itself measures, or None for a dish that reports the
+    /// outage without saying how long it has lasted (the case the hub has to time itself).
+    pub(crate) async fn mock_dish_with(allow_location: bool, cause: Option<i32>, duration_ns: Option<u64>) -> u16 {
+        let outage = cause.map(|c| pb::DishOutage { cause: Some(c), start_timestamp_ns: None, duration_ns, did_switch: None });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             loop {
                 let Ok((sock, _)) = listener.accept().await else { break };
+                let outage = outage.clone();
                 tokio::spawn(async move {
                     let mut conn = h2::server::handshake(sock).await.unwrap();
                     while let Some(Ok((req, mut respond))) = conn.accept().await {
@@ -863,7 +1018,9 @@ pub(crate) mod tests {
                         let r = pb::Request::decode(unframe(&buf).unwrap()).unwrap();
                         let mut trailers = http::HeaderMap::new();
                         let answer = match r.kind {
-                            Some(pb::request::Kind::GetStatus(_)) => Some(pb::response::Kind::DishGetStatus(bench_status())),
+                            Some(pb::request::Kind::GetStatus(_)) => {
+                                Some(pb::response::Kind::DishGetStatus(pb::DishGetStatusResponse { outage: outage.clone(), ..bench_status() }))
+                            }
                             Some(pb::request::Kind::Reboot(_)) => Some(pb::response::Kind::Reboot(pb::Empty {})),
                             Some(pb::request::Kind::GetLocation(_)) if allow_location => Some(pb::response::Kind::GetLocation(pb::GetLocationResponse {
                                 lla: Some(pb::LlaPosition { lat: Some(45.0625), lon: Some(-83.4321), alt: Some(180.0) }),

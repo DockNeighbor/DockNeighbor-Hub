@@ -1110,6 +1110,16 @@ async fn poll_with(drv: Result<Driver<'_>, String>, cfg: &RouterConfig, prev: Op
     snap.modem = status.modem;
     snap.wan = status.wan;
     snap.dish = status.dish;
+    // THE DISH'S OUTAGE CLOCK. The owner's rule is a DURATION — an outage is "no internet for over
+    // 2 minutes", whatever the dish says caused it (starlink::OUTAGE_MIN_MS) — so `up` needs the AGE
+    // of the outage, which is the dish's own measured duration where it gives one and the run the
+    // hub has watched across polls where it does not. `prev` is the last snapshot for this same
+    // dish, and only a poll that SUCCEEDED can testify to continuity, so an errored one ends the
+    // run. `status()` computed `wan` from the dish's own duration alone; this is the reconciled one.
+    if let Some(d) = snap.dish.as_mut() {
+        crate::starlink::carry_outage(d, prev.filter(|p| p.error.is_none()).and_then(|p| p.dish.as_ref()), now);
+        snap.wan = Some(crate::starlink::wan_of(d));
+    }
     // 🔴 D4: A SNAPSHOT THE PARSERS COULD NOT READ IS AN ERROR, not a silent success. Until 0.3.54
     // this fell through with `error = None` and `ok_at_ms` set, so `report_params` returned None,
     // the poll loop sent nothing AND router_health saw a good sample — a router the hub could not
@@ -1339,6 +1349,43 @@ mod tests {
         assert!(drv.set_gps_enabled(false).await.is_ok());
         // Nothing to report when a read learned neither a modem nor a dish.
         assert!(report_params(&Snapshot::default(), None).is_none());
+    }
+
+    /// THE CLOCK IS WIRED INTO THE POLL. A dish that reports an outage with no duration of its own
+    /// is timed by the hub across polls: the first sighting is not an outage, and the run carried
+    /// forward in `prev` is what takes it past the owner's two minutes.
+    #[tokio::test]
+    async fn a_dish_outage_is_timed_across_polls_and_only_counts_past_two_minutes() {
+        // Cause 2 = stowed — one of the causes 0.3.54 would never have called a WAN outage at all.
+        let port = crate::starlink::tests::mock_dish_with(false, Some(2), None).await;
+        let cfg = RouterConfig { vendor: "starlink".into(), host: "127.0.0.1".into(), port, ..Default::default() };
+
+        let first = poll(&lan_client(), &cfg, None).await;
+        assert_eq!(first.error, None);
+        let d = first.dish.as_ref().expect("dish");
+        assert_eq!(d.outage.as_deref(), Some("stowed"), "the cause is reported from the first sighting");
+        assert_eq!(first.wan.as_ref().map(|w| w.up), Some(true), "the first sighting of an outage is not yet an outage");
+        let since = d.outage_since_ms.expect("the hub started its own clock");
+        assert_eq!(d.outage_ms, Some(0), "no duration from the dish, and no elapsed run yet");
+
+        // The same unbroken run, 121 s older: rewind its start rather than sleep for two minutes.
+        let mut aged = first.clone();
+        aged.dish.as_mut().unwrap().outage_since_ms = Some(since - 121_000);
+        let second = poll(&lan_client(), &cfg, Some(&aged)).await;
+        assert_eq!(second.wan.as_ref().map(|w| w.up), Some(false), "the run carried across the poll and passed two minutes");
+        let d = second.dish.as_ref().unwrap();
+        assert!(d.outage_ms.unwrap() >= 121_000, "outage_ms = {:?}", d.outage_ms);
+        assert_eq!(get_param(&report_params(&second, None).unwrap(), "outage"), Some("stowed"), "and it still names itself");
+
+        // A poll that FAILED cannot testify to continuity: the run starts again from this sighting.
+        let mut broken = aged.clone();
+        broken.error = Some("the router did not answer (timed out)".into());
+        let third = poll(&lan_client(), &cfg, Some(&broken)).await;
+        assert_eq!(third.wan.as_ref().map(|w| w.up), Some(true), "the hub does not claim continuity it did not observe");
+    }
+
+    fn get_param<'a>(p: &'a [(String, String)], k: &str) -> Option<&'a str> {
+        p.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
     }
 
     #[tokio::test]
