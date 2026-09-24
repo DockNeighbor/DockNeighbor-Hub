@@ -290,6 +290,11 @@ impl ReadingGate {
 pub struct RouterSent {
     pub up: Option<String>,
     pub wan: Option<String>,
+    /// `upSrc` — whether the last sent `up` was READ from the router or carried forward because the
+    /// hub could not read it (router_health). A move between the two is a real transition the cloud
+    /// must see at once: the held reading's `up` does not change when a router stops answering, so
+    /// without this the only signal of "the hub has lost this router" waited for the keyframe.
+    pub up_src: Option<String>,
 }
 
 fn param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -298,16 +303,28 @@ fn param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
 
 impl RouterSent {
     pub fn from_params(params: &[(String, String)]) -> Self {
-        RouterSent { up: param(params, "up").map(str::to_string), wan: param(params, "wan").map(str::to_string) }
+        RouterSent {
+            up: param(params, "up").map(str::to_string),
+            wan: param(params, "wan").map(str::to_string),
+            up_src: param(params, crate::router_health::UP_SRC).map(str::to_string),
+        }
     }
 }
 
-/// PURE: is this router poll an immediate event? Only once a baseline exists (the first read after
-/// start rides the first keyframe), and only when the uplink kind or its up/down state moved.
+/// PURE: is this router poll an immediate event? When the uplink kind, its up/down state, or WHERE
+/// THAT STATE CAME FROM (`upSrc`) moved.
+///
+/// 🔴 THE FIRST READING AFTER A RESTART IS NOW AN EVENT (D8, owner ruling 2026-09-24). It used to
+/// return false with no baseline — "the first read after start rides the first keyframe" — which
+/// meant a hub that restarted next to a router it could not reach said nothing about that router
+/// for up to fifteen minutes, and (before D1) nothing at all. The cloud has never heard this
+/// router from this hub; that is the definition of something it must be told.
 pub fn router_is_event(last_sent: Option<&RouterSent>, params: &[(String, String)]) -> bool {
-    let Some(last) = last_sent else { return false };
     let now = RouterSent::from_params(params);
-    (now.up.is_some() && now.up != last.up) || (now.wan.is_some() && now.wan != last.wan)
+    let Some(last) = last_sent else { return true };
+    (now.up.is_some() && now.up != last.up)
+        || (now.wan.is_some() && now.wan != last.wan)
+        || (now.up_src.is_some() && now.up_src != last.up_src)
 }
 
 // ── LinkTap valves ────────────────────────────────────────────────────────────────────────────────
@@ -584,12 +601,23 @@ mod tests {
 
     #[test]
     fn rssi_and_sinr_are_never_router_events_but_the_uplink_is() {
-        let base = p(&[("up", "1"), ("wan", "lte"), ("rssi", "-71"), ("sinr", "12")]);
-        assert!(!router_is_event(None, &base), "the first poll is the keyframe's baseline");
+        let base = p(&[("up", "1"), ("upSrc", "read"), ("wan", "lte"), ("rssi", "-71"), ("sinr", "12")]);
+        // 🔴 D8: the first poll after a restart IS an event now — the cloud has never heard this
+        // router from this hub, and waiting up to 15 minutes for a keyframe is how a router that was
+        // unreachable at boot stayed invisible.
+        assert!(router_is_event(None, &base), "the first poll after a restart is an event");
         let sent = RouterSent::from_params(&base);
         assert!(!router_is_event(Some(&sent), &p(&[("up", "1"), ("wan", "lte"), ("rssi", "-95"), ("sinr", "-3")])));
         assert!(router_is_event(Some(&sent), &p(&[("up", "0"), ("wan", "lte")])), "WAN down");
         assert!(router_is_event(Some(&sent), &p(&[("up", "1"), ("wan", "starlink")])), "uplink source changed");
+        // 🔴 D1: a router the hub has LOST reports the same `up` and the same `wan` — the reading is
+        // held. `upSrc` is the only thing that moves, so it has to be what makes it an event;
+        // otherwise "the hub cannot read this router" waits for the next keyframe.
+        let held = p(&[("up", "1"), ("upSrc", "unread"), ("wan", "lte"), ("reason", "timeout")]);
+        assert!(router_is_event(Some(&sent), &held), "read -> unread is a transition the cloud must see");
+        let held_sent = RouterSent::from_params(&held);
+        assert!(!router_is_event(Some(&held_sent), &held), "and it is sent once, not every poll");
+        assert!(router_is_event(Some(&held_sent), &base), "unread -> read is the other edge");
     }
 
     #[test]

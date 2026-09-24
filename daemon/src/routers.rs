@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use crate::gps::{cradlepoint_base, parse_cradlepoint_gps, GpsFix};
 use crate::hub_config::RouterConfig;
+use crate::router_health::up_read;
 use crate::peplink::Peplink;
 use crate::starlink::{DishStatus, Starlink};
 
@@ -120,6 +121,13 @@ pub struct WanStatus {
     /// `lte` | `wired` | `repeater` | `starlink` | `none`.
     pub wan: String,
     pub up: bool,
+    /// Did the device actually SAY? `false` = it answered, but not with an uplink state this hub
+    /// recognises, so `up` above is NOT evidence and nothing may report down from it (owner ruling,
+    /// Jonathan 2026-09-24: up/down "is too aggressive"). `uplink_up` is what reads this; a read
+    /// that lands here becomes an UNREADABLE snapshot, reported with `upSrc=unread` and the last
+    /// known `up`, never a down. `Default` is deliberately `false`: an unfilled WanStatus knows
+    /// nothing, and the safe reading of "knows nothing" is "do not claim".
+    pub up_known: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
     /// Seconds the active uplink has been connected, when the router's status API says (a Peplink's
@@ -152,8 +160,9 @@ pub struct ApnConfig {
 }
 
 /// Everything the last poll learned about one router — what `/api/hub/routers` and the console
-/// show. `error` is set when the poll failed (unreachable, refused sign-in) and the rest is what
-/// was last known, so a router that just went dark still shows its identity.
+/// show. `error` is set when the poll failed (unreachable, refused sign-in) OR when the device
+/// answered without an uplink state this hub can read (`uplink_up`, E_UNREADABLE) and the rest is
+/// what was last known, so a router that just went dark still shows its identity.
 #[derive(Clone, Debug, Default, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -322,13 +331,30 @@ fn wan_entries(devices: &Value) -> Vec<(&str, &Value)> {
         .unwrap_or_default()
 }
 
+/// NCOS `status.connection_state`, CLASSIFIED — the one table, and the only place a Cradlepoint's
+/// down is decided.
+///
+/// 🔴 D2, owner ruling 2026-09-24. This used to be `… == "connected"`.unwrap_or(FALSE): a WAN entry
+/// with no `status`, no `connection_state`, or a state word this hub has never seen was reported as
+/// DISCONNECTED. A router that answers partially is UNREADABLE, not down — the two are different
+/// facts and only one of them is the router's.
+///
+/// `Some(true)` connected. `Some(false)` the router itself says it is not connected. `None` it did
+/// not say, or said something this table does not list — `establishing`, `configuring`,
+/// `connecting` and the like are a WAN on its way up, not a WAN that is down, and a word from a
+/// firmware this hub has never met is not evidence of anything.
+const NCOS_DISCONNECTED: &[&str] = &["disconnected", "unplugged", "unconfigured", "unavailable", "error", "standby", "offline"];
+
+pub fn ncos_conn_state(entry: &Value) -> Option<bool> {
+    let raw = entry.get("status").and_then(|s| s.get("connection_state")).and_then(|v| v.as_str())?.trim().to_ascii_lowercase();
+    if raw == "connected" {
+        return Some(true);
+    }
+    NCOS_DISCONNECTED.contains(&raw.as_str()).then_some(false)
+}
+
 fn connected(entry: &Value) -> bool {
-    entry
-        .get("status")
-        .and_then(|s| s.get("connection_state"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.eq_ignore_ascii_case("connected"))
-        .unwrap_or(false)
+    ncos_conn_state(entry) == Some(true)
 }
 
 fn ip_of(entry: &Value) -> Option<String> {
@@ -370,7 +396,10 @@ pub fn parse_modem(devices: &Value) -> Option<ModemStatus> {
         rsrp: g.get("RSRP").and_then(as_f64),
         rsrq: g.get("RSRQ").and_then(as_f64),
         sinr: g.get("SINR").and_then(as_f64),
-        connected: if connected(entry) { Some(true) } else { None },
+        // Tri-state on purpose (D2): Some(false) is the modem SAYING it is not connected, None is
+        // the modem not saying. `modem_params` reports the first as `up=0` and refuses to report
+        // the second at all — `uplink_up` turns it into an unreadable snapshot.
+        connected: ncos_conn_state(entry),
         ip: ip_of(entry),
         tx_bytes: stats.and_then(|s| s.get("out")).and_then(as_u64),
         rx_bytes: stats.and_then(|s| s.get("in")).and_then(as_u64),
@@ -384,7 +413,11 @@ pub fn parse_wan(devices: &Value) -> Option<WanStatus> {
         return None;
     }
     let Some((key, v)) = entries.iter().find(|(_, v)| connected(v)) else {
-        return Some(WanStatus { wan: "none".into(), up: false, ip: None, uptime_s: None });
+        // Nothing is connected. DOWN ONLY IF EVERY ENTRY SAID SO (D2): one entry the router
+        // described in words this hub does not recognise, or did not describe at all, makes the
+        // whole read unreadable — `up_known: false` — rather than a fleet of "disconnected".
+        let up_known = entries.iter().all(|(_, v)| ncos_conn_state(v) == Some(false));
+        return Some(WanStatus { wan: "none".into(), up: false, up_known, ip: None, uptime_s: None });
     };
     let lower = key.to_ascii_lowercase();
     let wan = if lower.starts_with("mdm") {
@@ -396,7 +429,7 @@ pub fn parse_wan(devices: &Value) -> Option<WanStatus> {
     };
     // No uptime: nothing in the CBA850 capture or the app's NCOS fixtures carries a connection
     // uptime, and the report does not guess one.
-    Some(WanStatus { wan: wan.into(), up: true, ip: ip_of(v), uptime_s: None })
+    Some(WanStatus { wan: wan.into(), up: true, up_known: true, ip: ip_of(v), uptime_s: None })
 }
 
 /// PURE: `/api/status/gps` (the unwrapped `data`) → GpsSupport. A `fix` block — the shape the app's
@@ -468,7 +501,7 @@ pub fn modem_params(
     probe: Option<&Probe>,
     wan_kb_delta: Option<u64>,
 ) -> Vec<(String, String)> {
-    let mut p: Vec<(String, String)> = vec![("up".into(), if m.connected == Some(true) { "1" } else { "0" }.into())];
+    let mut p: Vec<(String, String)> = up_read(m.connected == Some(true));
     let mut push = |k: &str, v: Option<String>| {
         if let Some(v) = v {
             p.push((k.to_string(), v));
@@ -502,7 +535,8 @@ pub fn modem_params(
 /// `rsrp`, no `dataMb`: a dish has none, and inventing zeros would read as a broken modem. Usage
 /// is not metered here either — a Starlink plan is not the cellular plan the KB deltas feed.
 pub fn dish_params(d: &DishStatus, wan: &WanStatus, probe: Option<&Probe>) -> Vec<(String, String)> {
-    let mut p: Vec<(String, String)> = vec![("up".into(), if wan.up { "1" } else { "0" }.into()), ("wan".into(), wan.wan.clone())];
+    let mut p: Vec<(String, String)> = up_read(wan.up);
+    p.push(("wan".into(), wan.wan.clone()));
     let mut push = |k: &str, v: Option<String>| {
         if let Some(v) = v {
             p.push((k.to_string(), v));
@@ -536,7 +570,8 @@ pub fn dish_params(d: &DishStatus, wan: &WanStatus, probe: Option<&Probe>) -> Ve
 /// `rssi`, `sinr`, `dataMb` or any other cellular field: there is no modem, and inventing one would
 /// read as a broken modem ("No SIM") on the card.
 pub fn wan_params(wan: &WanStatus, probe: Option<&Probe>) -> Vec<(String, String)> {
-    let mut p: Vec<(String, String)> = vec![("up".into(), if wan.up { "1" } else { "0" }.into()), ("wan".into(), wan.wan.clone())];
+    let mut p: Vec<(String, String)> = up_read(wan.up);
+    p.push(("wan".into(), wan.wan.clone()));
     let mut push = |k: &str, v: Option<String>| {
         if let Some(v) = v {
             p.push((k.to_string(), v));
@@ -558,6 +593,43 @@ pub fn wan_params(wan: &WanStatus, probe: Option<&Probe>) -> Vec<(String, String
 /// fine and reachable for weeks, but this returned None, so the poll loop never set router_latest,
 /// never spooled an event and the keyframe never carried it — the app's card sat on "Waiting for its
 /// first report…" forever.
+/// PURE: what this read says about the uplink, or None when the hub CANNOT TELL — the device did
+/// not answer with a state, answered with words this hub does not recognise (D2, D3), or answered
+/// with nothing the parsers could read at all (D4).
+///
+/// The arms mirror `report_params`' precedence exactly, so the answer here is always about the
+/// same field the report's `up` would have come from. None is the one that matters: it is what
+/// turns a read into an UNREADABLE snapshot rather than a down one.
+pub fn uplink_up(snap: &Snapshot) -> Option<bool> {
+    if let Some(m) = &snap.modem {
+        return m.connected;
+    }
+    if let (Some(_), Some(w)) = (&snap.dish, &snap.wan) {
+        return Some(w.up);
+    }
+    if let Some(w) = &snap.wan {
+        return w.up_known.then_some(w.up);
+    }
+    None
+}
+
+/// PURE: everything the hub can honestly say about a device it has NEVER successfully read on this
+/// run — its identity from an earlier probe, and the agent version. No link state: `unread_params`
+/// adds `upSrc=unread` and the reason, and there is nothing else the hub knows (D8).
+pub fn identity_params(snap: Option<&Snapshot>) -> Vec<(String, String)> {
+    let mut p: Vec<(String, String)> = Vec::new();
+    if let Some(probe) = snap.and_then(|s| s.probe.as_ref()) {
+        if let Some(m) = &probe.model {
+            p.push(("model".into(), m.clone()));
+        }
+        if let Some(f) = &probe.firmware {
+            p.push(("fw".into(), f.clone()));
+        }
+    }
+    p.push(("av".into(), format!("hub-{}", env!("CARGO_PKG_VERSION"))));
+    p
+}
+
 pub fn report_params(snap: &Snapshot, wan_kb_delta: Option<u64>) -> Option<Vec<(String, String)>> {
     if let Some(m) = &snap.modem {
         return Some(modem_params(m, snap.wan.as_ref(), snap.probe.as_ref(), wan_kb_delta));
@@ -718,13 +790,39 @@ impl<'a> Ncos<'a> {
     }
 }
 
+/// The two transport failures the hub can name for itself, as CONSTANTS — `reason_of` matches
+/// against these same strings, so the failure class and the message it is derived from cannot
+/// drift apart the way a second copy of the wording would.
+pub const E_TIMEOUT: &str = "the router did not answer (timed out) — is the hub on the same network?";
+pub const E_UNREACHABLE: &str = "the router could not be reached at that address";
+/// The device answered, but not with an uplink state this hub can read — see `uplink_up`. Not a
+/// down: an unreadable read (D2/D3/D4).
+pub const E_UNREADABLE: &str = "the device answered without an uplink state this hub can read";
+
 pub(crate) fn reachability(e: reqwest::Error) -> String {
     if e.is_timeout() {
-        "the router did not answer (timed out) — is the hub on the same network?".into()
+        E_TIMEOUT.into()
     } else if e.is_connect() {
-        "the router could not be reached at that address".into()
+        E_UNREACHABLE.into()
     } else {
         e.without_url().to_string()
+    }
+}
+
+/// The longest a `reason` may be. It rides every held report, so it is a hint, not a transcript.
+pub const MAX_REASON_CHARS: usize = 60;
+
+/// PURE: the short `reason` param for an unreadable reading — a failure CLASS where the hub named
+/// one itself, else the device's own words, trimmed to MAX_REASON_CHARS.
+pub fn reason_of(error: &str) -> String {
+    match error.trim() {
+        e if e == E_TIMEOUT => "timeout".into(),
+        e if e == E_UNREACHABLE => "unreachable".into(),
+        e if e == E_UNREADABLE => "unreadable".into(),
+        e if e.chars().count() > MAX_REASON_CHARS => {
+            format!("{}…", e.chars().take(MAX_REASON_CHARS - 1).collect::<String>())
+        }
+        e => e.to_string(),
     }
 }
 
@@ -1012,6 +1110,15 @@ async fn poll_with(drv: Result<Driver<'_>, String>, cfg: &RouterConfig, prev: Op
     snap.modem = status.modem;
     snap.wan = status.wan;
     snap.dish = status.dish;
+    // 🔴 D4: A SNAPSHOT THE PARSERS COULD NOT READ IS AN ERROR, not a silent success. Until 0.3.54
+    // this fell through with `error = None` and `ok_at_ms` set, so `report_params` returned None,
+    // the poll loop sent nothing AND router_health saw a good sample — a router the hub could not
+    // read at all RESET the grace machine to healthy, every poll, forever. It is now the same kind
+    // of failure as a timeout: reported as the last good reading with `upSrc=unread`.
+    if uplink_up(&snap).is_none() {
+        snap.error = Some(E_UNREADABLE.into());
+        return snap;
+    }
     if snap.probe.is_none() {
         snap.probe = drv.probe().await.ok();
     }
@@ -1285,6 +1392,7 @@ mod tests {
 #[cfg(test)]
 mod wired_report_tests {
     use super::*;
+    use serde_json::json;
 
     fn get<'a>(params: &'a [(String, String)], k: &str) -> Option<&'a str> {
         params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
@@ -1293,7 +1401,7 @@ mod wired_report_tests {
     fn wired(up: bool) -> Snapshot {
         Snapshot {
             probe: Some(Probe { model: Some("Balance 20X".into()), firmware: Some("8.5.1".into()), ..Default::default() }),
-            wan: Some(WanStatus { wan: "wired".into(), up, ip: Some("10.1.2.3".into()), uptime_s: None }),
+            wan: Some(WanStatus { wan: "wired".into(), up, up_known: true, ip: Some("10.1.2.3".into()), uptime_s: None }),
             ..Default::default()
         }
     }
@@ -1311,8 +1419,107 @@ mod wired_report_tests {
         // Nothing cellular, and nothing a dish says: the report is exactly these six names.
         let mut names: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["av", "fw", "ip", "model", "up", "wan"]);
-        assert_eq!(get(&report_params(&wired(false), None).unwrap(), "up"), Some("0"));
+        assert_eq!(names, ["av", "fw", "ip", "model", "up", "upSrc", "wan"]);
+        // The router SAID it — `upSrc=read` rides every reading the hub actually made, so a reader
+        // never has to tell "read" from "unread" by an absence.
+        assert_eq!(get(&params, "upSrc"), Some("read"));
+        let down = report_params(&wired(false), None).unwrap();
+        assert_eq!((get(&down, "up"), get(&down, "upSrc")), (Some("0"), Some("read")));
+    }
+
+    /// D2 — A CRADLEPOINT THAT ANSWERS PARTIALLY IS UNREADABLE, NOT DISCONNECTED.
+    #[test]
+    fn a_cradlepoint_wan_with_no_connection_state_is_unknown_not_down() {
+        let e = |v: Value| v;
+        assert_eq!(ncos_conn_state(&e(json!({"status": {"connection_state": "connected"}}))), Some(true));
+        assert_eq!(ncos_conn_state(&e(json!({"status": {"connection_state": "CONNECTED "}}))), Some(true), "case and padding");
+        assert_eq!(ncos_conn_state(&e(json!({"status": {"connection_state": "unplugged"}}))), Some(false));
+        assert_eq!(ncos_conn_state(&e(json!({"status": {"connection_state": "disconnected"}}))), Some(false));
+        // 🔴 The three shapes that used to read as DISCONNECTED because of `.unwrap_or(false)`.
+        assert_eq!(ncos_conn_state(&e(json!({"status": {}}))), None, "no connection_state at all");
+        assert_eq!(ncos_conn_state(&e(json!({"diagnostics": {}}))), None, "no status block at all");
+        assert_eq!(ncos_conn_state(&e(json!({"status": {"connection_state": "establishing"}}))), None, "on its way UP is not down");
+        assert_eq!(ncos_conn_state(&e(json!({"status": {"connection_state": "something-new"}}))), None, "a word from a firmware we have not met");
+
+        // parse_wan: nothing connected is `none`+down ONLY when every entry said so.
+        let all_said = json!({"ethernet-wan": {"status": {"connection_state": "disconnected"}}});
+        let w = parse_wan(&all_said).unwrap();
+        assert_eq!((w.up, w.up_known), (false, true), "the router said it: a real down");
+        let partial = json!({"ethernet-wan": {"status": {"connection_state": "disconnected"}}, "mdm-1": {"status": {}}});
+        let w = parse_wan(&partial).unwrap();
+        assert_eq!((w.up, w.up_known), (false, false), "one entry that did not say makes the READ unreadable");
+        assert_eq!(uplink_up(&Snapshot { wan: Some(w), ..Default::default() }), None);
+
+        // parse_modem: the same tri-state, on the field the modem report's `up` is built from.
+        let m = parse_modem(&json!({"mdm-x": {"status": {}, "diagnostics": {"PIN_STATUS": "READY", "RSRP": "-90"}}})).unwrap();
+        assert_eq!(m.connected, None, "a modem that did not say is not a modem that is down");
+        assert_eq!(uplink_up(&Snapshot { modem: Some(m), ..Default::default() }), None);
+        let m = parse_modem(&json!({"mdm-x": {"status": {"connection_state": "unplugged"}, "diagnostics": {"RSRP": "-90"}}})).unwrap();
+        assert_eq!(m.connected, Some(false), "and one that DID say is");
+        assert_eq!(uplink_up(&Snapshot { modem: Some(m), ..Default::default() }), Some(false));
+    }
+
+    /// D4 — A READ THE PARSERS CANNOT UNDERSTAND IS AN ERROR, not a silent success. End to end
+    /// against a router that answers 200 with a status block carrying nothing readable.
+    ///
+    /// 🔴 This used to leave `error = None` and set `ok_at_ms`: `report_params` returned None, the
+    /// poll loop sent nothing, AND router_health was handed a GOOD sample — so a router the hub
+    /// could not read at all reset its own grace machine to healthy on every poll, forever.
+    #[tokio::test]
+    async fn a_read_the_parsers_cannot_understand_becomes_an_error_not_a_silent_success() {
+        use axum::{routing::get, Router};
+        let ok = |v: serde_json::Value| axum::Json(serde_json::json!({ "success": true, "data": v }));
+        let app = Router::new()
+            // A WAN entry with no `connection_state` at all: the D2 shape, answered with HTTP 200.
+            .route("/api/status/wan/devices", get(move || async move { ok(json!({ "ethernet-wan": { "status": {} } })) }))
+            .route("/api/status/product_info", get(move || async move { ok(json!({ "product_name": "CBA850" })) }))
+            .route("/api/status/gps", get(move || async move { ok(json!({})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let cfg = RouterConfig { vendor: "cradlepoint".into(), host: "127.0.0.1".into(), port, password: "x".into(), ..Default::default() };
+        let snap = poll_in_background(&poll_client(), &cfg, None).await;
+        assert_eq!(snap.error.as_deref(), Some(E_UNREADABLE), "the router answered; the hub still could not read its uplink");
+        assert_eq!(snap.ok_at_ms, None, "and it was NOT a successful read");
+        assert_eq!(reason_of(E_UNREADABLE), "unreadable");
+        // The grace machine is therefore told about a FAILURE, not handed a healthy sample.
+        let read = if snap.error.is_none() { report_params(&snap, None) } else { None };
+        assert!(read.is_none());
+
+        // The pure side of the same rule, on every shape that reaches it.
+        assert_eq!(uplink_up(&Snapshot::default()), None, "nothing read at all");
+        assert!(report_params(&Snapshot::default(), None).is_none());
+        let vague = Snapshot { wan: Some(WanStatus { wan: "none".into(), up: false, up_known: false, ..Default::default() }), ..Default::default() };
+        assert_eq!(uplink_up(&vague), None, "an unreadable WAN never yields an `up`");
+        let said = Snapshot { wan: Some(WanStatus { wan: "none".into(), up: false, up_known: true, ..Default::default() }), ..Default::default() };
+        assert_eq!(uplink_up(&said), Some(false), "but a WAN the router DID describe does");
+    }
+
+    #[test]
+    fn a_reason_is_a_class_where_the_hub_named_one_and_short_otherwise() {
+        assert_eq!(reason_of(E_TIMEOUT), "timeout");
+        assert_eq!(reason_of(E_UNREACHABLE), "unreachable");
+        assert_eq!(reason_of(E_UNREADABLE), "unreadable");
+        assert_eq!(reason_of("  invalid credentials "), "invalid credentials", "a short vendor message rides as it is");
+        let long = "x".repeat(400);
+        let r = reason_of(&long);
+        assert_eq!(r.chars().count(), MAX_REASON_CHARS, "a vendor essay is cut, not carried");
+        assert!(r.ends_with('…'));
+        // The classes are derived from the SAME constants `reachability` produces, so they cannot drift.
+        assert!(reason_of(E_TIMEOUT) != E_TIMEOUT && reason_of(E_UNREACHABLE) != E_UNREACHABLE);
+    }
+
+    /// D8 — what the hub can honestly say about a device it has never read.
+    #[test]
+    fn identity_is_what_the_hub_knows_without_a_reading() {
+        let p = identity_params(None);
+        assert_eq!(p, vec![("av".to_string(), format!("hub-{}", env!("CARGO_PKG_VERSION")))]);
+        let snap = Snapshot { probe: Some(Probe { model: Some("Balance One".into()), firmware: Some("8.5.5".into()), ..Default::default() }), ..Default::default() };
+        let p = identity_params(Some(&snap));
+        assert_eq!(p[0], ("model".to_string(), "Balance One".to_string()));
+        assert_eq!(p[1], ("fw".to_string(), "8.5.5".to_string()));
+        assert!(!p.iter().any(|(k, _)| k == "up" || k == "wan"), "identity is never a link state");
     }
 
     #[test]
@@ -1335,7 +1542,7 @@ mod wired_report_tests {
         let up = report_params(&wired(true), None).unwrap();
         let down = report_params(&wired(false), None).unwrap();
         let baseline = crate::cadence::RouterSent::from_params(&up);
-        assert!(!crate::cadence::router_is_event(None, &up), "the first read is a baseline, not an event");
+        assert!(crate::cadence::router_is_event(None, &up), "the first read after a restart is an event (D8)");
         assert!(!crate::cadence::router_is_event(Some(&baseline), &up));
         assert!(crate::cadence::router_is_event(Some(&baseline), &down));
         assert!(crate::cadence::router_is_event(Some(&crate::cadence::RouterSent::from_params(&down)), &up));
@@ -1514,7 +1721,7 @@ mod gps_capability_tests {
         assert_eq!(get("ip"), Some("192.168.123.144"));
         let mut names: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["av", "fw", "ip", "up", "uptime", "wan"]);
+        assert_eq!(names, ["av", "fw", "ip", "up", "upSrc", "uptime", "wan"]);
         // Nothing up: no connection uptime is reported, whatever the entries carry.
         let down = json!({ "stat": "ok", "response": { "2": body["response"]["2"].clone(), "order": [2] } });
         let w = crate::peplink::parse_wan(&down).unwrap();

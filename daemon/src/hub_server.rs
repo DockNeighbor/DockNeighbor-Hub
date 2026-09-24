@@ -4040,10 +4040,14 @@ struct RouterPollState {
     last_counters: HashMap<String, (u64, u64)>,
     /// The up/down grace state machine (router_health, owner ruling 2026-09-17).
     health: HashMap<String, crate::router_health::RouterHealth>,
-    /// Routers reported down BECAUSE their poll kept failing — the ones "reachable again" is said of.
+    /// Routers whose reading is being HELD because their poll kept failing — the ones "reachable
+    /// again" is said of.
     unreachable: HashSet<String>,
     /// Routers whose "no agent token" line has been logged.
     no_token_noted: HashSet<String>,
+    /// The common-mode line (D7) has been logged for the run of passes we are in; cleared by the
+    /// first pass that is not common-mode, so the boat is told each time it happens, not each poll.
+    common_mode_noted: bool,
 }
 
 impl RouterPollState {
@@ -4060,12 +4064,16 @@ impl RouterPollState {
 /// and whether it is an event). The poll loop spools the send; tests drive this directly with injected
 /// times (`started_ms`/`finished_ms`: when the poll began and came back).
 ///
-/// UP/DOWN GOES THROUGH router_health (owner ruling 2026-09-17): a bad sample — a failed poll, or a read
-/// that says the uplink is down — inside the 45 s grace window reports NOTHING new: router_latest keeps
-/// the last good reading, so the keyframe carries it unchanged, and no event is sent. Only when bad
-/// samples have been continuous for 45 s does the down report go out (a read's own `up=0`, or for a
-/// failed poll the last reading with `up=0`), through the same router_is_event path as before. The first
-/// good sample reports up at once.
+/// UP/DOWN GOES THROUGH router_health (owner rulings 2026-09-17 and 2026-09-24): a bad sample — a failed
+/// poll, or a read that says the uplink is down — inside the 45 s grace window reports NOTHING new:
+/// router_latest keeps the last good reading, so the keyframe carries it unchanged, and no event is sent.
+/// Only when bad samples have been continuous for 45 s does the report go out, through the same
+/// router_is_event path as before. The first good sample reports up at once.
+///
+/// 🔴 AND WHAT GOES OUT AT 45 s DEPENDS ON WHO SAID IT (D1). A read that ANSWERED `up=0` is reported as
+/// `up=0, upSrc=read` — the device's own word. A poll the hub could not make is reported as the last
+/// good reading, `up` UNTOUCHED, `upSrc=unread` and a short `reason`: the hub says it lost the reading,
+/// not that the link went down. It used to assert `up=0` for both, on links the owner streams video over.
 async fn router_observed(
     rt: &Rt,
     r: &hub_config::RouterConfig,
@@ -4074,7 +4082,7 @@ async fn router_observed(
     finished_ms: i64,
     st: &mut RouterPollState,
 ) -> Option<(batch::Item, bool)> {
-    use crate::router_health::{down_params, sample_of, Sample, Verdict};
+    use crate::router_health::{sample_of, unread_params, Sample, Verdict};
     let read = if snap.error.is_none() { crate::routers::report_params(snap, None) } else { None };
     let sample = match snap.error {
         Some(_) => Sample::Failed,
@@ -4090,7 +4098,9 @@ async fn router_observed(
         logged = true;
     }
     if let (Verdict::WentDown, Some(why)) = (verdict, &snap.error) {
-        crate::hlog!("routers: {} '{}' - could not be reached for {bad_for_s} s; reporting it down: {why}", r.host, r.name);
+        // NOT "reporting it down" any more (D1): the hub reports the last state the router itself
+        // gave, marked unread. What it has lost is the READING, and that is what this says.
+        crate::hlog!("routers: {} '{}' - could not be read for {bad_for_s} s; holding its last reading as unread: {why}", r.host, r.name);
         st.unreachable.insert(r.id.clone());
         logged = true;
     }
@@ -4104,8 +4114,21 @@ async fn router_observed(
     let params = match (verdict, &snap.error) {
         (Verdict::Hold, _) => None,
         (_, None) => read,
-        (Verdict::WentDown, Some(_)) => down_params(rt.telemetry.lock().await.router_latest.get(&r.id).map(Vec::as_slice)),
-        // Already reported down and still unreachable: nothing new to say.
+        (Verdict::WentDown, Some(why)) => {
+            // The grace window has run out on a read the hub could not make. Report the LAST GOOD
+            // reading, `up` untouched, marked `upSrc=unread` with a short reason — and, after a
+            // restart with no last reading at all, the router's identity alone, so a router that
+            // was already unreachable when the hub came up is still reported (D8).
+            let t = rt.telemetry.lock().await;
+            let last = t.router_latest.get(&r.id).cloned();
+            drop(t);
+            Some(unread_params(
+                last.as_deref(),
+                Some(&crate::routers::reason_of(why)),
+                &crate::routers::identity_params(Some(snap)),
+            ))
+        }
+        // Already held as unread and still unreadable: nothing new to say.
         (_, Some(_)) => None,
     };
     if r.agent_token.is_empty() {
@@ -4121,11 +4144,18 @@ async fn router_observed(
     t.router_latest.insert(r.id.clone(), params.clone());
     let event = cadence::router_is_event(t.router_sent.get(&r.id), &params);
     if event && !logged {
+        let state = match params.iter().rev().find(|(k, _)| k == crate::router_health::UP_SRC).map(|(_, v)| v.as_str()) {
+            // An unread reading is neither up nor down, and saying either would be the defect again.
+            Some(crate::router_health::UP_SRC_UNREAD) => "unread",
+            _ if params.iter().any(|(k, v)| k == "up" && v == "1") => "up",
+            _ if params.iter().any(|(k, _)| k == "up") => "down",
+            _ => "unread",
+        };
         crate::hlog!(
             "routers: {} '{}' - uplink {} {}",
             r.host, r.name,
             params.iter().find(|(k, _)| k == "wan").map_or("?", |(_, v)| v.as_str()),
-            if params.iter().any(|(k, v)| k == "up" && v == "1") { "up" } else { "down" }
+            state
         );
     }
     if !t.router_sent.contains_key(&r.id) {
@@ -4141,6 +4171,33 @@ async fn router_observed(
     }
 }
 
+/// Await every router read CONCURRENTLY, answers in the order given (D6).
+///
+/// 🔴 THE PASS USED TO BE SERIAL. Each read carries a 30 s deadline (routers::POLL_HTTP_TIMEOUT,
+/// starlink::POLL_CALL_TIMEOUT), so a boat with three managed devices and one of them hung made
+/// every other device's reading 30 s late — and made them fail together, which is the exact shape
+/// `common_mode_failure` then has to tell apart from a real loss of the hub's LAN.
+///
+/// One task, not several: these futures borrow the poll client and the config, and a hung read
+/// parks its own future without parking the others.
+async fn read_all<T>(reads: Vec<impl std::future::Future<Output = T>>) -> Vec<T> {
+    futures_util::future::join_all(reads).await
+}
+
+/// PURE: the pass-level D7 decision. `reads` is one `(vendor, failed)` per router read in this
+/// pass, in order. Returns whether this is a common-mode failure, and per router whether its read
+/// may be folded into its grace machine and reported at all.
+///
+/// A suppressed router is not "held" by its grace machine — it is not TOLD about the pass, so its
+/// grace window neither starts nor advances, and the last good reading stands untouched. The whole
+/// point is that a hub which has lost its own network says nothing about the routers behind it.
+/// Routers that READ FINE in the same pass report normally: the suppression is about failures.
+fn pass_verdicts(reads: &[(&str, bool)]) -> (bool, Vec<bool>) {
+    let failed: Vec<&str> = reads.iter().filter(|(_, failed)| *failed).map(|(v, _)| *v).collect();
+    let common = crate::router_health::common_mode_failure(&failed);
+    (common, reads.iter().map(|(_, failed)| !(common && *failed)).collect())
+}
+
 /// Read each managed router on its cadence (H2): the `modem.measurement` becomes the router's newest
 /// value for the keyframe, and goes to the cloud AT ONCE only when the uplink kind (`wan`) or its
 /// up/down state moved, or a member is watching. The KB it used since the last SENT report accumulates
@@ -4150,17 +4207,27 @@ async fn router_observed(
 ///
 /// Up/down is router_health's decision (router_observed): a failed poll is retried after 5 s, then
 /// 10/20/40 s, capped at 60 s, and never less often than the router's normal cadence; a router is
-/// reported down only after 45 s of continuous failure (or of reading its uplink down), and up again on
-/// the first good read. The background poll uses the generous poll deadlines (routers::poll_client,
-/// starlink::POLL_CALL_TIMEOUT).
+/// reported DOWN only after 45 s of continuously reading its uplink down, held as UNREAD after 45 s of
+/// polls that failed, and up again on the first good read. The background poll uses the generous poll
+/// deadlines (routers::poll_client, starlink::POLL_CALL_TIMEOUT).
+///
+/// Each pass takes `now` per router and reads every due router CONCURRENTLY (D6, `read_all`), and a pass
+/// that lost two vendors at once reports none of them (D7, `pass_verdicts`).
 async fn router_poll_loop(rt: Shared) {
     let client = crate::routers::poll_client();
     let mut st = RouterPollState::default();
     loop {
         let cfg = hub_config::read_config_in(&rt.base);
-        let now = now_ms();
         let is_leased = leased(&rt);
-        for r in cfg.routers.iter().filter(|r| r.enabled && !r.host.is_empty()) {
+        // Who is due. 🔴 `now` IS TAKEN PER ROUTER (D6): one shared `now` for the whole pass was
+        // read before the first router's 30 s timeout and then used to judge the last one, so a
+        // hung router dragged every router behind it into the same lateness — and into failing in
+        // lockstep, which is exactly the shape D7 has to tell apart from a real LAN loss.
+        let mut due_idx: Vec<usize> = Vec::new();
+        for (i, r) in cfg.routers.iter().enumerate() {
+            if !r.enabled || r.host.is_empty() {
+                continue;
+            }
             let idle = crate::routers::poll_secs(r);
             let prev = rt.router_state.read().await.get(&r.id).cloned();
             // GPS on in the config, but only sampled while the router has not said it has none.
@@ -4177,22 +4244,54 @@ async fn router_poll_loop(rt: Shared) {
                 idle
             };
             let due_ms = (secs * 1000) as i64;
-            let due = st.health.get(&r.id).cloned().unwrap_or_default().due(now, st.last_poll_ms.get(&r.id).copied(), due_ms);
-            if !due {
-                continue;
+            if st.health.get(&r.id).cloned().unwrap_or_default().due(now_ms(), st.last_poll_ms.get(&r.id).copied(), due_ms) {
+                due_idx.push(i);
             }
-            let started = now_ms();
-            let snap = crate::routers::poll_in_background(&client, r, prev.as_ref()).await;
-            let finished = now_ms();
+        }
+        // Read them CONCURRENTLY (D6). One router parked on the 30 s poll deadline no longer holds
+        // up every other router's read, so a hub with a Cradlepoint, a Peplink and a dish cannot
+        // pile three timeouts into one serial pass and report the lot late.
+        let mut reads = Vec::with_capacity(due_idx.len());
+        for &i in &due_idx {
+            let r = &cfg.routers[i];
+            let prev = rt.router_state.read().await.get(&r.id).cloned();
+            let client = &client;
+            reads.push(async move {
+                let started = now_ms();
+                let snap = crate::routers::poll_in_background(client, r, prev.as_ref()).await;
+                let finished = now_ms();
+                (i, prev, started, snap, finished)
+            });
+        }
+        let results = read_all(reads).await;
+        // 🔴 COMMON-MODE SUPPRESSION (D7). Two or more managed routers of DIFFERENT vendors failing
+        // to read in one pass says the HUB lost its own LAN, not that the boat lost two uplinks at
+        // once. Nothing is reported for those routers, their grace machines are not advanced, and
+        // the last good readings stand.
+        let reads_seen: Vec<(&str, bool)> =
+            results.iter().map(|(i, _, _, snap, _)| (cfg.routers[*i].vendor.as_str(), snap.error.is_some())).collect();
+        let (common_mode, reportable) = pass_verdicts(&reads_seen);
+        if common_mode && !st.common_mode_noted {
+            crate::hlog!(
+                "routers: {} managed routers could not be read in the same pass, across vendors - treating this as the hub's own network, not the routers; holding their last readings",
+                reads_seen.iter().filter(|(_, failed)| *failed).count()
+            );
+        }
+        st.common_mode_noted = common_mode;
+        for (n, (i, prev, started, snap, finished)) in results.into_iter().enumerate() {
+            let r = &cfg.routers[i];
             st.last_poll_ms.insert(r.id.clone(), started);
             if let Some(note) = crate::routers::gps_unsupported_note(r, prev.as_ref(), &snap) {
                 crate::hlog!("{note}");
             }
-            if let Some((item, event)) = router_observed(&rt, r, &snap, started, finished, &mut st).await {
-                if event {
-                    note_activity(&rt);
+            if reportable[n] {
+                if let Some((item, event)) = router_observed(&rt, r, &snap, started, finished, &mut st).await {
+                    if event {
+                        note_activity(&rt);
+                    }
+                    spool_report(&rt, &crate::linktap_runtime::Report { device: item.device, event: item.event, params: item.params, token: None })
+                        .await;
                 }
-                spool_report(&rt, &crate::linktap_runtime::Report { device: item.device, event: item.event, params: item.params, token: None }).await;
             }
             if snap.error.is_none() && r.gps_enabled && !r.gps_dev_id.is_empty() {
                 if let Some(fix) = &snap.fix {
@@ -6341,7 +6440,7 @@ mod tests {
 
     fn wired(up: bool) -> crate::routers::Snapshot {
         crate::routers::Snapshot {
-            wan: Some(crate::routers::WanStatus { wan: "wired".into(), up, ip: Some("10.0.0.2".into()), uptime_s: Some(600) }),
+            wan: Some(crate::routers::WanStatus { wan: "wired".into(), up, up_known: true, ip: Some("10.0.0.2".into()), uptime_s: Some(600) }),
             probe: Some(crate::routers::Probe { model: Some("Balance One".into()), ..Default::default() }),
             ok_at_ms: Some(1),
             ..Default::default()
@@ -6352,9 +6451,44 @@ mod tests {
         crate::routers::Snapshot { error: Some("the router did not answer (timed out) — is the hub on the same network?".into()), ..last.clone() }
     }
 
-    fn dish(outage: Option<&str>, outage_ms: Option<i64>) -> crate::routers::Snapshot {
-        let d = crate::starlink::DishStatus { outage: outage.map(String::from), outage_ms, latency_ms: Some(31.0), ..Default::default() };
+    /// A dish snapshot from a DishOutage cause (`starlink::outage_label`), or None for a healthy dish.
+    fn dish(cause: Option<i32>, outage_ms: Option<i64>) -> crate::routers::Snapshot {
+        let d = crate::starlink::DishStatus {
+            outage: cause.map(|c| crate::starlink::outage_label(c).to_string()),
+            outage_cause: cause,
+            outage_ms,
+            latency_ms: Some(31.0),
+            ..Default::default()
+        };
         crate::routers::Snapshot { wan: Some(crate::starlink::wan_of(&d)), dish: Some(d), ..Default::default() }
+    }
+    /// Cause 6 = obstructed: a genuine WAN outage (starlink::LINK_OUTAGE_CAUSES).
+    const OBSTRUCTED: i32 = 6;
+    /// Cause 1 = booting: the DISH's own condition, never a WAN down (starlink::LINK_OUTAGE_CAUSES).
+    const BOOTING: i32 = 1;
+
+    /// D5, at the poll loop: a dish in a CONDITION never reaches the grace machine as a bad sample,
+    /// so it can neither be reported down nor bypass the window with its own measured duration.
+    #[tokio::test]
+    async fn a_dish_that_is_merely_booting_is_never_reported_down_however_long_it_lasts() {
+        let r = grace_router("starlink");
+        let (rt, cfg, base) = grace_rt("grace-dish-condition", &r).await;
+        let mut st = RouterPollState::default();
+        router_observed(&rt, &r, &dish(None, None), 0, 0, &mut st).await;
+        // Ten minutes of "booting", reported by the dish with its own measured duration.
+        for t in [100, 160, 220, 280, 340, 400, 460, 520, 580, 640, 700] {
+            let snap = dish(Some(BOOTING), Some(600 * SEC));
+            let sent = router_observed(&rt, &r, &snap, t * SEC, t * SEC, &mut st).await;
+            if let Some((item, _)) = &sent {
+                assert_eq!(up_of(&item.params), "1", "a booting dish is not a WAN down: {:?}", item.params);
+            }
+            assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "1");
+        }
+        assert_eq!(st.health[&r.id], crate::router_health::RouterHealth::default(), "no bad run was ever opened");
+        // Its condition is still reported, exactly as before — nothing is hidden from the owner.
+        let kf = keyframe_router(&rt, &cfg, &r.id).await.unwrap();
+        assert_eq!(get_param(&kf, "outage"), Some("booting"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     async fn grace_rt(tag: &str, r: &hub_config::RouterConfig) -> (Shared, HubConfig, PathBuf) {
@@ -6373,6 +6507,10 @@ mod tests {
         params.iter().find(|(k, _)| k == "up").map(|(_, v)| v.as_str()).unwrap()
     }
 
+    fn get_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        params.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
     const SEC: i64 = 1_000;
 
     #[tokio::test]
@@ -6381,7 +6519,9 @@ mod tests {
         let (rt, cfg, base) = grace_rt("grace-single", &r).await;
         let mut st = RouterPollState::default();
         let good = wired(true);
-        assert!(router_observed(&rt, &r, &good, 0, 0, &mut st).await.is_none(), "the first read is the baseline");
+        let (first, event) = router_observed(&rt, &r, &good, 0, 0, &mut st).await.expect("the first read after a restart is reported (D8)");
+        assert!(event);
+        assert_eq!(up_of(&first.params), "1");
         let before = keyframe_router(&rt, &cfg, &r.id).await.expect("the keyframe carries the baseline");
         assert_eq!(up_of(&before), "1");
 
@@ -6405,19 +6545,24 @@ mod tests {
             assert!(router_observed(&rt, &r, &dark, t * SEC, t * SEC, &mut st).await.is_none(), "{} s of failure is not down", t - 100);
             assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "1");
         }
-        let (item, event) = router_observed(&rt, &r, &dark, 145 * SEC, 145 * SEC, &mut st).await.expect("45 s: down goes out");
-        assert!(event, "down is an event");
-        assert_eq!(up_of(&item.params), "0");
-        assert!(item.params.iter().any(|(k, v)| k == "wan" && v == "wired"), "the last reading, with up=0: {:?}", item.params);
-        assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "0", "and the keyframe now says down");
+        let (item, event) = router_observed(&rt, &r, &dark, 145 * SEC, 145 * SEC, &mut st).await.expect("45 s: the held reading goes out");
+        assert!(event, "losing the reading is an event");
+        // 🔴 D1. This USED TO BE `up=0` — the hub asserting a link state it had not read, on a wired
+        // Peplink the owner streams video over. It now reports what it knows and says it did not read it.
+        assert_eq!(up_of(&item.params), "1", "the last state the ROUTER gave, not a zero the hub invented");
+        assert_eq!(get_param(&item.params, "upSrc"), Some("unread"));
+        assert_eq!(get_param(&item.params, "reason"), Some("timeout"), "the failure CLASS, not the sentence");
+        assert!(item.params.iter().any(|(k, v)| k == "wan" && v == "wired"), "the rest of the last reading: {:?}", item.params);
+        let kf = keyframe_router(&rt, &cfg, &r.id).await.unwrap();
+        assert_eq!((up_of(&kf), get_param(&kf, "upSrc")), ("1", Some("unread")), "and so does the keyframe");
         assert!(st.unreachable.contains(&r.id));
         for t in [205, 265] {
-            assert!(router_observed(&rt, &r, &dark, t * SEC, t * SEC, &mut st).await.is_none(), "down is sent once");
+            assert!(router_observed(&rt, &r, &dark, t * SEC, t * SEC, &mut st).await.is_none(), "it is said once");
         }
 
-        let (item, event) = router_observed(&rt, &r, &good, 300 * SEC, 300 * SEC, &mut st).await.expect("the first success is up");
+        let (item, event) = router_observed(&rt, &r, &good, 300 * SEC, 300 * SEC, &mut st).await.expect("the first success is read again");
         assert!(event);
-        assert_eq!(up_of(&item.params), "1");
+        assert_eq!((up_of(&item.params), get_param(&item.params, "upSrc")), ("1", Some("read")));
         assert!(!st.unreachable.contains(&r.id));
         assert_eq!(st.health[&r.id], crate::router_health::RouterHealth::default(), "normal cadence at once");
         assert!(router_observed(&rt, &r, &good, 420 * SEC, 420 * SEC, &mut st).await.is_none(), "one up event, not two");
@@ -6442,13 +6587,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// D6 — one hung router must not delay, or lock-step, the others.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_router_does_not_hold_up_the_rest_of_the_pass() {
+        let start = tokio::time::Instant::now();
+        // Three reads: a 30 s hang (the poll deadline) and two quick ones. Each takes its OWN times
+        // inside its future, which is the other half of D6.
+        // One async fn per read, exactly as the loop calls `poll_in_background` per router.
+        async fn read(name: &'static str, secs: u64, start: tokio::time::Instant) -> (&'static str, Duration, Duration) {
+            let began = tokio::time::Instant::now();
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            (name, began.elapsed(), start.elapsed())
+        }
+        let reads = vec![read("hung", 30, start), read("quick", 1, start), read("quick2", 2, start)];
+        let out = read_all(reads).await;
+        assert_eq!(out.iter().map(|(n, ..)| *n).collect::<Vec<_>>(), ["hung", "quick", "quick2"], "answers keep the order asked");
+        assert_eq!(out[1].2, Duration::from_secs(1), "the quick router finished on its own schedule, not behind the hung one");
+        assert_eq!(out[2].2, Duration::from_secs(2));
+        // 🔴 Serially this pass would take 33 s and every router would be judged against the last
+        // router's clock. Concurrently it takes as long as the slowest read, and no longer.
+        assert_eq!(start.elapsed(), Duration::from_secs(30), "the pass costs the slowest read, not their sum");
+    }
+
+    /// D7 — two vendors failing together is the HUB's LAN; nothing is reported for them.
+    #[test]
+    fn a_pass_that_lost_two_vendors_at_once_reports_none_of_them_and_one_vendor_still_reports() {
+        // Cradlepoint fine, Peplink and Starlink both dark: the hub lost its own network.
+        let (common, report) = pass_verdicts(&[("cradlepoint", false), ("peplink", true), ("starlink", true)]);
+        assert!(common);
+        assert_eq!(report, vec![true, false, false], "the one that READ FINE still reports; the failures are held");
+        // One vendor failing — even twice — is that vendor's problem and goes through the grace machine.
+        let (common, report) = pass_verdicts(&[("peplink", true), ("peplink", true)]);
+        assert!(!common);
+        assert_eq!(report, vec![true, true]);
+        // One router failing on its own is the ordinary case.
+        assert_eq!(pass_verdicts(&[("cradlepoint", false), ("peplink", true)]), (false, vec![true, true]));
+        assert_eq!(pass_verdicts(&[]), (false, vec![]));
+    }
+
+    /// D7, at the grace machine: a suppressed pass must leave the health state UNTOUCHED, so a hub
+    /// that lost its LAN for ten minutes still owes each router a full 45 s once it comes back.
+    #[tokio::test]
+    async fn a_suppressed_pass_does_not_advance_a_routers_grace_window() {
+        let r = grace_router("peplink");
+        let (rt, _cfg, base) = grace_rt("grace-common-mode", &r).await;
+        let mut st = RouterPollState::default();
+        let good = wired(true);
+        router_observed(&rt, &r, &good, 0, 0, &mut st).await;
+        let dark = unreachable_from(&good);
+        // What the loop does when `pass_verdicts` says "suppressed": it does not call router_observed.
+        let (_, report) = pass_verdicts(&[("peplink", true), ("cradlepoint", true)]);
+        assert!(!report[0]);
+        for t in [100, 200, 300, 400] {
+            if report[0] {
+                router_observed(&rt, &r, &dark, t * SEC, t * SEC, &mut st).await;
+            }
+        }
+        assert_eq!(st.health.get(&r.id), Some(&crate::router_health::RouterHealth::default()), "no failure run was ever opened");
+        // And when the hub's LAN comes back but this router really is dark, the window starts then.
+        assert!(router_observed(&rt, &r, &dark, 500 * SEC, 500 * SEC, &mut st).await.is_none(), "the first real failure is not a down");
+        assert_eq!(st.health[&r.id].first_failure_at, Some(500 * SEC));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[tokio::test]
     async fn a_single_starlink_outage_sample_sends_no_down_event_but_45_s_continuous_does() {
         let r = grace_router("starlink");
         let (rt, cfg, base) = grace_rt("grace-dish", &r).await;
         let mut st = RouterPollState::default();
         router_observed(&rt, &r, &dish(None, None), 0, 0, &mut st).await;
-        let sent = router_observed(&rt, &r, &dish(Some("obstructed"), Some(2 * SEC)), 120 * SEC, 120 * SEC, &mut st).await;
+        let sent = router_observed(&rt, &r, &dish(Some(OBSTRUCTED), Some(2 * SEC)), 120 * SEC, 120 * SEC, &mut st).await;
         assert!(sent.is_none(), "a 2 s obstruction is not a down event: {sent:?}");
         let kf = keyframe_router(&rt, &cfg, &r.id).await.unwrap();
         assert_eq!(up_of(&kf), "1");
@@ -6456,9 +6664,9 @@ mod tests {
         assert!(router_observed(&rt, &r, &dish(None, None), 125 * SEC, 125 * SEC, &mut st).await.is_none());
 
         for t in [200, 205, 215, 235] {
-            assert!(router_observed(&rt, &r, &dish(Some("obstructed"), None), t * SEC, t * SEC, &mut st).await.is_none());
+            assert!(router_observed(&rt, &r, &dish(Some(OBSTRUCTED), None), t * SEC, t * SEC, &mut st).await.is_none());
         }
-        let (item, event) = router_observed(&rt, &r, &dish(Some("obstructed"), None), 245 * SEC, 245 * SEC, &mut st).await.unwrap();
+        let (item, event) = router_observed(&rt, &r, &dish(Some(OBSTRUCTED), None), 245 * SEC, 245 * SEC, &mut st).await.unwrap();
         assert!(event && up_of(&item.params) == "0");
         assert!(item.params.iter().any(|(k, v)| k == "outage" && v == "obstructed"));
 
@@ -6466,7 +6674,7 @@ mod tests {
         let (rt2, _cfg2, base2) = grace_rt("grace-dish-measured", &r).await;
         let mut st2 = RouterPollState::default();
         router_observed(&rt2, &r, &dish(None, None), 0, 0, &mut st2).await;
-        let (item, event) = router_observed(&rt2, &r, &dish(Some("no satellites"), Some(50 * SEC)), 120 * SEC, 120 * SEC, &mut st2).await.unwrap();
+        let (item, event) = router_observed(&rt2, &r, &dish(Some(5), Some(50 * SEC)), 120 * SEC, 120 * SEC, &mut st2).await.unwrap();
         assert!(event && up_of(&item.params) == "0");
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&base2);

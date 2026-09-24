@@ -14,7 +14,7 @@
 # contract and its fixtures, not source — see the repo README.
 [package]
 name = "brvg-hub"
-version = "0.3.53"
+version = "0.3.54"
 description = "DockNeighbor hub — the always-on service that carries a vehicle's local work"
 edition = "2021"
 rust-version = "1.77.2"
@@ -58,7 +58,9 @@ url = "2"
 # same reason: one vetted TLS story across every artifact we ship.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# `alloc` is for `future::join_all` — the router poll reads every due router CONCURRENTLY, so one
+# router hanging on its 30 s deadline cannot delay, or lock-step the failure of, the others (D6).
+futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
 uuid = { version = "1", features = ["v4"] }
 # Shared UDP binds for NMEA-over-IP (gps.rs bind_udp_shared): SO_REUSEADDR + SO_REUSEPORT so the
 # hub can listen on 10110/2000/... while a chartplotter program on the same PC (TimeZero, OpenCPN)
