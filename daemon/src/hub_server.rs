@@ -4208,8 +4208,11 @@ fn pass_verdicts(reads: &[(&str, bool)]) -> (bool, Vec<bool>) {
 /// Up/down is router_health's decision (router_observed): a failed poll is retried after 5 s, then
 /// 10/20/40 s, capped at 60 s, and never less often than the router's normal cadence; a router is
 /// reported DOWN only after 45 s of continuously reading its uplink down, held as UNREAD after 45 s of
-/// polls that failed, and up again on the first good read. The background poll uses the generous poll
-/// deadlines (routers::poll_client, starlink::POLL_CALL_TIMEOUT).
+/// polls that failed, and up again on the first good read. A STARLINK's outage threshold is its own
+/// and longer — two minutes, whatever the dish says caused it (starlink::OUTAGE_MIN_MS, owner ruling
+/// 2026-09-24) — and the 45 s window never adds to it; 45 s still governs a dish poll that FAILED.
+/// The background poll uses the generous poll deadlines (routers::poll_client,
+/// starlink::POLL_CALL_TIMEOUT).
 ///
 /// Each pass takes `now` per router and reads every due router CONCURRENTLY (D6, `read_all`), and a pass
 /// that lost two vendors at once reports none of them (D7, `pass_verdicts`).
@@ -6451,7 +6454,9 @@ mod tests {
         crate::routers::Snapshot { error: Some("the router did not answer (timed out) — is the hub on the same network?".into()), ..last.clone() }
     }
 
-    /// A dish snapshot from a DishOutage cause (`starlink::outage_label`), or None for a healthy dish.
+    /// A dish snapshot from a DishOutage cause (`starlink::outage_label`), or None for a healthy
+    /// dish. `outage_ms` is the AGE of the outage as `starlink::carry_outage` reconciled it in the
+    /// poll — the reading that reaches this function has already been through that clock.
     fn dish(cause: Option<i32>, outage_ms: Option<i64>) -> crate::routers::Snapshot {
         let d = crate::starlink::DishStatus {
             outage: cause.map(|c| crate::starlink::outage_label(c).to_string()),
@@ -6462,33 +6467,49 @@ mod tests {
         };
         crate::routers::Snapshot { wan: Some(crate::starlink::wan_of(&d)), dish: Some(d), ..Default::default() }
     }
-    /// Cause 6 = obstructed: a genuine WAN outage (starlink::LINK_OUTAGE_CAUSES).
+    /// Cause 6 = obstructed.
     const OBSTRUCTED: i32 = 6;
-    /// Cause 1 = booting: the DISH's own condition, never a WAN down (starlink::LINK_OUTAGE_CAUSES).
+    /// Cause 1 = booting — a cause the interim 0.3.54 table would never have called a WAN outage.
     const BOOTING: i32 = 1;
+    /// Cause 2 = stowed — the owner's own example of an outage that lasts hours.
+    const STOWED: i32 = 2;
 
-    /// D5, at the poll loop: a dish in a CONDITION never reaches the grace machine as a bad sample,
-    /// so it can neither be reported down nor bypass the window with its own measured duration.
+    /// THE OWNER'S RULING AT THE POLL LOOP (Jonathan, 2026-09-24): an outage is "no internet for
+    /// over 2 minutes", and "all of them except connectd" count. Below two minutes a dish is up with
+    /// its cause named; past two minutes it is down, WHATEVER the cause — and it goes down in that
+    /// same poll, because router_health's 45 s window never adds to the dish's two.
     #[tokio::test]
-    async fn a_dish_that_is_merely_booting_is_never_reported_down_however_long_it_lasts() {
-        let r = grace_router("starlink");
-        let (rt, cfg, base) = grace_rt("grace-dish-condition", &r).await;
-        let mut st = RouterPollState::default();
-        router_observed(&rt, &r, &dish(None, None), 0, 0, &mut st).await;
-        // Ten minutes of "booting", reported by the dish with its own measured duration.
-        for t in [100, 160, 220, 280, 340, 400, 460, 520, 580, 640, 700] {
-            let snap = dish(Some(BOOTING), Some(600 * SEC));
-            let sent = router_observed(&rt, &r, &snap, t * SEC, t * SEC, &mut st).await;
-            if let Some((item, _)) = &sent {
-                assert_eq!(up_of(&item.params), "1", "a booting dish is not a WAN down: {:?}", item.params);
+    async fn any_dish_outage_is_reported_down_at_two_minutes_and_not_before() {
+        for cause in [BOOTING, STOWED, OBSTRUCTED] {
+            let r = grace_router("starlink");
+            let (rt, cfg, base) = grace_rt(&format!("grace-dish-{cause}"), &r).await;
+            let mut st = RouterPollState::default();
+            router_observed(&rt, &r, &dish(None, None), 0, 0, &mut st).await;
+            let label = crate::starlink::outage_label(cause);
+
+            // Under the threshold: up, and the cause is still reported.
+            for t in [30, 90, 119, 120] {
+                let sent = router_observed(&rt, &r, &dish(Some(cause), Some(t * SEC)), t * SEC, t * SEC, &mut st).await;
+                if let Some((item, _)) = &sent {
+                    assert_eq!(up_of(&item.params), "1", "{t} s of {label} is not an outage: {:?}", item.params);
+                }
+                assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "1", "{t} s of {label}");
             }
-            assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "1");
+            assert_eq!(st.health[&r.id], crate::router_health::RouterHealth::default(), "no bad run was ever opened");
+            assert_eq!(get_param(&keyframe_router(&rt, &cfg, &r.id).await.unwrap(), "outage"), Some(label));
+
+            // Over it: down, in THIS poll — not 45 s later.
+            let (item, event) = router_observed(&rt, &r, &dish(Some(cause), Some(121 * SEC)), 121 * SEC, 121 * SEC, &mut st)
+                .await
+                .expect("a dish past two minutes is reported down at once");
+            assert!(event, "{label} going out is an event");
+            assert_eq!(up_of(&item.params), "0", "{label} for over two minutes IS a WAN outage");
+            assert_eq!(get_param(&item.params, "outage"), Some(label), "the dish's own cause rides along with the down");
+            assert_eq!(get_param(&item.params, "upSrc"), Some("read"), "the dish said so; the hub did not infer it");
+            assert_eq!(st.health[&r.id].reported, crate::router_health::Reported::Down);
+            assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "0");
+            let _ = std::fs::remove_dir_all(&base);
         }
-        assert_eq!(st.health[&r.id], crate::router_health::RouterHealth::default(), "no bad run was ever opened");
-        // Its condition is still reported, exactly as before — nothing is hidden from the owner.
-        let kf = keyframe_router(&rt, &cfg, &r.id).await.unwrap();
-        assert_eq!(get_param(&kf, "outage"), Some("booting"));
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     async fn grace_rt(tag: &str, r: &hub_config::RouterConfig) -> (Shared, HubConfig, PathBuf) {
@@ -6650,33 +6671,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// An outage that LIFTS inside the two minutes never sends a down at all, and a real one
+    /// recovers on the first clear read — 45 s never enters into either.
     #[tokio::test]
-    async fn a_single_starlink_outage_sample_sends_no_down_event_but_45_s_continuous_does() {
+    async fn a_dish_outage_that_lifts_inside_two_minutes_never_sends_a_down() {
         let r = grace_router("starlink");
         let (rt, cfg, base) = grace_rt("grace-dish", &r).await;
         let mut st = RouterPollState::default();
         router_observed(&rt, &r, &dish(None, None), 0, 0, &mut st).await;
+        // A two-second obstruction. It is reported — nothing is hidden — but `up` never leaves 1.
         let sent = router_observed(&rt, &r, &dish(Some(OBSTRUCTED), Some(2 * SEC)), 120 * SEC, 120 * SEC, &mut st).await;
-        assert!(sent.is_none(), "a 2 s obstruction is not a down event: {sent:?}");
+        if let Some((item, _)) = &sent {
+            assert_eq!(up_of(&item.params), "1", "a 2 s obstruction is not a down: {:?}", item.params);
+        }
+        assert_eq!(up_of(&keyframe_router(&rt, &cfg, &r.id).await.unwrap()), "1");
+        // It lifts at 125 s. Under the 45 s rule this run would already have been reported down.
+        router_observed(&rt, &r, &dish(None, None), 125 * SEC, 125 * SEC, &mut st).await;
         let kf = keyframe_router(&rt, &cfg, &r.id).await.unwrap();
         assert_eq!(up_of(&kf), "1");
-        assert!(!kf.iter().any(|(k, _)| k == "outage"), "the keyframe keeps the last good reading");
-        assert!(router_observed(&rt, &r, &dish(None, None), 125 * SEC, 125 * SEC, &mut st).await.is_none());
+        assert!(!kf.iter().any(|(k, _)| k == "outage"), "the dish says it lifted, so the reading stops naming one");
+        assert_eq!(st.health[&r.id], crate::router_health::RouterHealth::default(), "no bad run was ever opened");
 
-        for t in [200, 205, 215, 235] {
-            assert!(router_observed(&rt, &r, &dish(Some(OBSTRUCTED), None), t * SEC, t * SEC, &mut st).await.is_none());
-        }
-        let (item, event) = router_observed(&rt, &r, &dish(Some(OBSTRUCTED), None), 245 * SEC, 245 * SEC, &mut st).await.unwrap();
-        assert!(event && up_of(&item.params) == "0");
-        assert!(item.params.iter().any(|(k, v)| k == "outage" && v == "obstructed"));
-
-        // The dish's OWN measured duration ≥ 45 s counts at once (router_health header).
-        let (rt2, _cfg2, base2) = grace_rt("grace-dish-measured", &r).await;
-        let mut st2 = RouterPollState::default();
-        router_observed(&rt2, &r, &dish(None, None), 0, 0, &mut st2).await;
-        let (item, event) = router_observed(&rt2, &r, &dish(Some(5), Some(50 * SEC)), 120 * SEC, 120 * SEC, &mut st2).await.unwrap();
-        assert!(event && up_of(&item.params) == "0");
+        // A real one, and the recovery after it.
+        let (down, event) = router_observed(&rt, &r, &dish(Some(OBSTRUCTED), Some(200 * SEC)), 300 * SEC, 300 * SEC, &mut st)
+            .await
+            .expect("over two minutes IS an outage");
+        assert!(event && up_of(&down.params) == "0");
+        assert!(down.params.iter().any(|(k, v)| k == "outage" && v == "obstructed"));
+        let (back, event) = router_observed(&rt, &r, &dish(None, None), 310 * SEC, 310 * SEC, &mut st)
+            .await
+            .expect("the first clear read restores up at once");
+        assert!(event && up_of(&back.params) == "1");
+        assert_eq!(st.health[&r.id], crate::router_health::RouterHealth::default());
         let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&base2);
     }
 }
