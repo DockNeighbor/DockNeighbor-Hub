@@ -269,6 +269,14 @@ pub fn nonce_ping_frame(nonce: &str) -> String {
 /// PURE: a nonce. Unguessable is not the point — UNMATCHABLE by a static auto-response pair is, so
 /// any value that varies per ping does the job. Base-36 of the clock plus a per-connection counter,
 /// so two pings in the same millisecond still differ.
+///
+/// ⚠️ THE SHAPE IS THE WORKER'S, NOT OURS. `hubLink.ts` echoes `n` back only when it matches
+/// `^[A-Za-z0-9]{1,64}$`; anything else is refused and the worker falls back to a BARE
+/// `{"type":"pong"}`. That degrades silently — the socket keeps answering, `nonce_echoed` never
+/// becomes true, and the liveness proof quietly stops proving anything. So: plain ASCII
+/// alphanumerics, comfortably inside the cap. `NONCE_MAX_CHARS` and the test below pin it.
+pub const NONCE_MAX_CHARS: usize = 32;
+
 pub fn next_nonce(counter: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -610,7 +618,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
         assert_eq!(parsed["type"], "ping");
         assert_eq!(parsed["n"], n.as_str());
-        assert!(!n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric()), "a plain token the worker can echo: {n}");
+        // 🔴 The worker echoes `n` ONLY when it matches ^[A-Za-z0-9]{1,64}$ and otherwise answers a
+        // BARE pong — which would leave `nonce_echoed` false forever and silently un-prove liveness.
+        for c in [1u64, 2, 7, 4096, u64::MAX] {
+            let n = next_nonce(c);
+            assert!(!n.is_empty(), "an empty nonce is no nonce");
+            assert!(n.chars().count() <= NONCE_MAX_CHARS, "inside the worker's 64-char cap: {n}");
+            assert!(n.chars().all(|c| c.is_ascii_alphanumeric()), "the worker's accepted shape: {n}");
+        }
         assert_ne!(next_nonce(2), next_nonce(3), "a repeated nonce would be a static frame again");
     }
 

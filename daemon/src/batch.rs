@@ -227,10 +227,16 @@ pub const MODEM_LIVE_ONLY: &[&str] = &[
 /// "everything not live-only", so a field missing here is still sent.
 /// `upSrc`, `reason` and `atMs` are STATE and must never be stripped: `upSrc=unread` is the whole
 /// reason an unreadable router is not reported as a down one (router_health), so losing it outside
-/// a lease would put back exactly the defect it was added to fix. `atMs` is listed to keep this
-/// list name-for-name with the cloud's (`liveTelemetryFields.ts`), but 0.3.54 does not emit it —
-/// a fresh timestamp on every poll would rewrite the reading document on every check-in, which is
-/// the cost the live-only rule exists to avoid; the worker falls back to arrival time.
+/// a lease would put back exactly the defect it was added to fix.
+///
+/// ⚠️ `atMs` IS RESERVED, NOT EMITTED. It is listed to keep this list name-for-name with the
+/// cloud's (`liveTelemetryFields.ts`), and the worker stamps its WAN transition rows with arrival
+/// time (`at_src='cloud'`) because no hub sends it. BEFORE YOU TURN IT ON: a timestamp that differs
+/// on every poll makes every router reading differ on every poll, which defeats the unchanged-
+/// reading suppression the cloud relies on — every router, every keyframe, a write each time. That
+/// is the cost the live-only rule exists to avoid. If a hub is to send `atMs`, the cloud needs a
+/// deadband or an exemption for it FIRST (the same note sits beside the field in
+/// liveTelemetryFields.ts).
 pub const MODEM_STATE: &[&str] = &[
     "up", "upSrc", "reason", "atMs", "outage", "alerts", "carrier", "mode", "sim", "wan", "wanSrc", "dataMb", "ip", "model", "fw",
     "av", "update", "released",
