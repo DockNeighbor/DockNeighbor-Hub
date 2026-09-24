@@ -387,15 +387,16 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(35);
 ///
 /// ⚠️ THE CADENCE IS THE CLOUD SESSION'S CALL — these two constants are the whole knob, deliberately
 /// named and deliberately adjacent, so changing the number is a one-line edit with no other
-/// consequence. The cloud session proposed every 5 minutes (≈11 minutes to detect a half-open
-/// socket). This ships 60 s with 3 missed echoes (≈3 minutes) because the path being kept alive is
-/// a VALVE COMMAND path and 11 minutes of "no hub took that command" is a product failure, not a
-/// cost question: a nonce ping is one inbound WebSocket message, which Cloudflare bills at 1/20th
-/// of a request, so 60 s costs on the order of a rounding error per hub per day.
+/// consequence. Two cadences were argued: 5 min (≈11 min to detect a half-open socket) and 60 s
+/// (≈3 min). SHIPPED: 120 s with 3 missed echoes, ≈6 minutes, decided 2026-09-24 on cost — a nonce
+/// ping is an inbound WebSocket message, which does NOT hit the auto-response pair and therefore
+/// WAKES the Durable Object, and 60 s would add ~1,440 wakes a day for one hub, tripling idle DO
+/// usage. 6 minutes is judged an acceptable bound for a failure mode that is rare now, against a
+/// valve-command path where "no hub took that command" is the visible cost of detecting it late.
 ///
 /// Three missed echoes, not one, for the same reason as SILENCE_LIMIT: a single lost frame on a
 /// marina's Wi-Fi is not a dead socket, and reconnecting on every hiccup would be its own outage.
-pub const NONCE_PING_EVERY: Duration = Duration::from_secs(60);
+pub const NONCE_PING_EVERY: Duration = Duration::from_secs(120);
 pub const NONCE_MISSES_ALLOWED: u32 = 3;
 /// The silence the nonce heartbeat allows: NONCE_MISSES_ALLOWED intervals.
 pub const NONCE_SILENCE_LIMIT: Duration = Duration::from_secs(NONCE_PING_EVERY.as_secs() * NONCE_MISSES_ALLOWED as u64);
@@ -641,7 +642,7 @@ mod tests {
         assert!(!nonce_is_silent(true, limit, limit), "exactly at the limit is still alive");
         assert!(nonce_is_silent(true, limit + Duration::from_secs(1), limit));
         // The cadence pair, stated: three missed echoes, ~3 minutes to notice a half-open socket.
-        assert_eq!(NONCE_PING_EVERY, Duration::from_secs(60));
+        assert_eq!(NONCE_PING_EVERY, Duration::from_secs(120));
         assert_eq!(NONCE_MISSES_ALLOWED, 3);
         assert_eq!(NONCE_SILENCE_LIMIT, NONCE_PING_EVERY * NONCE_MISSES_ALLOWED, "the limit IS the misses, not a second number");
         assert!(NONCE_SILENCE_LIMIT > NONCE_PING_EVERY, "one lost frame is not a dead socket");
