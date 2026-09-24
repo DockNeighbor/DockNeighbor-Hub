@@ -1,5 +1,11 @@
 // ROUTER UP/DOWN GRACE — when a managed router, modem or Starlink dish is REPORTED down.
 //
+// ⚠️ 2026-09-24, Jonathan, SECOND RULING: "the way you are measuring up/down on routers is wrong.
+// It's too aggressive and not actually logging the state." The grace window below is unchanged; what
+// changed is that the hub no longer reports DOWN for a router it could not READ — see the `upSrc`
+// block after this one, `unread_params` and `common_mode_failure`. "Down" below now means only what
+// a device SAID, never what the hub failed to find out.
+//
 // Owner ruling (Jonathan, 2026-09-17): router polling was too aggressive and router cards flapped. "A
 // single failed poll or timeout never marks a router down"; retry after a few seconds, back off while
 // failures continue; report DOWN only once failures have been CONTINUOUS for a 30–60 s grace window;
@@ -22,10 +28,45 @@
 // - A Starlink that reports, in the same answer, an outage it has itself measured at ≥ 45 s
 //   (DishOutage.duration_ns) counts at once — the dish has already watched the window elapse (a hub
 //   restarted mid-outage need not wait another 45 s). A dish that does not report a duration waits
-//   the window like everything else.
+//   the window like everything else. That shortcut is now reachable ONLY by a genuine link outage:
+//   since 0.3.54 a dish CONDITION (booting, stowed, sleeping…) never produces `up=0` at all
+//   (starlink::LINK_OUTAGE_CAUSES), so it cannot bypass the window however long the dish has been
+//   in it — proven in starlink.rs.
 //
 // PURE: no clock, no I/O. hub_server's router_poll_loop is the shell: it samples, calls `observe`
 // with the times it read, and reports what the verdict says.
+
+// WHERE `up` CAME FROM — `upSrc`, the param added 0.3.54 (owner ruling, Jonathan 2026-09-24: "the
+// way you are measuring up/down on routers is wrong. It's too aggressive and not actually logging
+// the state").
+//
+// 🔴 AN UNREADABLE ROUTER IS NOT A DOWN ROUTER. Until 0.3.54 a poll that kept failing past the
+// grace window reported the last reading with `up` REPLACED BY 0 — so a hub that had lost its own
+// LAN, or a router whose API had gone quiet, produced a link-down on CENTRAL's Starlink and wired
+// Peplink, which are the links the owner streams video over. The hub now reports what it actually
+// knows: the last `up` the router DID say, marked `upSrc=unread`, with a short `reason`.
+//
+// The vocabulary, and the one compatibility rule: `upSrc` ABSENT means `read`. Every reading an
+// older daemon ever sent, and every reading already stored in the cloud, is therefore a `read` —
+// which is what it was.
+/// The param name.
+pub const UP_SRC: &str = "upSrc";
+/// The router answered and this is what it said.
+pub const UP_SRC_READ: &str = "read";
+/// The hub could not read the router. `up` beside this is the last value the router DID say — it
+/// is NOT evidence about the link now, and nothing downstream may treat it as a down.
+pub const UP_SRC_UNREAD: &str = "unread";
+/// The short failure class, or the vendor's own words, beside an `upSrc=unread` reading.
+pub const REASON: &str = "reason";
+
+/// PURE: the two params every READ report opens with — `up`, and `upSrc=read` beside it so a
+/// reader never has to infer it from an absence.
+pub fn up_read(up: bool) -> Vec<(String, String)> {
+    vec![
+        ("up".into(), if up { "1" } else { "0" }.into()),
+        (UP_SRC.into(), UP_SRC_READ.into()),
+    ]
+}
 
 /// Bad samples must be continuous for this long before a router is reported down.
 pub const DOWN_GRACE_MS: i64 = 45_000;
@@ -127,21 +168,72 @@ impl RouterHealth {
     }
 }
 
-/// PURE: the report for a router whose POLL FAILED past the grace window — its last reported reading
-/// with `up` set to 0 (every other field is what it last said). None when there was never a reading.
-pub fn down_params(last: Option<&[(String, String)]>) -> Option<Vec<(String, String)>> {
-    let last = last?;
-    let mut p: Vec<(String, String)> = last.iter().filter(|(k, _)| k != "up").cloned().collect();
-    p.insert(0, ("up".into(), "0".into()));
-    Some(p)
+/// PURE: the report for a router the hub COULD NOT READ past the grace window — its last reported
+/// reading with `up` LEFT EXACTLY AS THE ROUTER LAST SAID IT, marked `upSrc=unread`, plus a short
+/// `reason`. Every other field is what it last said.
+///
+/// 🔴 THIS USED TO INSERT `up=0` (D1). It does not any more: an unreadable router is not a down
+/// router, and the hub has no business asserting a link state it did not read. See the `upSrc`
+/// note at the top of this file.
+///
+/// After a RESTART there is no last reading (`last` is None) — and reporting nothing at all is how
+/// a router that was already unreachable when the hub came up stayed invisible to the cloud
+/// forever (D8). So None still produces a report: `upSrc=unread` and the reason, WITHOUT an `up`
+/// field, because the hub genuinely does not know one and will not invent it. `identity` is
+/// whatever the hub can honestly say about the device (its agent version, and a model/firmware it
+/// probed before the restart) — never a link state.
+pub fn unread_params(
+    last: Option<&[(String, String)]>,
+    reason: Option<&str>,
+    identity: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut p: Vec<(String, String)> = match last {
+        Some(l) => l.iter().filter(|(k, _)| k != UP_SRC && k != REASON).cloned().collect(),
+        None => identity.iter().filter(|(k, _)| k != "up" && k != UP_SRC && k != REASON).cloned().collect(),
+    };
+    // Right after `up` when there is one, so the pair reads together; first otherwise.
+    let at = p.iter().position(|(k, _)| k == "up").map_or(0, |i| i + 1);
+    p.insert(at, (UP_SRC.into(), UP_SRC_UNREAD.into()));
+    if let Some(r) = reason.map(str::trim).filter(|r| !r.is_empty()) {
+        p.push((REASON.into(), r.to_string()));
+    }
+    p
 }
 
-/// PURE: the sample a poll's report makes. `up=0` is a reported-down uplink; anything else is up.
+/// PURE: the sample a poll's report makes. `up=0` is a reported-down uplink — but ONLY when the
+/// same report says the hub READ it (`upSrc` absent or `read`). A reading carried forward with
+/// `upSrc=unread` is the hub's own memory, not a fresh down, and folding it back in as one would
+/// let a single unreadable router re-arm the grace machine off its own held report.
 pub fn sample_of(params: Option<&[(String, String)]>, measured_ms: Option<i64>) -> Sample {
-    match params.and_then(|p| p.iter().rev().find(|(k, _)| k == "up")) {
-        Some((_, v)) if v == "0" => Sample::ReportedDown { measured_ms },
+    let get = |key: &str| params.and_then(|p| p.iter().rev().find(|(k, _)| k == key)).map(|(_, v)| v.as_str());
+    if get(UP_SRC).is_some_and(|s| s == UP_SRC_UNREAD) {
+        return Sample::Up;
+    }
+    match get("up") {
+        Some("0") => Sample::ReportedDown { measured_ms },
         _ => Sample::Up,
     }
+}
+
+/// PURE: did this poll pass fail in a way that means THE HUB lost its own LAN, rather than the
+/// routers going down? (D7, owner ruling 2026-09-24.)
+///
+/// Two or more managed routers OF DIFFERENT VENDORS failing to read in the same pass is not a
+/// coincidence. A boat does not lose a Cradlepoint and a Peplink at the same instant; it loses the
+/// switch they both hang off, or the hub's own network interface. Two failures of the SAME vendor
+/// are not this — one bad firmware or one bad credential explains those — so the rule is
+/// deliberately about vendor DIVERSITY, not about a count.
+///
+/// `failed_vendors` is the vendor of every router whose read failed in one pass, in any order.
+pub fn common_mode_failure(failed_vendors: &[&str]) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    for v in failed_vendors {
+        let v = v.trim();
+        if !v.is_empty() && !seen.contains(&v) {
+            seen.push(v);
+        }
+    }
+    seen.len() >= 2
 }
 
 #[cfg(test)]
@@ -266,14 +358,82 @@ mod tests {
         assert!(down.due(75 * S, Some(45 * S), 30 * S), "a 30 s leased cadence beats the 60 s backoff");
     }
 
+    fn p(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// D1 — THE DEFECT ITSELF. An unreadable router keeps the `up` its router last GAVE; the hub
+    /// never substitutes a 0 for a reading it did not make.
     #[test]
-    fn a_failed_poll_past_the_window_reports_the_last_reading_with_up_0() {
-        let p = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    fn an_unreadable_router_keeps_its_last_up_and_is_marked_unread() {
         let last = p(&[("up", "1"), ("wan", "wired"), ("model", "Balance One")]);
-        assert_eq!(down_params(Some(&last)), Some(p(&[("up", "0"), ("wan", "wired"), ("model", "Balance One")])));
-        assert_eq!(down_params(None), None, "never read since start: nothing invented");
+        let held = unread_params(Some(&last), Some("timeout"), &[]);
+        assert_eq!(
+            held,
+            p(&[("up", "1"), ("upSrc", "unread"), ("wan", "wired"), ("model", "Balance One"), ("reason", "timeout")]),
+            "the last GOOD reading, `up` untouched, marked unread with its reason"
+        );
+        assert!(!held.iter().any(|(k, v)| k == "up" && v == "0"), "a router the hub cannot read is NEVER reported down");
+
+        // A router whose last reading was a genuine, READ down keeps that too — the hub does not
+        // flip it back up either. Only the source changes.
+        let was_down = p(&[("up", "0"), ("upSrc", "read"), ("wan", "none")]);
+        assert_eq!(unread_params(Some(&was_down), None, &[]), p(&[("up", "0"), ("upSrc", "unread"), ("wan", "none")]));
+
+        // `upSrc`/`reason` are replaced, never stacked, however long the router stays unreadable.
+        let again = unread_params(Some(&held), Some("unreachable"), &[]);
+        assert_eq!(again.iter().filter(|(k, _)| k == "upSrc").count(), 1);
+        assert_eq!(again.iter().filter(|(k, _)| k == "reason").count(), 1);
+        assert_eq!(again.iter().rev().find(|(k, _)| k == "reason").unwrap().1, "unreachable");
+    }
+
+    /// D8 — after a restart there is no last reading, and reporting NOTHING is how a router that
+    /// was already unreachable at boot stayed invisible. Identity, `upSrc=unread`, no invented `up`.
+    #[test]
+    fn a_router_unreachable_since_boot_is_still_reported_without_inventing_an_up() {
+        let identity = p(&[("model", "Balance One"), ("fw", "8.5.5"), ("av", "hub-0.3.54")]);
+        let first = unread_params(None, Some("unreachable"), &identity);
+        assert_eq!(first[0], ("upSrc".to_string(), "unread".to_string()), "the first thing it says is that it did not read");
+        assert!(!first.iter().any(|(k, _)| k == "up"), "no last reading means no `up` — the hub does not guess one");
+        assert_eq!(first.iter().rev().find(|(k, _)| k == "reason").unwrap().1, "unreachable");
+        for (k, v) in &identity {
+            assert!(first.contains(&(k.clone(), v.clone())), "identity `{k}` is what the hub CAN honestly say");
+        }
+        // An `up` smuggled in through `identity` is refused: identity is not a link state.
+        let sneaky = p(&[("up", "1"), ("av", "hub-0.3.54")]);
+        assert!(!unread_params(None, None, &sneaky).iter().any(|(k, _)| k == "up"));
+    }
+
+    #[test]
+    fn a_read_down_is_a_sample_but_a_held_unread_reading_is_not() {
+        let last = p(&[("up", "1"), ("upSrc", "read"), ("wan", "wired")]);
         assert_eq!(sample_of(Some(&last), None), Sample::Up);
-        assert_eq!(sample_of(Some(&p(&[("up", "0"), ("wan", "starlink")])), Some(3)), Sample::ReportedDown { measured_ms: Some(3) });
+        assert_eq!(
+            sample_of(Some(&p(&[("up", "0"), ("upSrc", "read"), ("wan", "starlink")])), Some(3)),
+            Sample::ReportedDown { measured_ms: Some(3) }
+        );
+        assert_eq!(sample_of(Some(&p(&[("up", "0"), ("wan", "starlink")])), Some(3)), Sample::ReportedDown { measured_ms: Some(3) },
+            "`upSrc` absent means READ — every reading an older daemon sent");
+        // 🔴 The held reading carries `up=0` when the router's last READ said so. Folding that back
+        // in as a fresh down would let one unreadable router re-arm the grace machine off its own memory.
+        assert_eq!(sample_of(Some(&p(&[("up", "0"), ("upSrc", "unread")])), Some(99_000)), Sample::Up);
         assert_eq!(sample_of(None, None), Sample::Up, "a read with nothing to report is not a down");
+    }
+
+    /// D7 — two vendors failing at once is the HUB's LAN, not two routers.
+    #[test]
+    fn two_vendors_failing_together_is_the_hubs_own_network_and_one_vendor_is_not() {
+        assert!(common_mode_failure(&["cradlepoint", "peplink"]));
+        assert!(common_mode_failure(&["starlink", "peplink", "peplink"]));
+        assert!(!common_mode_failure(&["peplink", "peplink"]), "two of ONE vendor is one bad firmware or one bad credential");
+        assert!(!common_mode_failure(&["cradlepoint"]));
+        assert!(!common_mode_failure(&[]), "a pass with no failures is not a LAN loss");
+        assert!(!common_mode_failure(&["peplink", "", " "]), "an unset vendor is not a second vendor");
+    }
+
+    #[test]
+    fn a_read_report_says_so_in_up_src() {
+        assert_eq!(up_read(true), p(&[("up", "1"), ("upSrc", "read")]));
+        assert_eq!(up_read(false), p(&[("up", "0"), ("upSrc", "read")]));
     }
 }

@@ -225,8 +225,21 @@ pub const MODEM_LIVE_ONLY: &[&str] = &[
 ];
 /// `modem.measurement` STATE — always sent. Listed for the tests and the reader; the rule itself is
 /// "everything not live-only", so a field missing here is still sent.
+/// `upSrc`, `reason` and `atMs` are STATE and must never be stripped: `upSrc=unread` is the whole
+/// reason an unreadable router is not reported as a down one (router_health), so losing it outside
+/// a lease would put back exactly the defect it was added to fix.
+///
+/// ⚠️ `atMs` IS RESERVED, NOT EMITTED. It is listed to keep this list name-for-name with the
+/// cloud's (`liveTelemetryFields.ts`), and the worker stamps its WAN transition rows with arrival
+/// time (`at_src='cloud'`) because no hub sends it. BEFORE YOU TURN IT ON: a timestamp that differs
+/// on every poll makes every router reading differ on every poll, which defeats the unchanged-
+/// reading suppression the cloud relies on — every router, every keyframe, a write each time. That
+/// is the cost the live-only rule exists to avoid. If a hub is to send `atMs`, the cloud needs a
+/// deadband or an exemption for it FIRST (the same note sits beside the field in
+/// liveTelemetryFields.ts).
 pub const MODEM_STATE: &[&str] = &[
-    "up", "outage", "alerts", "carrier", "mode", "sim", "wan", "wanSrc", "dataMb", "ip", "model", "fw", "av", "update", "released",
+    "up", "upSrc", "reason", "atMs", "outage", "alerts", "carrier", "mode", "sim", "wan", "wanSrc", "dataMb", "ip", "model", "fw",
+    "av", "update", "released",
 ];
 /// `linktap.measurement`: the valve's radio signal is the one live-only field.
 pub const LINKTAP_LIVE_ONLY: &[&str] = &["signal"];
@@ -363,7 +376,7 @@ pub mod fixtures {
             rssi: Some(-71.0), rsrp: Some(-101.0), rsrq: Some(-9.0), sinr: Some(12.0), connected: Some(true),
             ip: Some("100.64.3.9".into()), tx_bytes: Some(400 << 20), rx_bytes: Some(900 << 20),
         };
-        let w = WanStatus { wan: "lte".into(), up: true, ip: None, uptime_s: Some(3600) };
+        let w = WanStatus { wan: "lte".into(), up: true, up_known: true, ip: None, uptime_s: Some(3600) };
         routers::modem_params(&m, Some(&w), Some(&probe("CBA850")), None)
     }
 
@@ -380,7 +393,7 @@ pub mod fixtures {
 
     /// A wired Peplink Balance — up/wan, identity and its uplink uptime.
     pub fn wired() -> Vec<(String, String)> {
-        let w = WanStatus { wan: "wired".into(), up: true, ip: Some("203.0.113.7".into()), uptime_s: Some(7200) };
+        let w = WanStatus { wan: "wired".into(), up: true, up_known: true, ip: Some("203.0.113.7".into()), uptime_s: Some(7200) };
         routers::wan_params(&w, Some(&probe("Balance One")))
     }
 
@@ -562,11 +575,17 @@ mod tests {
         }
         // Spot the ones that matter on the card, so a fixture that stopped emitting them fails here.
         let lte = for_the_wire(Item { device: "r".into(), event: "modem.measurement".into(), params: lte() }, false);
-        assert_eq!(keys(&lte), ["up", "mode", "carrier", "sim", "dataMb", "wan", "ip", "model", "fw", "av"]);
+        assert_eq!(keys(&lte), ["up", "upSrc", "mode", "carrier", "sim", "dataMb", "wan", "ip", "model", "fw", "av"]);
         let dish = for_the_wire(Item { device: "s".into(), event: "modem.measurement".into(), params: dish() }, false);
-        assert_eq!(keys(&dish), ["up", "wan", "model", "fw", "av", "outage", "alerts"]);
+        assert_eq!(keys(&dish), ["up", "upSrc", "wan", "model", "fw", "av", "outage", "alerts"]);
         let wired = for_the_wire(Item { device: "w".into(), event: "modem.measurement".into(), params: wired() }, false);
-        assert_eq!(keys(&wired), ["up", "wan", "ip", "model", "fw", "av"]);
+        assert_eq!(keys(&wired), ["up", "upSrc", "wan", "ip", "model", "fw", "av"]);
+        // 🔴 `upSrc` IS STATE: strip it outside a lease and an unreadable router reads as a down one
+        // again — the whole of D1. Proven on a HELD reading, which is the one that carries `unread`.
+        let held = crate::router_health::unread_params(Some(&super::fixtures::wired()), Some("timeout"), &[]);
+        let out = for_the_wire(Item { device: "w".into(), event: "modem.measurement".into(), params: held }, false);
+        assert!(out.params.contains(&("upSrc".to_string(), "unread".to_string())), "{:?}", keys(&out));
+        assert!(out.params.contains(&("reason".to_string(), "timeout".to_string())), "{:?}", keys(&out));
     }
 
     #[test]

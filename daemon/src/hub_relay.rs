@@ -123,6 +123,29 @@ pub fn backoff_secs(attempt: u32) -> u64 {
     secs.min(MAX_BACKOFF_SECS)
 }
 
+/// A connection that lived at least this long WAS a connection, not a failing handshake.
+pub const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(60);
+
+/// PURE: the attempt counter for the NEXT reconnect, from how the last one ended and how long the
+/// connection it served lived.
+///
+/// 🔴 THE COUNTER NEVER RESET ON A FAILURE (D9, owner ruling 2026-09-24). `run` zeroed `attempt`
+/// only on a CLEAN close, so after the first few failures the hub sat permanently at the 60 s cap:
+/// a socket that had been up for two hours and was then reset by the edge cost ~61 s of "no hub"
+/// before the hub even tried again. CENTRAL logged 78 resets between 2026-09-19 and 2026-09-24 —
+/// over an hour of windows in which a valve command answered "no hub took that command", on a
+/// vessel whose web app has NO LAN path to the hub.
+///
+/// Backoff exists to stop a hub hammering a cloud that will not have it. A connection that lived a
+/// full minute is the opposite of that evidence, so the next failure starts the schedule over.
+pub fn next_attempt(attempt: u32, lived: Duration, clean_close: bool) -> u32 {
+    if clean_close || lived >= BACKOFF_RESET_AFTER {
+        0
+    } else {
+        attempt.saturating_add(1)
+    }
+}
+
 /// PURE: strip a secret out of anything on its way to a log. The socket URL carries the hub token,
 /// and a transport error that quotes the URL would otherwise write the credential to disk.
 pub fn redact(text: &str, secret: &str) -> String {
@@ -137,10 +160,12 @@ pub fn redact(text: &str, secret: &str) -> String {
 #[derive(Debug, PartialEq)]
 pub enum WorkerMessage {
     Keys(Vec<MemberKey>),
-    /// The worker's answer to our application ping. Its VALUE is nothing; its ARRIVAL is everything —
-    /// it is the one frame only the live Durable Object can send, which is why it, not a control-frame
-    /// PONG, is what proves the socket is real. See the heartbeat in `serve_once`.
-    Pong,
+    /// The worker's answer to our application ping. A pong with NO `n` is the auto-response's, or an
+    /// older worker's: its arrival is TEXT, which still counts for the any-TEXT liveness rule, but it
+    /// proves only that the edge is there. A pong that ECHOES the nonce we sent could only have come
+    /// from the object's own `webSocketMessage` — that is the one that proves the object is running.
+    /// See `nonce_ping_frame` and the heartbeat in `serve_once`.
+    Pong { n: Option<String> },
     Call {
         id: String,
         uid: String,
@@ -169,6 +194,10 @@ struct RawFrame {
     path: Option<String>,
     #[serde(default)]
     body: Option<String>,
+    /// The nonce echoed back on a `pong` (`nonce_ping_frame`). Absent on the auto-response's pong
+    /// and on every worker older than Cloud #—wan-state-log.
+    #[serde(default)]
+    n: Option<String>,
 }
 
 /// PURE: read one frame from the worker.
@@ -176,7 +205,7 @@ pub fn parse_worker_message(raw: &str) -> Option<WorkerMessage> {
     let f: RawFrame = serde_json::from_str(raw).ok()?;
     match f.kind.as_str() {
         "keys" => Some(WorkerMessage::Keys(f.keys.unwrap_or_default())),
-        "pong" => Some(WorkerMessage::Pong),
+        "pong" => Some(WorkerMessage::Pong { n: f.n.filter(|s| !s.is_empty()) }),
         "call" => {
             let id = f.id.filter(|s| !s.is_empty())?;
             // A call with no caller is not answerable: every action here is role-gated, and a
@@ -210,9 +239,57 @@ pub fn result_frame(id: &str, answer: &Answer) -> String {
 
 /// PURE: the application heartbeat. A TEXT frame, deliberately — a control-frame PING is answered by
 /// the Cloudflare edge for a hibernating object, so it would prove the edge is reachable, not that
-/// the object still holds this socket. Only the live Durable Object answers this, with a `pong`.
+/// the object still holds this socket.
+///
+/// ⚠️ THESE BYTES ARE PINNED. The worker hands exactly this string to `setWebSocketAutoResponse`
+/// (DockNeighbor-Cloud hubRelay.ts `APP_PING_FRAME`), and a drift check compares the two, so the
+/// 10 s heartbeat must stay byte-for-byte `{"type":"ping"}`. It is NOT, on its own, proof the
+/// object is running any more — see `nonce_ping_frame`.
 fn app_ping_frame() -> String {
     r#"{"type":"ping"}"#.to_string()
+}
+
+/// PURE: the NONCE heartbeat — the one frame the runtime's auto-response cannot answer.
+///
+/// 🔴 D15, the third turn of the half-open screw (owner ruling 2026-09-24). Cloud #476 installed
+/// `setWebSocketAutoResponse` with a request/response pair BYTE-IDENTICAL to `app_ping_frame()`
+/// and its pong. That is a real cost saving, and it also means the Cloudflare RUNTIME answers the
+/// 10 s ping WITHOUT the Durable Object running — while `serve_once` below counts any TEXT frame
+/// as proof of life. So the plain ping has quietly become, again, a test of the edge rather than
+/// of the object: the very thing the 2026-08-31 and 2026-09-09 outages were about.
+///
+/// A ping carrying a random `n` cannot equal the auto-response's request string, so it falls
+/// through to the object's `webSocketMessage`, which echoes `{"type":"pong","n":…}`. ONLY an echo
+/// whose `n` matches the nonce we sent counts for the nonce silence limit; the edge cannot forge
+/// one, because it does not know the nonce and has no rule that produces it.
+pub fn nonce_ping_frame(nonce: &str) -> String {
+    format!(r#"{{"type":"ping","n":"{nonce}"}}"#)
+}
+
+/// PURE: a nonce. Unguessable is not the point — UNMATCHABLE by a static auto-response pair is, so
+/// any value that varies per ping does the job. Base-36 of the clock plus a per-connection counter,
+/// so two pings in the same millisecond still differ.
+///
+/// ⚠️ THE SHAPE IS THE WORKER'S, NOT OURS. `hubLink.ts` echoes `n` back only when it matches
+/// `^[A-Za-z0-9]{1,64}$`; anything else is refused and the worker falls back to a BARE
+/// `{"type":"pong"}`. That degrades silently — the socket keeps answering, `nonce_echoed` never
+/// becomes true, and the liveness proof quietly stops proving anything. So: plain ASCII
+/// alphanumerics, comfortably inside the cap. `NONCE_MAX_CHARS` and the test below pin it.
+pub const NONCE_MAX_CHARS: usize = 32;
+
+pub fn next_nonce(counter: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut v = now ^ counter.rotate_left(29) ^ 0x9E37_79B9_7F4A_7C15;
+    let mut out = String::with_capacity(13);
+    const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    for _ in 0..12 {
+        out.push(ALPHABET[(v % 36) as usize] as char);
+        v /= 36;
+    }
+    out
 }
 
 /// PURE. `lanIps` + `webVersion` + `httpPort` are how the cloud learns WHERE this hub is and
@@ -259,16 +336,14 @@ pub async fn run(rt: Shared) {
             tokio::time::sleep(Duration::from_secs(30)).await;
             continue;
         }
-        match serve_once(&rt, &cfg).await {
-            Ok(()) => {
-                crate::hlog!("hub: relay socket closed; reconnecting");
-                attempt = 0;
-            }
-            Err(e) => {
-                crate::hlog!("hub: relay socket failed: {}", redact(&e, &cfg.token));
-                attempt = attempt.saturating_add(1);
-            }
+        let opened = tokio::time::Instant::now();
+        let outcome = serve_once(&rt, &cfg).await;
+        let lived = opened.elapsed();
+        match &outcome {
+            Ok(()) => crate::hlog!("hub: relay socket closed; reconnecting"),
+            Err(e) => crate::hlog!("hub: relay socket failed after {}s: {}", lived.as_secs(), redact(e, &cfg.token)),
         }
+        attempt = next_attempt(attempt, lived, outcome.is_ok());
         tokio::time::sleep(Duration::from_secs(backoff_secs(attempt))).await;
     }
 }
@@ -308,12 +383,45 @@ pub async fn run(rt: Shared) {
 const PING_EVERY: Duration = Duration::from_secs(10);
 const SILENCE_LIMIT: Duration = Duration::from_secs(35);
 
+/// HOW OFTEN THE NONCE PING GOES OUT, and how many echoes may be missed before the socket is dead.
+///
+/// ⚠️ THE CADENCE IS THE CLOUD SESSION'S CALL — these two constants are the whole knob, deliberately
+/// named and deliberately adjacent, so changing the number is a one-line edit with no other
+/// consequence. Two cadences were argued: 5 min (≈11 min to detect a half-open socket) and 60 s
+/// (≈3 min). SHIPPED: 120 s with 3 missed echoes, ≈6 minutes, decided 2026-09-24 on cost — a nonce
+/// ping is an inbound WebSocket message, which does NOT hit the auto-response pair and therefore
+/// WAKES the Durable Object, and 60 s would add ~1,440 wakes a day for one hub, tripling idle DO
+/// usage. 6 minutes is judged an acceptable bound for a failure mode that is rare now, against a
+/// valve-command path where "no hub took that command" is the visible cost of detecting it late.
+///
+/// Three missed echoes, not one, for the same reason as SILENCE_LIMIT: a single lost frame on a
+/// marina's Wi-Fi is not a dead socket, and reconnecting on every hiccup would be its own outage.
+pub const NONCE_PING_EVERY: Duration = Duration::from_secs(120);
+pub const NONCE_MISSES_ALLOWED: u32 = 3;
+/// The silence the nonce heartbeat allows: NONCE_MISSES_ALLOWED intervals.
+pub const NONCE_SILENCE_LIMIT: Duration = Duration::from_secs(NONCE_PING_EVERY.as_secs() * NONCE_MISSES_ALLOWED as u64);
+
 /// PURE: has the peer gone silent long enough to call the socket dead?
 ///
 /// Split out because the rule lives inside a `select!` arm, which no test can reach — and a
 /// liveness check nothing verifies is how the original "answer pings, never send one" survived.
 pub fn relay_is_silent(silent_for: Duration, limit: Duration) -> bool {
     silent_for > limit
+}
+
+/// PURE: has the OBJECT gone silent, as opposed to the edge? (D15.)
+///
+/// BACKWARD COMPATIBLE IN BOTH DIRECTIONS, and this predicate is where that lives:
+///   * Against a worker that NEVER echoes a nonce (any worker before the wan-state-log release),
+///     `echoed` stays false for the whole connection and this rule never fires. The hub falls back
+///     to exactly today's behaviour — the 10 s ping and the 35 s any-TEXT silence limit — so an old
+///     worker costs nothing but the stronger check.
+///   * Against the new worker, the first echo proves it speaks nonces, and from then on the
+///     connection is held to it: a socket whose pings are being answered only by the runtime stops
+///     producing echoes, and ~3 minutes later the hub reconnects. A 0.3.53 daemon, which never
+///     sends `n`, is unaffected: the new worker answers its plain ping exactly as before.
+pub fn nonce_is_silent(echoed: bool, since_last_echo: Duration, limit: Duration) -> bool {
+    echoed && since_last_echo > limit
 }
 
 /// One connection's lifetime. `Ok` means a clean close; `Err` carries a reason worth backing off for.
@@ -333,6 +441,16 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // the first tick fires immediately; we want a full interval of grace
     let mut last_seen = tokio::time::Instant::now();
+
+    // The nonce heartbeat (D15) — a second, slower timer beside the 10 s one. `nonce_echoed` is the
+    // back-compat switch: until this worker has echoed once, the nonce limit is not enforced.
+    let mut nonce_ping = tokio::time::interval(NONCE_PING_EVERY);
+    nonce_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    nonce_ping.tick().await;
+    let mut nonce_seq: u64 = 0;
+    let mut pending_nonce: Option<String> = None;
+    let mut nonce_echoed = false;
+    let mut last_nonce_echo = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -357,7 +475,16 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
                 };
                 let Some(msg) = parse_worker_message(&text) else { continue };
                 match msg {
-                    WorkerMessage::Pong => { /* liveness already recorded above; nothing else to do */ }
+                    WorkerMessage::Pong { n } => {
+                        // Any TEXT already counted for `last_seen` above. A pong that echoes the
+                        // nonce we last sent is the stronger fact: the OBJECT ran. From the first
+                        // such echo this connection is held to the nonce limit as well.
+                        if n.is_some() && n == pending_nonce {
+                            nonce_echoed = true;
+                            last_nonce_echo = tokio::time::Instant::now();
+                            pending_nonce = None;
+                        }
+                    }
                     WorkerMessage::Keys(keys) => {
                         crate::hlog!("hub: member keys pushed ({})", keys.len());
                         apply_keys(rt, keys).await;
@@ -388,6 +515,21 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
                 // a hibernating object's control PINGs are answered by the edge instead — see
                 // app_ping_frame and the `Message::Text` liveness rule above.
                 within(WRITE_TIMEOUT, "ping write", write.send(Message::Text(app_ping_frame()))).await?;
+            }
+            _ = nonce_ping.tick() => {
+                // ⚠️ CHECK BEFORE SENDING, for the same reason as above. This is the check the plain
+                // ping can no longer make: the runtime auto-answers `{"type":"ping"}` without the
+                // object, so only a matching nonce echo says the object is still there.
+                if nonce_is_silent(nonce_echoed, last_nonce_echo.elapsed(), NONCE_SILENCE_LIMIT) {
+                    return Err(format!(
+                        "the relay object stopped echoing nonce pings for {}s - treating the socket as dead and reconnecting",
+                        last_nonce_echo.elapsed().as_secs()
+                    ));
+                }
+                nonce_seq = nonce_seq.wrapping_add(1);
+                let n = next_nonce(nonce_seq);
+                within(WRITE_TIMEOUT, "nonce ping write", write.send(Message::Text(nonce_ping_frame(&n)))).await?;
+                pending_nonce = Some(n);
             }
         }
     }
@@ -439,6 +581,73 @@ mod tests {
         assert_eq!(backoff_secs(u32::MAX), MAX_BACKOFF_SECS); // no overflow, no zero-length wait
     }
 
+    /// D9 — THE COUNTER NEVER RESET ON A FAILURE, so a hub that had been up for hours paid the 60 s
+    /// cap on the reset that followed. CENTRAL: 78 resets in five days, each one a ~61 s NO_HUB window.
+    #[test]
+    fn a_connection_that_really_lived_starts_the_backoff_over() {
+        // A run of failing handshakes still climbs — that is what backoff is for.
+        let mut attempt = 0;
+        for expected in [1, 2, 3, 4] {
+            attempt = next_attempt(attempt, Duration::from_secs(2), false);
+            assert_eq!(attempt, expected);
+        }
+        assert_eq!(backoff_secs(attempt), 16, "four failed handshakes in a row: back off");
+
+        // 🔴 And then a connection that LIVED. The next failure starts at one second, not sixty.
+        let after = next_attempt(attempt, BACKOFF_RESET_AFTER, false);
+        assert_eq!(after, 0);
+        assert_eq!(backoff_secs(after), 1, "a reset after a real connection costs a second, not a minute");
+        assert_eq!(next_attempt(9, Duration::from_secs(7200), false), 0, "two hours, then an edge reset");
+
+        // The boundary, and the case it must not swallow: a handshake that wedges just under it.
+        assert_eq!(next_attempt(5, BACKOFF_RESET_AFTER - Duration::from_millis(1), false), 6, "59.999 s is not a connection");
+        assert_eq!(next_attempt(5, Duration::ZERO, false), 6);
+        // A clean close has always reset, and still does, however short it was.
+        assert_eq!(next_attempt(5, Duration::ZERO, true), 0);
+    }
+
+    /// D15 — the nonce heartbeat. The plain ping is auto-answered by the Cloudflare runtime, so it
+    /// no longer proves the object is running; only an echoed nonce does.
+    #[test]
+    fn a_nonce_ping_cannot_be_answered_by_the_auto_response_pair() {
+        let n = next_nonce(1);
+        let frame = nonce_ping_frame(&n);
+        // 🔴 The auto-response compares the request string BYTE FOR BYTE (hubRelay.ts APP_PING_FRAME).
+        assert_ne!(frame, app_ping_frame(), "a nonce ping must never equal the auto-answered frame");
+        assert_eq!(app_ping_frame(), r#"{"type":"ping"}"#, "and the plain ping's bytes are pinned by a drift check");
+        // It is still a ping the worker's own parser reads, and it carries the nonce.
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
+        assert_eq!(parsed["type"], "ping");
+        assert_eq!(parsed["n"], n.as_str());
+        // 🔴 The worker echoes `n` ONLY when it matches ^[A-Za-z0-9]{1,64}$ and otherwise answers a
+        // BARE pong — which would leave `nonce_echoed` false forever and silently un-prove liveness.
+        for c in [1u64, 2, 7, 4096, u64::MAX] {
+            let n = next_nonce(c);
+            assert!(!n.is_empty(), "an empty nonce is no nonce");
+            assert!(n.chars().count() <= NONCE_MAX_CHARS, "inside the worker's 64-char cap: {n}");
+            assert!(n.chars().all(|c| c.is_ascii_alphanumeric()), "the worker's accepted shape: {n}");
+        }
+        assert_ne!(next_nonce(2), next_nonce(3), "a repeated nonce would be a static frame again");
+    }
+
+    #[test]
+    fn only_an_echo_of_the_nonce_we_sent_counts_as_the_objects_proof_of_life() {
+        assert_eq!(parse_worker_message(r#"{"type":"pong","n":"abc123"}"#), Some(WorkerMessage::Pong { n: Some("abc123".into()) }));
+        assert_eq!(parse_worker_message(r#"{"type":"pong","n":""}"#), Some(WorkerMessage::Pong { n: None }), "an empty echo is no echo");
+        assert_eq!(parse_worker_message(r#"{"type":"pong"}"#), Some(WorkerMessage::Pong { n: None }), "the auto-response's pong");
+
+        // The rule the select! arm applies, and the back-compat switch inside it.
+        let limit = NONCE_SILENCE_LIMIT;
+        assert!(!nonce_is_silent(false, Duration::from_secs(86_400), limit), "a worker that never echoed is never held to it");
+        assert!(!nonce_is_silent(true, limit, limit), "exactly at the limit is still alive");
+        assert!(nonce_is_silent(true, limit + Duration::from_secs(1), limit));
+        // The cadence pair, stated: three missed echoes, ~3 minutes to notice a half-open socket.
+        assert_eq!(NONCE_PING_EVERY, Duration::from_secs(120));
+        assert_eq!(NONCE_MISSES_ALLOWED, 3);
+        assert_eq!(NONCE_SILENCE_LIMIT, NONCE_PING_EVERY * NONCE_MISSES_ALLOWED, "the limit IS the misses, not a second number");
+        assert!(NONCE_SILENCE_LIMIT > NONCE_PING_EVERY, "one lost frame is not a dead socket");
+    }
+
     #[test]
     fn a_pushed_key_set_is_read_including_an_empty_one() {
         assert_eq!(
@@ -455,7 +664,7 @@ mod tests {
         // The frame whose ARRIVAL is the whole point: only the live object sends it, so it, not a
         // control-frame PONG, is what the liveness check trusts. Losing this parse would silently
         // reopen the half-open outage — a pong would fall through to "unknown frame" and be ignored.
-        assert_eq!(parse_worker_message(r#"{"type":"pong"}"#), Some(WorkerMessage::Pong));
+        assert_eq!(parse_worker_message(r#"{"type":"pong"}"#), Some(WorkerMessage::Pong { n: None }));
     }
 
     #[test]

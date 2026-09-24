@@ -287,6 +287,11 @@ pub struct DishStatus {
     /// Hub-internal: router_health counts an outage the dish measured past the grace window at once.
     #[serde(skip)]
     pub outage_ms: Option<i64>,
+    /// The raw DishOutage.Cause behind `outage`. Hub-internal (`outage` carries its label on the
+    /// wire): `is_link_outage` reads this to decide whether the WAN is down or the DISH is merely
+    /// busy with itself. Some(0) is an outage whose cause the dish did not give.
+    #[serde(skip)]
+    pub outage_cause: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
     /// Ping loss to the point of presence, percent.
@@ -367,6 +372,7 @@ pub fn parse_status(r: &pb::DishGetStatusResponse) -> DishStatus {
         obstructed: obs.and_then(|o| o.currently_obstructed),
         outage: r.outage.as_ref().map(|o| outage_label(o.cause.unwrap_or(0)).to_string()),
         outage_ms: r.outage.as_ref().and_then(|o| o.duration_ns).map(|ns| i64::try_from(ns / 1_000_000).unwrap_or(i64::MAX)),
+        outage_cause: r.outage.as_ref().map(|o| o.cause.unwrap_or(0)),
         latency_ms: f(r.pop_ping_latency_ms).map(round1),
         loss_pct: f(r.pop_ping_drop_rate).map(|n| round1(n * 100.0)),
         down_mbps: f(r.downlink_throughput_bps).map(|n| round1(n / 1_000_000.0)),
@@ -395,10 +401,39 @@ pub fn parse_probe(info: &pb::DeviceInfo) -> Probe {
     }
 }
 
-/// PURE: the uplink the dish IS. Up means not in an outage — every outage cause (booting, no
-/// satellites, obstructed, stowed…) reads as down, which is what the Connectivity page needs.
+/// THE OUTAGE CAUSES THAT ARE A WAN OUTAGE — the one table, and the only place `up=0` is decided
+/// for a dish.
+///
+/// ⚠️ THE OWNER'S RULING ON THIS SPLIT IS PENDING. Jonathan, 2026-09-24: "the way you are measuring
+/// up/down on routers is wrong. It's too aggressive and not actually logging the state." Until he
+/// rules on the wording and the split, this table is deliberately conservative: only a cause that
+/// means THERE IS NO PATH TO THE INTERNET sets `up=0`. Everything else is the DISH's own condition
+/// and is reported as such — the `outage` param still carries the label, exactly as before, so
+/// nothing is hidden; the dish simply stops claiming the WAN went down because it was booting.
+///
+/// A WAN outage (this table):
+///   5 no satellites, 6 obstructed, 7 no downlink, 8 no pings — the dish has no usable path.
+///
+/// A DISH CONDITION, reported without `up=0`:
+///   1 booting, 2 stowed, 3 thermal shutdown, 4 no schedule, 9 actuator activity, 10 cable test,
+///   11 sleeping, 13 sky search, 14 RF inhibited.
+///
+/// AND AN UNRECOGNISED CAUSE IS NOT A LINK OUTAGE either — the ruling is that down needs positive
+/// evidence, so a cause code this hub has never seen (including the dish reporting an outage with
+/// no cause at all, `Some(0)`) reports its label without asserting the WAN is down.
+pub const LINK_OUTAGE_CAUSES: &[i32] = &[5, 6, 7, 8];
+
+/// PURE: does this DishOutage.Cause mean the WAN is down? See LINK_OUTAGE_CAUSES.
+pub fn is_link_outage(cause: i32) -> bool {
+    LINK_OUTAGE_CAUSES.contains(&cause)
+}
+
+/// PURE: the uplink the dish IS. Down ONLY on a cause in LINK_OUTAGE_CAUSES; a dish condition
+/// (booting, stowed, sleeping, moving, thermally shut down…) reports its `outage` label with the
+/// WAN still up. See that table for why, and for the pending owner ruling.
 pub fn wan_of(d: &DishStatus) -> WanStatus {
-    WanStatus { wan: "starlink".into(), up: d.outage.is_none(), ip: None, uptime_s: None }
+    let up = !d.outage_cause.is_some_and(is_link_outage);
+    WanStatus { wan: "starlink".into(), up, up_known: true, ip: None, uptime_s: None }
 }
 
 /// PURE: `get_location` → a fix, or None when the dish has no valid position yet. The dish reports
@@ -657,7 +692,7 @@ pub(crate) mod tests {
         assert_eq!(d.signal_pct, Some(100.0));
         assert_eq!(d.alerts, vec!["lower signal than predicted".to_string()]);
         assert_eq!((d.gps_valid, d.gps_sats), (Some(true), Some(25)));
-        assert_eq!(wan_of(&d), WanStatus { wan: "starlink".into(), up: true, ip: None, uptime_s: None });
+        assert_eq!(wan_of(&d), WanStatus { wan: "starlink".into(), up: true, up_known: true, ip: None, uptime_s: None });
     }
 
     #[test]
@@ -677,6 +712,59 @@ pub(crate) mod tests {
         let bare = parse_status(&pb::DishGetStatusResponse::default());
         assert_eq!(bare, DishStatus::default());
         assert!(wan_of(&bare).up, "no outage reported is up — the dish says so by omission");
+    }
+
+    /// D5 — A DISH CONDITION IS NOT A WAN OUTAGE. Every cause used to set `up=0`.
+    #[test]
+    fn only_a_genuine_link_outage_takes_the_wan_down_a_dish_condition_does_not() {
+        let with_cause = |cause: i32, ns: Option<u64>| {
+            let mut s = bench_status();
+            s.outage = Some(pb::DishOutage { cause: Some(cause), start_timestamp_ns: None, duration_ns: ns, did_switch: None });
+            parse_status(&s)
+        };
+        // The genuine ones: no path to the internet.
+        for cause in LINK_OUTAGE_CAUSES {
+            let d = with_cause(*cause, None);
+            assert!(!wan_of(&d).up, "cause {cause} ({}) is a WAN outage", outage_label(*cause));
+            assert!(is_link_outage(*cause));
+        }
+        // 🔴 The dish's OWN conditions. Every one of these reported the WAN down until 0.3.54.
+        for cause in [1, 2, 3, 4, 9, 10, 11, 13, 14] {
+            let d = with_cause(cause, None);
+            let label = outage_label(cause);
+            assert!(wan_of(&d).up, "cause {cause} ({label}) is the dish's condition, not a link outage");
+            assert!(!is_link_outage(cause));
+            // And it is STILL REPORTED — nothing is hidden, the dish just stops claiming a WAN down.
+            assert_eq!(d.outage.as_deref(), Some(label), "the cause is reported exactly as before");
+            let params = crate::routers::dish_params(&d, &wan_of(&d), None);
+            assert!(params.contains(&("outage".to_string(), label.to_string())), "{params:?}");
+            assert_eq!(params.iter().find(|(k, _)| k == "up").map(|(_, v)| v.as_str()), Some("1"));
+        }
+        // A cause this hub has never met, and an outage with no cause at all: not link outages.
+        assert!(wan_of(&with_cause(99, None)).up, "an unrecognised cause is not evidence of a down link");
+        let mut s = bench_status();
+        s.outage = Some(pb::DishOutage { cause: None, start_timestamp_ns: None, duration_ns: None, did_switch: None });
+        let d = parse_status(&s);
+        assert_eq!(d.outage_cause, Some(0));
+        assert!(wan_of(&d).up, "an outage the dish did not explain is not a WAN down");
+
+        // THE GRACE SHORTCUT (router_health: a dish-measured outage ≥ 45 s skips the window) can no
+        // longer be reached by a dish condition, because a dish condition never produces `up=0`.
+        let booting = with_cause(1, Some(600_000_000_000)); // ten minutes of "booting"
+        assert_eq!(booting.outage_ms, Some(600_000));
+        let params = crate::routers::dish_params(&booting, &wan_of(&booting), None);
+        assert_eq!(
+            crate::router_health::sample_of(Some(&params), booting.outage_ms),
+            crate::router_health::Sample::Up,
+            "a ten-minute boot does not bypass the grace window, because it is not a down sample at all"
+        );
+        // A genuine one still does, which is what the shortcut is for.
+        let starved = with_cause(5, Some(600_000_000_000));
+        let params = crate::routers::dish_params(&starved, &wan_of(&starved), None);
+        assert_eq!(
+            crate::router_health::sample_of(Some(&params), starved.outage_ms),
+            crate::router_health::Sample::ReportedDown { measured_ms: Some(600_000) }
+        );
     }
 
     #[test]

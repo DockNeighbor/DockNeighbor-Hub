@@ -108,21 +108,67 @@ pub fn parse_firmware(body: &Value) -> Option<String> {
         .and_then(|v| str_of(v.get("version")))
 }
 
-/// The WAN map: every object value except `order` (the display ordering array).
+/// The WAN map, IN THE ROUTER'S OWN ORDER. `order` is the documented display-ordering array of WAN
+/// ids (Router API, WAN_Status_Obj) and it is what the router's own UI reads first, so the hub
+/// follows it rather than picking whichever entry a hash map happened to yield first (D3). Ids in
+/// `order` may be numbers or strings; an id `order` names but the map does not carry is skipped,
+/// and any object the map carries that `order` did not name is appended after them, so a firmware
+/// that omits `order` — or omits an entry from it — still reports everything.
 fn wan_entries(r: &Value) -> Vec<&Value> {
-    r.as_object()
-        .map(|m| m.iter().filter(|(k, v)| k.as_str() != "order" && v.is_object()).map(|(_, v)| v).collect())
-        .unwrap_or_default()
+    let Some(map) = r.as_object() else { return Vec::new() };
+    let mut named: Vec<String> = Vec::new();
+    if let Some(order) = r.get("order").and_then(|v| v.as_array()) {
+        for id in order {
+            let key = match id {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            if map.get(&key).is_some_and(|v| v.is_object()) && !named.contains(&key) {
+                named.push(key);
+            }
+        }
+    }
+    let mut out: Vec<&Value> = named.iter().filter_map(|k| map.get(k)).collect();
+    out.extend(map.iter().filter(|(k, v)| k.as_str() != "order" && v.is_object() && !named.contains(k)).map(|(_, v)| v));
+    out
 }
 
-/// "Connected" is `statusLed: 'green'` or a message starting `Connected` — firmware varies, so
-/// both are accepted.
+/// PEPLINK WAN STATE, CLASSIFIED — the one table, and the only place a Peplink's down is decided.
+///
+/// 🔴 D3, owner ruling 2026-09-24. This used to be a BOOLEAN: `statusLed == "green" || message
+/// starts with "Connected"`, and everything else — a yellow LED, "Connecting...", "Obtaining IP
+/// address", a firmware that spells the LED differently, a WAN entry with neither field — was
+/// DOWN. The absence of a green LED is not evidence of disconnection. Down now needs the router to
+/// SAY it.
+///
+/// The documented fields (Router API, fw 8.0.1–8.5.2, WAN_Status_Obj): `statusLed` is the colour
+/// the router's own dashboard shows, `message` is the human sentence beside it.
+///
+/// * `Some(true)` — a green LED, or a message that begins "connected".
+/// * `Some(false)` — a red LED, or a message the router uses for a link that IS disconnected.
+/// * `None` — anything else: a yellow/amber LED (connecting, or up on a backup), a message this
+///   hub does not recognise, or an entry that carries neither field. Unknown, and never a down.
+const PEPLINK_DOWN_LED: &[&str] = &["red"];
+const PEPLINK_DOWN_MESSAGES: &[&str] = &["disconnected", "disabled", "no cable detected", "cable detached", "no cable", "disconnecting"];
+
+pub fn wan_state(w: &Value) -> Option<bool> {
+    let led = w.get("statusLed").and_then(|v| v.as_str()).map(|s| s.trim().to_ascii_lowercase());
+    let msg = w.get("message").and_then(|v| v.as_str()).map(|s| s.trim().to_ascii_lowercase());
+    if led.as_deref() == Some("green") || msg.as_deref().is_some_and(|m| m.starts_with("connected")) {
+        return Some(true);
+    }
+    if led.as_deref().is_some_and(|l| PEPLINK_DOWN_LED.contains(&l)) {
+        return Some(false);
+    }
+    if msg.as_deref().is_some_and(|m| PEPLINK_DOWN_MESSAGES.iter().any(|d| m.starts_with(d))) {
+        return Some(false);
+    }
+    None
+}
+
 fn is_up(w: &Value) -> bool {
-    w.get("statusLed").and_then(|v| v.as_str()) == Some("green")
-        || w.get("message")
-            .and_then(|v| v.as_str())
-            .map(|m| m.to_ascii_lowercase().starts_with("connected"))
-            .unwrap_or(false)
+    wan_state(w) == Some(true)
 }
 
 /// `GET /api/status.wan.connection` → the ACTIVE uplink, classified by its `type`.
@@ -132,7 +178,11 @@ pub fn parse_wan(body: &Value) -> Option<WanStatus> {
         return None;
     }
     let Some(w) = entries.iter().copied().find(|w| is_up(w)) else {
-        return Some(WanStatus { wan: "none".into(), up: false, ip: None, uptime_s: None });
+        // Nothing is connected. DOWN ONLY IF EVERY ENTRY SAID SO (D3): one WAN the router described
+        // in words this hub does not recognise makes the whole read unreadable — `up_known: false`
+        // — rather than a router reported down because no LED happened to be green.
+        let up_known = entries.iter().all(|w| wan_state(w) == Some(false));
+        return Some(WanStatus { wan: "none".into(), up: false, up_known, ip: None, uptime_s: None });
     };
     let t = w.get("type").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
     let wan = if t.contains("cellular") || t.contains("modem") {
@@ -146,7 +196,7 @@ pub fn parse_wan(body: &Value) -> Option<WanStatus> {
     // It is taken from the CONNECTED entry only: the documented example gives a disconnected WAN
     // ("No Cable Detected") an uptime too, which is not a connection uptime.
     let uptime_s = w.get("uptime").and_then(as_f64).filter(|n| *n >= 0.0).map(|n| n as u64);
-    Some(WanStatus { wan: wan.into(), up: true, ip: str_of(w.get("ip")), uptime_s })
+    Some(WanStatus { wan: wan.into(), up: true, up_known: true, ip: str_of(w.get("ip")), uptime_s })
 }
 
 /// Cellular detail from the same payload — Peplink nests it under `cellular`. None on a model
@@ -173,7 +223,10 @@ pub fn parse_modem(body: &Value) -> Option<ModemStatus> {
         rsrp: level("rsrp"),
         rsrq: level("rsrq"),
         sinr: level("sinr"),
-        connected: Some(is_up(entry)),
+        // Tri-state (D3): None is a cellular WAN the router described in words this hub does not
+        // recognise — unknown, not a modem that is down. `uplink_up` turns that into an unreadable
+        // snapshot, reported with `upSrc=unread`.
+        connected: wan_state(entry),
         ip: str_of(entry.get("ip")),
         // Usage lives in InControl2, not the local API — no counters, so no dataMb / plan burn.
         tx_bytes: None,
@@ -406,7 +459,7 @@ mod tests {
     #[test]
     fn wan_picks_the_active_uplink_and_classifies_it() {
         let w = parse_wan(&json!({ "stat": "ok", "response": { "1": wired(), "2": down_cell(), "order": [1, 2] } })).unwrap();
-        assert_eq!(w, WanStatus { wan: "wired".into(), up: true, ip: Some("10.0.0.5".into()), uptime_s: None });
+        assert_eq!(w, WanStatus { wan: "wired".into(), up: true, up_known: true, ip: Some("10.0.0.5".into()), uptime_s: None });
     }
 
     #[test]
@@ -419,9 +472,51 @@ mod tests {
 
     #[test]
     fn wan_reports_none_when_nothing_is_up_and_nothing_without_a_map() {
-        assert_eq!(parse_wan(&json!({ "response": { "1": down_cell() } })).unwrap(), WanStatus { wan: "none".into(), up: false, ip: None, uptime_s: None });
+        assert_eq!(parse_wan(&json!({ "response": { "1": down_cell() } })).unwrap(), WanStatus { wan: "none".into(), up: false, up_known: true, ip: None, uptime_s: None });
         assert!(parse_wan(&json!({ "response": {} })).is_none());
         assert!(parse_wan(&json!(null)).is_none());
+    }
+
+    /// D3 — DOWN NEEDS THE ROUTER TO SAY SO. The absence of a green LED is not evidence.
+    #[test]
+    fn a_peplink_is_down_only_on_positive_evidence_of_disconnection() {
+        assert_eq!(wan_state(&json!({ "statusLed": "green" })), Some(true));
+        assert_eq!(wan_state(&json!({ "message": "Connected to Verizon" })), Some(true), "the documented message wording");
+        assert_eq!(wan_state(&json!({ "statusLed": "red", "message": "Disconnected" })), Some(false));
+        assert_eq!(wan_state(&json!({ "message": "No Cable Detected" })), Some(false), "the documented disconnected message");
+        // 🔴 Every one of these used to be DOWN.
+        assert_eq!(wan_state(&json!({ "statusLed": "yellow", "message": "Connecting..." })), None, "on its way up is not down");
+        assert_eq!(wan_state(&json!({ "message": "Obtaining IP Address" })), None);
+        assert_eq!(wan_state(&json!({ "statusLed": "amber" })), None, "an LED colour this hub does not know");
+        assert_eq!(wan_state(&json!({ "name": "WAN 2", "type": "ethernet" })), None, "an entry with neither field");
+
+        // And the WAN read that follows from it: one unrecognised entry makes the READ unreadable.
+        let w = parse_wan(&json!({ "response": { "1": down_cell(), "2": { "statusLed": "yellow" }, "order": [1, 2] } })).unwrap();
+        assert_eq!((w.up, w.up_known), (false, false), "not a router reported down because no LED was green");
+        let w = parse_wan(&json!({ "response": { "1": down_cell(), "2": json!({ "message": "Disconnected" }), "order": [1, 2] } })).unwrap();
+        assert_eq!((w.up, w.up_known), (false, true), "every WAN said it: a real down");
+
+        // A cellular entry the router did not describe is an unknown modem, not a dead one.
+        let vague = json!({ "response": { "1": { "type": "cellular", "statusLed": "yellow", "cellular": { "simStatus": "SIM card is ready" } } } });
+        assert_eq!(parse_modem(&vague).unwrap().connected, None);
+    }
+
+    /// D3 — the ACTIVE uplink is picked through the documented `order` array, not through whatever
+    /// the JSON object's iteration order happened to be.
+    #[test]
+    fn the_wan_map_is_read_in_the_routers_documented_order() {
+        let a = json!({ "name": "WAN 1", "type": "ethernet", "statusLed": "green", "ip": "10.0.0.1" });
+        let b = json!({ "name": "WAN 2", "type": "cellular", "statusLed": "green", "ip": "100.64.0.2" });
+        let body = json!({ "response": { "1": a.clone(), "2": b.clone(), "order": [2, 1] } });
+        assert_eq!(parse_wan(&body).unwrap().wan, "lte", "`order` puts WAN 2 first, so WAN 2 is the active uplink");
+        let flipped = json!({ "response": { "1": a.clone(), "2": b.clone(), "order": [1, 2] } });
+        assert_eq!(parse_wan(&flipped).unwrap().wan, "wired", "and the other way round when `order` says so");
+        // String ids, an id `order` names but the map lacks, and an entry `order` forgot.
+        let strung = json!({ "response": { "wan1": a.clone(), "wan2": b.clone(), "order": ["wan2", "wan9"] } });
+        assert_eq!(parse_wan(&strung).unwrap().wan, "lte", "string ids resolve; a missing one is skipped");
+        assert_eq!(parse_wan(&strung).unwrap().ip.as_deref(), Some("100.64.0.2"));
+        let forgot = json!({ "response": { "1": a, "2": b, "order": [] } });
+        assert_eq!(wan_entries(payload(&forgot).unwrap()).len(), 2, "an empty `order` still reports every WAN");
     }
 
     #[test]
