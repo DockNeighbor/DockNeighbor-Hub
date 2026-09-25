@@ -36,6 +36,9 @@ HUB_LITE_GUARD="${BRVG_HUB_LITE_GUARD:-/etc/brvg-hub-lite.guard}"
 HUB_LITE_GUARD_INIT="${BRVG_HUB_LITE_GUARD_INIT:-/etc/init.d/brvg-hub-lite-guard}"
 HUB_LITE_ROOT="${BRVG_HUB_LITE_ROOT:-/}"
 HUB_LITE_PROBATION_SEC="${BRVG_HUB_LITE_PROBATION_SEC:-600}"
+# Tests only: don't touch procd. NOT BRVG_HUB_LITE_TEST: the /api/hub/update door runs self_update with that set
+# (to skip the main loop), and an update from the app must still start its guard.
+HUB_LITE_NO_SERVICE="${BRVG_HUB_LITE_NO_SERVICE:-}"
 
 # The LAST telemetry this hub-lite composed, as JSON, for the LAN management door to serve
 # (hub-lite-mgmt.sh). Written by the same code that reports to the cloud, so the two can never
@@ -1384,7 +1387,7 @@ restore_hub_lite() {
     return 1
   fi
   log "rolled back to the previous hub-lite ($1); restarting"
-  [ -z "$BRVG_HUB_LITE_TEST" ] && [ -x /etc/init.d/brvg-hub-lite ] &&
+  [ -z "$HUB_LITE_NO_SERVICE" ] && [ -x /etc/init.d/brvg-hub-lite ] &&
     (sleep 2; /etc/init.d/brvg-hub-lite restart) >/dev/null 2>&1 &
   return 0
 }
@@ -1466,7 +1469,7 @@ probation_start() {
   printf 'FROM=%s\nTO=%s\nDEADLINE=%s\n' "$1" "$2" "$(( $(date +%s) + HUB_LITE_PROBATION_SEC ))" > "$HUB_LITE_PROBATION"
   guard_script > "$HUB_LITE_GUARD" && chmod 0755 "$HUB_LITE_GUARD"
   guard_init > "$HUB_LITE_GUARD_INIT" && chmod 0755 "$HUB_LITE_GUARD_INIT"
-  [ -z "$BRVG_HUB_LITE_TEST" ] && { "$HUB_LITE_GUARD_INIT" enable; "$HUB_LITE_GUARD_INIT" start; } >/dev/null 2>&1
+  [ -z "$HUB_LITE_NO_SERVICE" ] && { "$HUB_LITE_GUARD_INIT" enable; "$HUB_LITE_GUARD_INIT" start; } >/dev/null 2>&1
   return 0
 }
 

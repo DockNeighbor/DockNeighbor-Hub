@@ -2639,6 +2639,7 @@ check "flood close is untouched by the cadence: the receiver still closes with t
 # The real self_update, guard and restore, against a temp root. opkg is a stub; "installing" writes a new
 # collector script whose --version says what the fake feed offers.
 W="$T/wd"; mkdir -p "$W"
+HUB_LITE_NO_SERVICE=1
 wd_reset() {
   rm -rf "$W"; mkdir -p "$W/root/usr/bin" "$W/root/www/brvg/api"
   printf '#!/bin/sh\necho 0.18.3\n' > "$W/root/usr/bin/brvg-hub-lite"; chmod 755 "$W/root/usr/bin/brvg-hub-lite"
@@ -2711,6 +2712,18 @@ self_update 2>/dev/null
 check "smoke check: a new version that can't report its version is rolled back at once" "0.18.3" "$("$W/root/usr/bin/brvg-hub-lite" --version)"
 check "smoke check: ...and skip-listed" "0.18.5" "$(cat "$W/skip")"
 check "smoke check: ...and never put on probation" "gone" "$([ -f "$W/probation" ] && echo present || echo gone)"
+
+# The /api/hub/update door runs self_update with BRVG_HUB_LITE_TEST=1 (to skip the main loop). The guard
+# service must still be enabled and started on that path: record what probation_start asks procd for.
+wd_reset; OFFER=0.18.4; NEWBODY='#!/bin/sh
+echo 0.18.4'
+(
+  HUB_LITE_NO_SERVICE=""; BRVG_HUB_LITE_TEST=1
+  # The init script probation_start writes is a recorder here, so "procd" is a log of what was asked of it.
+  guard_init() { printf '#!/bin/sh\necho "$1" >> "%s"\n' "$W/procd.log"; }
+  probation_start 0.18.3 0.18.4 2>/dev/null
+)
+check "self_update via the app's door (BRVG_HUB_LITE_TEST set): the guard is enabled AND started" "enable start" "$(tr '\n' ' ' < "$W/procd.log" 2>/dev/null | sed 's/ $//')"
 
 wd_reset; hub_lite_files() { :; }; OFFER=0.18.4
 check "self_update: no update without a way back (nothing to back up)" "1:0" "$(self_update 2>/dev/null; echo "$?:$(grep -c '^upgrade' "$W/opkg.log")")"
