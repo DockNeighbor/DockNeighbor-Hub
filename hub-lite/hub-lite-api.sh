@@ -566,10 +566,10 @@ case "$method:$verb" in
     authorize administer
     command -v opkg >/dev/null 2>&1 || fail 501 "remote update is not supported on this platform - reinstall from the app"
     [ -r "$BIN" ] || fail 500 "hub-lite not installed"
-    # setsid where it exists, so the service restart the update performs does not take the updater
-    # down with the uhttpd that spawned it.
-    _detach=""; command -v setsid >/dev/null 2>&1 && _detach=setsid
-    $_detach sh -c "BRVG_HUB_LITE_TEST=1 . \"$BIN\"; self_update" </dev/null >/dev/null 2>&1 &
+    # The one detached runner the cloud verb uses too (own session, off procd's pipes, logs to syslog), so the
+    # service restart the update performs can't take the updater down with the uhttpd that spawned it.
+    load_lib
+    run_detached self_update
     reply 200 '{"status":"update started"}'
     ;;
 
