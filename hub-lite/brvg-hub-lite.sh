@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.18.3"
+HUB_LITE_VERSION="0.18.4"
 # Self-update under a watchdog (0.18.3): see self_update. Every path overridable for hub-lite/test.sh.
 HUB_LITE_BACKUP="${BRVG_HUB_LITE_BACKUP:-/etc/brvg-hub-lite.prev.tgz}"   # every file of the running hub-lite
 HUB_LITE_LEGACY_BACKUP="/etc/brvg-hub-lite.prev"                      # the single-script backup before 0.18.3
@@ -2441,18 +2441,265 @@ lt_write_state() {
 # note_stop. Without it a flood close or a manual close classifies as `unknown` when the valve
 # shuts, and the cycle's end tells the owner nothing about why. No file means no running cycle:
 # nothing to mark, exactly like note_stop on an idle track.
+# ⚠️ THE PROFILE IS AN ARGUMENT ($3 duration, $4 cap), NOT A ZERO. This REWRITES the run, so loading it
+# against 0 does not merely misread an upgrade-era file (no `dur=`/`cap=` line, meaning "the profile's
+# Normal Run" — lt_load_state's fallback): it writes `cap=0` back, permanently erasing the run's only
+# volume limit. The caller knows the valve, so it can read the profile; nobody else can once this has run.
 lt_mark_stop() {
   [ -f "$1" ] || return 0
-  lt_load_state "$1" 0 0
+  lt_load_state "$1" "${3:-0}" "${4:-0}"
   [ "$_state" = "watering" ] || return 0
   lt_write_state "$1" watering "$_started" "$2" "$_mode" "$_dur_eff" "$_cap_eff" "$_prov" "$_resume" "$_handover"
+}
+
+# --- THE CLOSE: CONFIRM, THEN RETRY (parity port of daemon/src/close_watch.rs) ------------------
+#
+# 🔴 A CLOSE WAS ONE PACKET AND A HOPE, ON BOTH TIERS. Every `cmd 7` here judged success by whether
+# `lt_post` exited 0 — i.e. whether the GATEWAY ACCEPTED the request — and then stopped. The measured
+# failure mode is the gateway answering `ret: 0` on a command it never delivers to the valve over RF
+# (the reason `cycle.rs`'s 8 s stop latency exists at all). So:
+#   * the flood close sent one command per valve and spooled `ok=0` / `linktap.stop_failed` only when
+#     the POST failed. A `ret: 0` over a valve that kept running was recorded as a success.
+#   * the volume cut sent one command per poll and, when the POST failed, TOOK THE MARK BACK so the
+#     next poll could cut again — which patched the disarmed-cutoff hole at the cost of the run's
+#     classification, and still did nothing at all about an accepted command that did not land.
+#
+# Success is now the VALVE'S OWN REPORTED STATE (`is_watering` in its `cmd 3` status — the same field
+# and the same parse the tick already feeds the cycle machine), never the command's exit. Each valve
+# has at most one close in flight, recorded in `$LT_STATE_DIR/close.<dev>` so the RECEIVER CGI and the
+# main loop are looking at one fact across two processes, and `lt_drive_closes` (in linktap_tick)
+# confirms it, re-issues on the schedule, or gives up and tells the owner.
+
+# The schedule. 🔴 THE OWNER'S NUMBERS (Jonathan, 2026-09-24): "confirm within 10 s of issuing; if
+# unconfirmed, re-issue at 5 s, 10 s, 20 s, 40 s, then every 60 s; give up at 5 minutes from the first
+# attempt." Kept in lockstep with `close_watch::CloseSchedule::PRODUCTION`; overridable ONLY so
+# test.sh can reach the give-up boundary without waiting five minutes.
+#
+# ⚠️ The 5 s first retry fires during a HEALTHY close: the measured stop latency is ~8 s, so a valve
+# that is shutting normally still reads `is_watering: 1` at 5 s and takes a second `cmd 7`. One extra
+# idempotent command (a `cmd 7` to a shut valve is a no-op), and three seconds sooner on the case this
+# exists for. The owner owns the trade; it is written down rather than quietly adjusted.
+LT_CLOSE_CONFIRM_WITHIN="${LT_CLOSE_CONFIRM_WITHIN:-10}"
+LT_CLOSE_RETRY_AT="${LT_CLOSE_RETRY_AT:-5 10 20 40}"
+LT_CLOSE_EVERY="${LT_CLOSE_EVERY:-60}"
+LT_CLOSE_GIVE_UP="${LT_CLOSE_GIVE_UP:-300}"
+
+# ⚠️ CROSS-REPO CONTRACT — the same string in the daemon (close_watch::CLOSE_UNCONFIRMED_EVENT) and in
+# the worker (hubValveState.ts HUB_VALVE_CLOSE_UNCONFIRMED_EVENT). It carries no "flood", "leak" or
+# "alarm" (the worker's FLOOD_EVENT_RE is a SUBSTRING match that closes valves), does not end in
+# `_off`/`.off` (that reads as an ALL-CLEAR), and does not end in `.change`/`.measurement` (that reads
+# as never-pushed telemetry). See the daemon's constant for the full reasoning.
+LT_CLOSE_UNCONFIRMED_EVENT="linktap.valve.close_unconfirmed"
+
+# PURE: the run mark a close of this cause leaves, so the end classifies as what the hub DID.
+lt_close_end_reason() { case "$1" in flood) echo flood_shutoff ;; *) echo "$1" ;; esac; }
+
+# PURE: does a NEW close of cause $1 take over one in flight for cause $2? One in-flight close per
+# valve, with one exception: a FLOOD overrides, because the cause is what the owner is told about and
+# a failed flood shutoff must never be reported as a failed button press.
+lt_close_overrides() { [ "$1" = "flood" ] && [ "$2" != "flood" ]; }
+
+# PURE: elapsed seconds, from the FIRST attempt, at which attempt $1 (1-based) falls due. Attempt 1 is
+# the close itself; 2.. walk LT_CLOSE_RETRY_AT and then go every LT_CLOSE_EVERY from the last of them.
+lt_close_due_at() {
+  [ "${1:-1}" -le 1 ] && { echo 0; return 0; }
+  _cd_want=$(( $1 - 1 ))
+  _cd_i=0; _cd_last=0
+  for _cd_o in $LT_CLOSE_RETRY_AT; do
+    _cd_i=$(( _cd_i + 1 )); _cd_last="$_cd_o"
+    [ "$_cd_i" -eq "$_cd_want" ] && { echo "$_cd_o"; return 0; }
+  done
+  echo $(( _cd_last + ( _cd_want - _cd_i ) * LT_CLOSE_EVERY ))
+}
+
+# PURE: what to do about one unconfirmed close. $1 first  $2 last  $3 tries  $4 watering(0/1)  $5 now.
+# Prints confirmed|gave_up|reissue|wait.
+#
+# ORDER IS LOAD-BEARING, and it is `cycle`'s doctrine — what we can SEE outranks what we planned:
+# CONFIRMED first (a valve that reports itself shut ends the sequence whatever the clock says), then
+# GIVE UP (so a retry falling due exactly at the boundary does not send one more command on the way
+# out), and only then a re-issue.
+lt_close_step() {
+  [ "$4" = "1" ] || { echo confirmed; return 0; }
+  _cs_el=$(( $5 - $1 )); [ "$_cs_el" -lt 0 ] && _cs_el=0
+  [ "$_cs_el" -ge "$LT_CLOSE_GIVE_UP" ] && { echo gave_up; return 0; }
+  if [ "$_cs_el" -ge "$(lt_close_due_at $(( $3 + 1 )))" ]; then echo reissue; else echo wait; fi
+}
+
+# PURE: seconds until this close must be looked at again. $1 first  $2 last  $3 tries  $4 now.
+# The smaller of "the next re-issue falls due" and "this issue's confirm deadline expires", so every
+# command is answered inside LT_CLOSE_CONFIRM_WITHIN even out where the re-issues are a minute apart.
+#
+# ⚠️ A DEADLINE ALREADY PAST IS NOT A DEADLINE. Keeping a spent confirm deadline in the minimum pins
+# the answer at "now" and the poll loop spins — a poll storm produced by the bound meant to prevent
+# one. (Found by the daemon's own test, which asked for 50 and got 0.)
+lt_close_next_look() {
+  _cn_t=$(( $1 + $(lt_close_due_at $(( $3 + 1 ))) ))
+  _cn_conf=$(( $2 + LT_CLOSE_CONFIRM_WITHIN ))
+  [ "$_cn_conf" -gt "$4" ] && [ "$_cn_conf" -lt "$_cn_t" ] && _cn_t="$_cn_conf"
+  _cn_give=$(( $1 + LT_CLOSE_GIVE_UP ))
+  [ "$_cn_give" -lt "$_cn_t" ] && _cn_t="$_cn_give"
+  _cn_s=$(( _cn_t - $4 )); [ "$_cn_s" -lt 1 ] && _cn_s=1
+  echo "$_cn_s"
+}
+
+# PURE: the VALVE'S OWN answer to "are you still running" out of a cmd 3 reply — 1 open, 0 shut, and
+# EMPTY when the reply does not say (daemon linktap::watering_from_status).
+#
+# 🔴 EMPTY IS NOT 0, AND THE DIFFERENCE IS THE WHOLE VALUE OF THIS FUNCTION. A timeout, a non-2xx, junk
+# or a `ret: 5` (this gateway cannot reach that valve over RF) tells us NOTHING about the valve, and
+# "nothing" resolved as "shut" would confirm a close that never happened — silently, and in the
+# direction of looking correct. Callers read empty as STILL OPEN and keep trying.
+lt_watering_from_status() {
+  awk '
+    { buf = buf $0 }
+    END {
+      if (buf !~ /"is_watering"[[:space:]]*:/) { printf ""; exit }
+      printf "%d", (buf ~ /"is_watering":[[:space:]]*(true|1|"true"|"1")/) ? 1 : 0
+    }'
+}
+
+# Load $LT_STATE_DIR/close.<dev> into _cl_cause _cl_first _cl_last _cl_tries. Non-zero when there is
+# no close in flight (or the record is unusable, which is treated the same way).
+lt_close_load() {
+  CL_CAUSE=""; CL_FIRST=""; CL_LAST=""; CL_TRIES=""
+  [ -f "$1" ] || return 1
+  # shellcheck disable=SC1090
+  . "$1"
+  case "${CL_FIRST:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "${CL_CAUSE:-}" ] || return 1
+  _cl_cause="$CL_CAUSE"
+  _cl_first="$CL_FIRST"
+  _cl_last="${CL_LAST:-$CL_FIRST}"
+  _cl_tries="${CL_TRIES:-1}"
+  return 0
+}
+
+# Record one close atomically. $1 file, then cause first last tries. Temp-and-move, like
+# lt_write_state: the receiver CGI and the poll loop are different processes reading the same file.
+lt_close_write() {
+  _cwf="$1.$$"
+  printf 'CL_CAUSE=%s\nCL_FIRST=%s\nCL_LAST=%s\nCL_TRIES=%s\n' "$2" "$3" "$4" "$5" > "$_cwf" 2>/dev/null \
+    && mv "$_cwf" "$1" 2>/dev/null
+  rm -f "$_cwf" 2>/dev/null
+  return 0
+}
+
+# THE ONE DOOR EVERY CLOSE PASSES THROUGH. $1 dev (normalised)  $2 cause (flood|volume_cap|manual).
+# Returns 0 ⇒ the caller sends `cmd 7` now; non-zero ⇒ a close is already in flight and its retry
+# sequence owns this valve, so a second concurrent command must NOT go out.
+#
+# Claims the slot and marks the run BEFORE the caller issues anything, in that order, deliberately: a
+# stop that lands while this process dies must still classify as ours rather than as an unexplained
+# close. The mark is no longer taken back on a failed POST — that is what the retry is for.
+lt_claim_close() {
+  mkdir -p "$LT_STATE_DIR" 2>/dev/null
+  _cc_f="$LT_STATE_DIR/close.$1"
+  if lt_close_load "$_cc_f"; then
+    if ! lt_close_overrides "$2" "$_cl_cause"; then
+      log "linktap: $1 - a $_cl_cause close is already in flight (attempt $_cl_tries) - not sending a second cmd 7"
+      return 1
+    fi
+    log "linktap: $1 - FLOOD close takes over the $_cl_cause close in flight"
+  fi
+  _cc_now=$(date +%s)
+  lt_close_write "$_cc_f" "$2" "$_cc_now" "$_cc_now" 1
+  lt_profile "$1"
+  lt_mark_stop "$LT_STATE_DIR/$1" "$(lt_close_end_reason "$2")" "$_p_dur" "$_p_cap"
+  return 0
+}
+
+# A close we GAVE UP on stops holding the software volume cutoff off — on a CAPPED run ONLY (the
+# daemon's note_stop_abandoned).
+#
+# 🔴 `stop=` DOES TWO JOBS, and the second is a safety interlock: `lt_decide` never cuts a run that
+# carries one. Marking a close and then never landing it would therefore disarm the only volume
+# enforcement there is for the rest of a run still passing water. ⚠️ A WASHDOWN KEEPS ITS MARK: it has
+# no cap, so releasing buys nothing, and it is the one mode lt_should_hand_over can reopen — which
+# would reprogram a valve we just failed to shut into a fresh run.
+# The profile is an argument ($2 duration, $3 cap) rather than a zero, for the same reason as
+# lt_mark_stop: a state file with no `cap=` line MEANS "the profile's Normal Run". ⚠️ NO TEST CAN TELL
+# THIS APART TODAY, and that is said out loud rather than left to look proven: every mark goes through
+# lt_claim_close → lt_mark_stop, which resolves the cap and writes it back, so by the time this runs the
+# file always carries one. It is defence against a future caller that marks a run some other way, not a
+# guard this suite exercises. (Mutation-checked 2026-09-24: zeroing it here leaves every test green.)
+lt_close_abandon() {
+  [ -f "$1" ] || return 0
+  lt_load_state "$1" "${2:-0}" "${3:-0}"
+  [ "$_state" = "watering" ] || return 0
+  [ -n "$_stop" ] || return 0
+  # A washdown is time-only by owner spec, so this is normally implied by the cap test below — but an
+  # upgrade-era file (mode=washdown, no cap= line) resolves to the PROFILE's cap, which is > 0. The
+  # mode is the fact that matters, so it is asked first and on its own.
+  [ "$_mode" = "washdown" ] && return 0
+  awk -v c="$_cap_eff" 'BEGIN{exit !(c > 0)}' || return 0
+  lt_write_state "$1" watering "$_started" "" "$_mode" "$_dur_eff" "$_cap_eff" "$_prov" "$_resume" "$_handover"
+  log "linktap: ${1##*/} - gave up closing; the volume cutoff is armed again for this run"
+}
+
+# Drive every unconfirmed close one step: ask the VALVE, then confirm, re-issue or give up. Sets
+# LT_CLOSE_LOOK to the seconds until the soonest next look ("" when nothing is closing), which the
+# main loop folds into its nap.
+lt_drive_closes() {
+  LT_CLOSE_LOOK=""
+  [ -d "$LT_STATE_DIR" ] || return 0
+  for _dc_f in "$LT_STATE_DIR"/close.*; do
+    [ -f "$_dc_f" ] || continue
+    _dc_d="${_dc_f##*/close.}"
+    [ -n "$_dc_d" ] || continue
+    lt_close_load "$_dc_f" || { rm -f "$_dc_f"; continue; }
+    _dc_cause="$_cl_cause"; _dc_first="$_cl_first"; _dc_last="$_cl_last"; _dc_tries="$_cl_tries"
+    # Unknown is "still open" (see lt_watering_from_status).
+    _dc_w=""
+    if _dc_reply=$(lt_post "{\"cmd\":3,\"gw_id\":\"$LINKTAP_GW_ID\",\"dev_id\":\"$_dc_d\"}" 10); then
+      _dc_w=$(printf '%s' "$_dc_reply" | lt_watering_from_status)
+    fi
+    [ -n "$_dc_w" ] || _dc_w=1
+    _dc_now=$(date +%s)
+    case "$(lt_close_step "$_dc_first" "$_dc_last" "$_dc_tries" "$_dc_w" "$_dc_now")" in
+      confirmed)
+        rm -f "$_dc_f"
+        log "linktap: ${_dc_d} - the valve reports CLOSED (${_dc_cause} close confirmed after ${_dc_tries} attempt(s))"
+        ;;
+      wait)
+        _dc_look=$(lt_close_next_look "$_dc_first" "$_dc_last" "$_dc_tries" "$_dc_now")
+        { [ -z "$LT_CLOSE_LOOK" ] || [ "$_dc_look" -lt "$LT_CLOSE_LOOK" ]; } && LT_CLOSE_LOOK="$_dc_look"
+        ;;
+      reissue)
+        _dc_tries=$(( _dc_tries + 1 ))
+        # Recorded before the command goes out, the same ordering as the first attempt — and it is
+        # also what stops a second pass re-sending the same attempt.
+        lt_close_write "$_dc_f" "$_dc_cause" "$_dc_first" "$_dc_now" "$_dc_tries"
+        if lt_post "$(linktap_stop_body "$LINKTAP_GW_ID" "$_dc_d")" 5 >/dev/null; then _dc_took="took it"; else _dc_took="refused it"; fi
+        log "linktap: ${_dc_d} - close not confirmed after $(( _dc_now - _dc_first ))s, re-issuing cmd 7 (attempt ${_dc_tries}) - gateway ${_dc_took}"
+        # Deliberately NO linktap.stop_failed per retry: the first attempt's failure is already
+        # reported by its caller, and one event per retry would be nine events per dead gateway.
+        _dc_look=$(lt_close_next_look "$_dc_first" "$_dc_now" "$_dc_tries" "$_dc_now")
+        { [ -z "$LT_CLOSE_LOOK" ] || [ "$_dc_look" -lt "$LT_CLOSE_LOOK" ]; } && LT_CLOSE_LOOK="$_dc_look"
+        ;;
+      gave_up)
+        rm -f "$_dc_f"
+        log "linktap: ${_dc_d} - GAVE UP closing the valve after ${_dc_tries} attempt(s) over $(( _dc_now - _dc_first ))s (${_dc_cause} close) - alerting the owner"
+        lt_profile "$_dc_d"
+        lt_close_abandon "$LT_STATE_DIR/$_dc_d" "$_p_dur" "$_p_cap"
+        # 🔴 THE OWNER'S ASK (Jonathan, 2026-09-24): "this also should tell the user if it was not able
+        # to close the valve during a flood event". Same alert for a volume-cutoff close and a manual
+        # one — that cutoff is the only volume enforcement there is, and a person who pressed Close was
+        # told it worked; `cause` is what tells them apart downstream.
+        lt_spool "lt_${_dc_d}" "$LT_CLOSE_UNCONFIRMED_EVENT" "cause=${_dc_cause}&attempts=${_dc_tries}&secs=$(( _dc_now - _dc_first ))"
+        ;;
+    esac
+  done
+  return 0
 }
 
 # Close every valve in $LINKTAP_DEV_IDS via http://$LINKTAP_HOST/api.shtml. No-op when LinkTap is
 # not configured, so every existing install is untouched. Each attempt spools a
 # linktap.flood_close.change line (rides the roll-up — visibility with zero new wire surface) and
-# logs locally; a failed close is spooled with ok=0 rather than retried here — the alarm itself is
-# already on its way to the cloud, and the worker's own flood path remains the escalation.
+# logs locally. ⚠️ `ok=1` MEANS "THE GATEWAY TOOK THE COMMAND", WHICH IS NOT "THE VALVE SHUT" — the
+# valve's own answer arrives on the next look (lt_drive_closes), which retries while it is still open
+# and spools LT_CLOSE_UNCONFIRMED_EVENT if it never shuts. The alarm itself is already on its way to
+# the cloud, and the worker's own flood path remains the escalation.
 #
 # ⚠️ NEVER PLAN-GATED, deliberately, exactly as the daemon's linktap_flood_stop_all: a close spends
 # no water, removes no limit and is idempotent, and the worst outcome of running it on a vehicle
@@ -2461,15 +2708,19 @@ lt_mark_stop() {
 #
 # Each close also marks the run `stop=flood_shutoff` (so the end classifies as flood_shutoff and a
 # washdown told to resume can never reopen), spools `linktap.stop_failed` with cause=flood when the
-# gateway did not take it (the daemon's event), and rings the poll loop to read the result back.
+# gateway did not take it (the daemon's event), and rings the poll loop to read the result back — which
+# is now also what drives the confirm-and-retry sequence the claim above opened.
 linktap_flood_close() {
   lt_configured || return 0
   for _d in $(printf '%s' "$LINKTAP_DEV_IDS" | tr ',' ' '); do
     _d=$(lt_norm_id "$_d")
     [ -n "$_d" ] || continue
-    # Marked BEFORE the command, like the daemon: if the stop lands and this process dies before
-    # it can write, the end must still read as ours rather than as an unexplained close.
-    lt_mark_stop "$LT_STATE_DIR/$_d" flood_shutoff
+    # Claims the valve's ONE in-flight close and marks the run flood_shutoff BEFORE the command — the
+    # same ordering this loop always had, and now also what makes the close confirmed against the
+    # valve's own state, retried on the schedule, and ALERTED if it never shuts (lt_drive_closes). A
+    # flood takes the slot over from a manual or volume close already being retried, so an alarm is
+    # never answered by silence; a flood close already in flight simply rides its own sequence.
+    lt_claim_close "$_d" flood || continue
     if lt_post "$(linktap_stop_body "$LINKTAP_GW_ID" "$_d")" 5 >/dev/null; then
       _ok=1
     else
@@ -2814,6 +3065,21 @@ lt_poll_hint() {
     _ph_until=$(( _ph_left - LT_HANDOVER_LEAD_SECS )); [ "$_ph_until" -lt 0 ] && _ph_until=0
     if [ -z "$_ph_best" ] || [ "$_ph_until" -lt "$_ph_best" ]; then _ph_best=$_ph_until; fi
   done
+  # A valve with an UNCONFIRMED CLOSE is the most time-critical thing this router can be holding, so
+  # its next look (lt_close_next_look, set by the last lt_drive_closes) wins over the handover window.
+  # ⚠️ NOT floored at 5 s with the rest: the first re-issue is due 5 s after the close and the confirm
+  # deadline is 10 s, so a floor applied AFTER this value would be harmless but a floor applied to a
+  # 1 s look would push the read past the deadline it exists to meet.
+  if [ -n "${LT_CLOSE_LOOK:-}" ]; then
+    if [ -n "$_ph_best" ]; then
+      [ "$_ph_best" -lt 5 ] && _ph_best=5
+      [ "$LT_CLOSE_LOOK" -lt "$_ph_best" ] && _ph_best="$LT_CLOSE_LOOK"
+      echo "$_ph_best"
+    else
+      echo "$LT_CLOSE_LOOK"
+    fi
+    return 0
+  fi
   [ -n "$_ph_best" ] || return 0
   [ "$_ph_best" -lt 5 ] && _ph_best=5
   echo "$_ph_best"
@@ -2997,6 +3263,12 @@ linktap_tick() {
   _unit=$(lt_unit)
   _lt_reached=""
 
+  # UNCONFIRMED CLOSES FIRST, and from whatever process claimed them: the receiver CGI's flood close
+  # and the LAN door's manual close both write `close.<dev>` and ring the wake, and this loop is what
+  # asks the valve whether it actually shut. Never plan-gated — LINKTAP_ALLOWED is not read on any
+  # closing path (a close spends no water and removes no limit), and neither is it here.
+  lt_drive_closes
+
   for _d in $(printf '%s' "$LINKTAP_DEV_IDS" | tr ',' ' '); do
     _d=$(lt_norm_id "$_d")
     [ -n "$_d" ] || continue
@@ -3030,19 +3302,25 @@ linktap_tick() {
         logger -t brvg-hub-lite "linktap: adopted a running cycle on ${_d} (Normal Run cap ${_p_cap}L)" 2>/dev/null || true
         ;;
       cut)
-        # Marked first, so the close that follows classifies against the run that was running.
-        lt_write_state "$_sf" watering "$_started" volume_cap "$_mode" "$_dur_eff" "$_cap_eff" "$_prov" "$_resume" "$_handover"
-        if lt_post "$(linktap_stop_body "$LINKTAP_GW_ID" "$_d")" 5 >/dev/null; then
-          logger -t brvg-hub-lite "linktap: volume cap ${_cap_eff}L reached on ${_d} - stop issued" 2>/dev/null || true
-        else
-          # A close that did not happen is worth hearing about now (daemon linktap.stop_failed).
-          lt_spool "lt_${_d}" "linktap.stop_failed" "error=gateway_unreachable"
-          logger -t brvg-hub-lite "linktap: ${_d} STOP FAILED - will re-issue on the next poll" 2>/dev/null || true
-          # 🔴 AND THE MARK IS TAKEN BACK. A stop that never reached the gateway left `stop=volume_cap`
-          # set, and lt_decide never cuts a run that already has a stop — so one lost packet meant
-          # the only volume enforcement there is stayed off for the rest of the run. Un-marked, the
-          # next poll cuts again: one attempt per poll, never a storm.
-          lt_write_state "$_sf" watering "$_started" "" "$_mode" "$_dur_eff" "$_cap_eff" "$_prov" "$_resume" "$_handover"
+        # Claimed and marked first, so the close that follows classifies against the run that was
+        # running — and so the valve is ASKED whether it shut (lt_drive_closes) instead of the
+        # gateway's acceptance being taken for one.
+        if lt_claim_close "$_d" volume_cap; then
+          if lt_post "$(linktap_stop_body "$LINKTAP_GW_ID" "$_d")" 5 >/dev/null; then
+            logger -t brvg-hub-lite "linktap: volume cap ${_cap_eff}L reached on ${_d} - stop issued" 2>/dev/null || true
+          else
+            # A close the gateway refused outright is worth hearing about now (daemon
+            # linktap.stop_failed) — and it is now also RETRIED, on the schedule, until the valve says
+            # it shut or the hub gives up and tells the owner.
+            lt_spool "lt_${_d}" "linktap.stop_failed" "error=gateway_unreachable"
+            logger -t brvg-hub-lite "linktap: ${_d} STOP FAILED - retrying on the close schedule" 2>/dev/null || true
+          fi
+          # 🔴 THE MARK IS NO LONGER TAKEN BACK HERE. It used to be, because `lt_decide` never cuts a
+          # run that carries a stop, so one lost packet left the only volume enforcement there is off
+          # for the rest of the run — the un-mark bought the cap back by throwing the run's
+          # classification away, and did nothing at all about a command the gateway ACCEPTED and never
+          # delivered. The retry sequence owns the re-issue now, and `lt_close_abandon` releases the
+          # mark at the END of it (capped runs only) rather than after the first failed packet.
         fi
         ;;
       ended:*)

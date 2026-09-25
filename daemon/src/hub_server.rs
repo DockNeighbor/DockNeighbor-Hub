@@ -256,6 +256,16 @@ pub struct Rt {
     /// poll loop, the gateway push route and the flood hook — they are three inputs to ONE state
     /// machine, and giving each its own copy would let them disagree about a cycle.
     pub linktap: tokio::sync::Mutex<Option<crate::linktap_runtime::Runtime>>,
+    /// CLOSES THIS HUB HAS ISSUED AND NOT YET SEEN CONFIRMED, keyed by normalised valve id
+    /// (close_watch.rs). At most one per valve, which is what makes "one in-flight close per valve"
+    /// a fact rather than an intention: every `cmd 7` site in this file claims a slot here first.
+    ///
+    /// ⚠️ DELIBERATELY NOT ON `Runtime`. `Runtime` exists only while `cfg.linktap.allowed` is true
+    /// (linktap_sync_config), and the flood close is deliberately NOT plan-gated — it runs from the
+    /// stored configuration on a hub whose plan does not include valve control, or which has not yet
+    /// heard from the cloud. A confirm-and-retry machine parked on `Runtime` would therefore retry
+    /// nothing, and alert nobody, in exactly the cases the un-gated close was written for.
+    pub valve_closes: tokio::sync::Mutex<HashMap<String, crate::close_watch::CloseWatch>>,
     /// The store's base directory — shared_base() in production, a temp dir in tests.
     pub base: PathBuf,
     /// The live key set. Loaded from the store at boot (offline reboot still authenticates known
@@ -457,6 +467,7 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         started: Instant::now(),
         worker_base,
         linktap: tokio::sync::Mutex::new(None),
+        valve_closes: tokio::sync::Mutex::new(HashMap::new()),
         valve_rev: tokio::sync::watch::channel(0u64).0,
         update_available: tokio::sync::RwLock::new(None),
         last_activity_ms: AtomicI64::new(now_ms()),
@@ -2620,6 +2631,211 @@ async fn linktap_sync_config(rt: &Rt) -> bool {
     true
 }
 
+// --- THE CLOSE: CONFIRM, THEN RETRY -------------------------------------------------------------
+//
+// 🔴 EVERY `cmd 7` IN THIS FILE NOW GOES THROUGH `claim_close`, AND THE VALVE — NOT THE GATEWAY'S
+// ACK — DECIDES WHETHER IT WORKED. The three closing paths (the volume cutoff via `linktap_act`, the
+// flood shutoff, and a person's Close through `do_valve`) each used to send one command, read
+// `reply.ok`, and stop. `reply.ok` means the GATEWAY ACCEPTED THE REQUEST; the measured failure mode
+// is a `ret: 0` on a command the gateway never delivers to the valve over RF
+// (`cycle::STOP_LATENCY_SECS`, MVP GW-02 2026-08-22). So every one of them could report success over
+// an open valve, and two of them could not retry even in principle — the cutoff because
+// `cycle::step` refuses to re-issue while `stop_issued` is set, and the flood path because it simply
+// had no loop.
+//
+// The shape, all of it in `close_watch.rs` except the I/O:
+//   * `claim_close` is the ONLY door. It takes the one in-flight slot for that valve (so no two
+//      callers can drive `cmd 7` at one valve), marks the run with the cause BEFORE the command goes
+//      out (unchanged ordering: a close that lands while this process dies must still classify as
+//      ours), and refuses a second close while one is being retried — except a FLOOD, which
+//      overrides and restarts the sequence under its own cause.
+//   * `drive_closes` runs on every poll pass, asks each closing valve for its OWN state, and
+//      confirms / re-issues / gives up. It works with or without a `Runtime`, because the flood close
+//      deliberately is not plan-gated and the `Runtime` is.
+//   * giving up RAISES AN ALERT (`close_watch::CLOSE_UNCONFIRMED_EVENT`) — the owner's ask,
+//      2026-09-24: *"this also should tell the user if it was not able to close the valve during a
+//      flood event"*. Same alert for a volume-cutoff close and a manual one; the `cause` param says
+//      which. An unconfirmed cutoff close is the same class of failure, because that cutoff is the
+//      only volume enforcement that exists.
+
+/// The gateway a close goes to: the running machine's when there is one, else the STORED
+/// configuration — the same fallback, for the same reason, as `linktap_flood_stop_all`.
+async fn close_gateway(rt: &Rt) -> Option<linktap::Gateway> {
+    {
+        let guard = rt.linktap.lock().await;
+        if let Some(r) = guard.as_ref() {
+            return Some(r.gateway.clone());
+        }
+    }
+    let lt = hub_config::read_config_in(&rt.base).linktap;
+    if lt.host.is_empty() || lt.gw_id.is_empty() {
+        return None;
+    }
+    Some(linktap::Gateway { host: lt.host, gw_id: lt.gw_id })
+}
+
+/// THE ONE DOOR EVERY CLOSE PASSES THROUGH. `true` ⇒ the caller sends `cmd 7` now; `false` ⇒ a close
+/// is already in flight for this valve and the retry sequence owns it.
+///
+/// Claims the slot and marks the run BEFORE the caller issues anything, in that order, deliberately.
+async fn claim_close(rt: &Rt, dev_id: &str, cause: crate::close_watch::CloseCause) -> bool {
+    let id = linktap::normalize_dev_id(dev_id);
+    {
+        let mut closes = rt.valve_closes.lock().await;
+        if let Some(open) = closes.get(&id) {
+            if !cause.overrides(open.cause) {
+                crate::hlog!(
+                    "linktap: {id} - a {} close is already in flight (attempt {}) - not sending a second cmd 7",
+                    open.cause.as_str(), open.attempts
+                );
+                return false;
+            }
+            crate::hlog!(
+                "linktap: {id} - FLOOD close takes over the {} close in flight",
+                open.cause.as_str()
+            );
+        }
+        closes.insert(id.clone(), crate::close_watch::CloseWatch::opened(cause, now_ms()));
+    }
+    // The mark, so the eventual close classifies as what the hub DID rather than as `unknown`. Held
+    // separately from the slot above: nothing in this file ever holds both locks at once.
+    {
+        let mut guard = rt.linktap.lock().await;
+        if let Some(r) = guard.as_mut() {
+            r.note_stop(&id, cause.end_reason());
+        }
+    }
+    true
+}
+
+/// Write one step's outcome back, but ONLY if the slot still holds the watch the step decided about
+/// (`None` removes it). A flood can take a slot over mid-pass, and a compare-and-set is the
+/// difference between "one in-flight close per valve" being a rule and being a hope.
+async fn settle_close(
+    rt: &Rt,
+    id: &str,
+    was: crate::close_watch::CloseWatch,
+    next: Option<crate::close_watch::CloseWatch>,
+) -> bool {
+    let mut closes = rt.valve_closes.lock().await;
+    if closes.get(id) != Some(&was) {
+        return false; // somebody else owns this valve's close now
+    }
+    match next {
+        Some(w) => closes.insert(id.to_string(), w),
+        None => closes.remove(id),
+    };
+    true
+}
+
+/// Drive every unconfirmed close one step. Returns how long the caller may sleep before it must look
+/// again, or `None` when nothing is closing.
+async fn drive_closes(
+    rt: &Rt,
+    client: &reqwest::Client,
+    sched: &crate::close_watch::CloseSchedule,
+) -> Option<Duration> {
+    use crate::close_watch::CloseStep;
+    let pending: Vec<(String, crate::close_watch::CloseWatch)> = {
+        let closes = rt.valve_closes.lock().await;
+        closes.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    };
+    if pending.is_empty() {
+        return None;
+    }
+    let Some(gw) = close_gateway(rt).await else {
+        // The gateway was removed from the configuration under us. Nothing can be confirmed or
+        // re-issued, so say so once and drop the watches rather than retrying into nowhere.
+        crate::hlog!("linktap: {} unconfirmed close(s) but no gateway is configured any more", pending.len());
+        rt.valve_closes.lock().await.clear();
+        return None;
+    };
+    let mut soonest: Option<i64> = None;
+    for (id, w) in pending {
+        let reply = linktap::post_command(client, &gw, &linktap::build_status(&gw, &id)).await;
+        // ⚠️ UNKNOWN IS "STILL OPEN", NEVER "CLOSED". A timeout, a non-2xx, junk, or a `ret: 5`
+        // (this gateway cannot reach that valve over RF) tells us NOTHING about the valve — and
+        // "nothing" resolved as closed is a confirmation of a close that may never have happened,
+        // failing in the direction of looking correct. Keep trying instead.
+        let watering = linktap::watering_from_status(&reply.data).unwrap_or(true);
+        let now = now_ms();
+        match crate::close_watch::close_step(sched, &w, watering, now) {
+            CloseStep::Confirmed => {
+                if settle_close(rt, &id, w, None).await {
+                    crate::hlog!(
+                        "linktap: {id} - the valve reports CLOSED ({} close confirmed after {} attempt(s))",
+                        w.cause.as_str(), w.attempts
+                    );
+                }
+            }
+            CloseStep::Wait => {
+                soonest = Some(match soonest {
+                    Some(s) => s.min(crate::close_watch::next_look_ms(sched, &w, now)),
+                    None => crate::close_watch::next_look_ms(sched, &w, now),
+                });
+            }
+            CloseStep::Reissue => {
+                let mut next = w;
+                next.attempts += 1;
+                next.last_ms = now;
+                // Recorded before the command goes out, the same ordering as the first attempt — and
+                // it is also what stops a second pass re-issuing the same attempt.
+                if !settle_close(rt, &id, w, Some(next)).await {
+                    continue;
+                }
+                let reply = linktap::post_command(client, &gw, &linktap::build_stop(&gw, &id)).await;
+                crate::hlog!(
+                    "linktap: {id} - close not confirmed after {}s, re-issuing cmd 7 (attempt {}) - gateway {}",
+                    (now - w.first_ms) / 1000,
+                    next.attempts,
+                    if reply.ok { "took it" } else { "refused it" }
+                );
+                // Deliberately NO `linktap.stop_failed` per retry: the first attempt's failure is
+                // already reported by its caller, and one event per retry would be nine events per
+                // dead gateway. The give-up alert below is what the owner needs to hear.
+                soonest = Some(match soonest {
+                    Some(s) => s.min(crate::close_watch::next_look_ms(sched, &next, now)),
+                    None => crate::close_watch::next_look_ms(sched, &next, now),
+                });
+            }
+            CloseStep::GaveUp => {
+                if !settle_close(rt, &id, w, None).await {
+                    continue;
+                }
+                crate::hlog!(
+                    "linktap: {id} - GAVE UP closing the valve after {} attempt(s) over {}s ({} close) - alerting the owner",
+                    w.attempts, (now - w.first_ms) / 1000, w.cause.as_str()
+                );
+                // 🔴 THE MARK IS KEPT, EXCEPT ON A CAPPED RUN. Leaving `stop_issued` set is right for
+                // everything that reads it — the end still classifies honestly, and neither the
+                // auto-restart nor the washdown handover can reopen a valve we could not shut. But on
+                // a run that HAS a volume cap, the mark is also what holds the software cutoff off,
+                // and that cutoff is the only volume enforcement there is; a gateway that comes back
+                // must be able to cut the run it is still passing water through. So a capped run's
+                // mark is released and a washdown's (cap 0, and the only mode a handover can reopen)
+                // is not.
+                let released = {
+                    let mut guard = rt.linktap.lock().await;
+                    match guard.as_mut() {
+                        Some(r) => r.note_stop_abandoned(&id),
+                        None => false,
+                    }
+                };
+                if released {
+                    crate::hlog!("linktap: {id} - the volume cutoff is armed again for this run");
+                }
+                report_event(rt, &crate::linktap_runtime::Report {
+                    token: None,
+                    device: format!("lt_{id}"),
+                    event: crate::close_watch::CLOSE_UNCONFIRMED_EVENT.into(),
+                    params: crate::close_watch::unconfirmed_params(&w, now),
+                }).await;
+            }
+        }
+    }
+    soonest.map(|ms| Duration::from_millis(ms.max(1) as u64))
+}
+
 /// Act on one machine decision: issue the stop it asked for, restart on a timer expiry, and spool
 /// whatever it wants reported.
 async fn linktap_act(
@@ -2675,17 +2891,32 @@ async fn linktap_act(
         }
     };
     if let crate::cycle::Action::Stop(reason) = action {
-        crate::hlog!("linktap: {dev_id} - issuing stop ({})", reason.as_str());
-        let reply = linktap::post_command(client, &gw, &linktap::build_stop(&gw, dev_id)).await;
-        if !reply.ok {
-            // A close that did not happen is worth hearing about immediately; the machine keeps
-            // stop_issued set, so the next observation retries without a re-issue storm.
-            crate::hlog!("linktap: {dev_id} STOP FAILED: {:?}", reply.error);
-            report_event(rt, &crate::linktap_runtime::Report { token: None,
-                device: format!("lt_{dev_id}"),
-                event: "linktap.stop_failed".into(),
-                params: vec![("error".into(), reply.error.unwrap_or_default())],
-            }).await;
+        // The machine only ever asks for the volume cutoff's stop; the other two reasons can only
+        // arrive here if a future caller routes one through, and each maps to its own cause rather
+        // than to a default that would mislabel the owner's alert.
+        let cause = match reason {
+            crate::cycle::EndReason::FloodShutoff => crate::close_watch::CloseCause::Flood,
+            crate::cycle::EndReason::Manual => crate::close_watch::CloseCause::Manual,
+            _ => crate::close_watch::CloseCause::VolumeCap,
+        };
+        // ⚠️ THE COMMENT THAT USED TO BE HERE WAS FALSE, AND IT WAS THE WHOLE BUG. It claimed "the
+        // machine keeps stop_issued set, so the next observation retries without a re-issue storm".
+        // `cycle::step` fires the cutoff only while `stop_issued.is_none()` and sets it in the same
+        // step, so with the mark set the branch never fires again: NOTHING retried. The retry is
+        // `drive_closes`, and success is the valve's own state — not this reply.
+        if claim_close(rt, dev_id, cause).await {
+            crate::hlog!("linktap: {dev_id} - issuing stop ({})", reason.as_str());
+            let reply = linktap::post_command(client, &gw, &linktap::build_stop(&gw, dev_id)).await;
+            if !reply.ok {
+                // A close the gateway refused outright is still worth hearing about immediately —
+                // and now it is also retried, on the schedule, until the valve says it shut.
+                crate::hlog!("linktap: {dev_id} STOP FAILED: {:?}", reply.error);
+                report_event(rt, &crate::linktap_runtime::Report { token: None,
+                    device: format!("lt_{dev_id}"),
+                    event: "linktap.stop_failed".into(),
+                    params: vec![("error".into(), reply.error.unwrap_or_default())],
+                }).await;
+            }
         }
     }
 
@@ -2788,16 +3019,29 @@ async fn linktap_poll_loop(rt: Shared) {
                 }
             }
         }
+        // 🔴 UNCONFIRMED CLOSES ARE DRIVEN OUTSIDE THE `linktap_sync_config` GATE ABOVE, on purpose.
+        // That gate is `cfg.linktap.allowed` — the paid plan — and the flood close is deliberately not
+        // plan-gated (a close spends no water and removes no limit). A hub on an unpermitted or
+        // lapsed plan, or one that has not had a heartbeat since boot, closes its valves on a flood
+        // and must therefore also CONFIRM, RETRY and ALERT on them; a driver inside the gate would
+        // fall silent in exactly the case the un-gated close was written for.
+        let close_nap = drive_closes(&rt, &client, &crate::close_watch::CloseSchedule::PRODUCTION).await;
         // A washdown about to hand over needs a poll INSIDE its lead window, and that window is
         // narrower than the standing cadence — so ask the runtime whether anything is time-critical
         // before sleeping the full minute. Nothing pending ⇒ the normal interval, unchanged.
         let nap = {
             let guard = rt.linktap.lock().await;
-            guard
+            let hinted = guard
                 .as_ref()
                 .and_then(|r| r.poll_hint(now_ms()))
                 .map(|h| h.min(Duration::from_secs(LINKTAP_POLL_SECS)))
-                .unwrap_or(Duration::from_secs(LINKTAP_POLL_SECS))
+                .unwrap_or(Duration::from_secs(LINKTAP_POLL_SECS));
+            // A valve with an unconfirmed close is the most time-critical thing this loop can be
+            // holding, so its next look wins over both the handover hint and the standing cadence.
+            match close_nap {
+                Some(c) => hinted.min(c),
+                None => hinted,
+            }
         };
         // Sleep the computed nap, but cut it short the instant a valve command rings linktap_wake —
         // then settle briefly so the gateway has applied the command before we read it back. A
@@ -2948,14 +3192,18 @@ pub async fn linktap_flood_stop_all(rt: &Rt) {
         }
     };
     for id in ids {
-        {
-            let mut guard = rt.linktap.lock().await;
-            if let Some(r) = guard.as_mut() {
-                r.note_stop(&id, crate::cycle::EndReason::FloodShutoff);
-            }
+        // Claims the valve's one in-flight close and marks the run FloodShutoff before the command
+        // goes out — the same ordering this loop always had, now also the thing that makes the close
+        // retried and confirmed (close_watch.rs). A flood takes the slot over from a manual or
+        // volume close already being retried, so an alarm is never answered by silence.
+        if !claim_close(rt, &id, crate::close_watch::CloseCause::Flood).await {
+            continue; // a flood close is already being retried for this valve
         }
         let reply = linktap::post_command(&client, &gw, &linktap::build_stop(&gw, &id)).await;
-        crate::hlog!("linktap: flood shutoff -> {id} {}", if reply.ok { "closed" } else { "FAILED" });
+        // ⚠️ "closed" HERE MEANS "THE GATEWAY TOOK THE COMMAND", WHICH IS NOT THE SAME THING. The
+        // valve's own answer arrives on the next look; `drive_closes` logs that one, retries when it
+        // is still open, and alerts the owner if it never shuts.
+        crate::hlog!("linktap: flood shutoff -> {id} {}", if reply.ok { "command accepted" } else { "FAILED" });
         if !reply.ok {
             report_event(rt, &crate::linktap_runtime::Report { token: None,
                 device: format!("lt_{id}"),
@@ -4386,11 +4634,26 @@ async fn do_valve(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
         other => return err(422, &format!("unknown action '{other}' — expected open or close")),
     };
 
+    // A CLOSE CLAIMS THE VALVE'S ONE IN-FLIGHT CLOSE AND MARKS THE RUN BEFORE THE COMMAND GOES OUT
+    // (close_watch.rs), so this press is confirmed against the valve's own state and retried on the
+    // schedule instead of being believed because the gateway said `ret: 0`. When a close is ALREADY
+    // being retried here, that sequence answers the press — a second concurrent `cmd 7` at one valve
+    // is the one thing the slot exists to prevent. The response is deliberately unchanged in both
+    // cases: the valve is on its way shut either way, and the app's contract is `{ok:true}`.
+    if req.action == "close" && !claim_close(rt, &dev_id, crate::close_watch::CloseCause::Manual).await {
+        crate::hlog!("linktap: close {dev_id} - a close is already in flight; not issuing another");
+        rt.linktap_wake.notify_one();
+        return ok_json(&serde_json::json!({ "ok": true }));
+    }
     let reply = linktap::post_command(&client, &gw, &body_json).await;
     if !reply.ok {
         let detail = reply.error.unwrap_or_else(|| "the gateway refused the command".into());
         crate::hlog!("linktap: {} {} failed: {detail}", req.action, dev_id);
         // 502: the hub is fine, the thing BEHIND it refused. The app falls back and says so.
+        //
+        // A refused CLOSE is no longer the end of it: the watch claimed above is retried on the
+        // schedule and the owner is told if the valve never shuts. The 502 still goes back, because
+        // it is the truth about this request and the app's fallback copy depends on it.
         return err(502, &format!("the gateway did not accept that command: {detail}"));
     }
     crate::hlog!("linktap: {} {} ok", req.action, dev_id);
@@ -6244,6 +6507,273 @@ mod tests {
         hub_config::write_config_in(&base, &seeded_cfg()).unwrap(); // no linktap config whatsoever
         let rt = new_rt(base, "https://unused.example".into());
         linktap_flood_stop_all(&rt).await; // must simply return
+    }
+
+    // --- CONFIRM-THEN-RETRY on a close (close_watch.rs) -----------------------------------------
+
+    /// A stub gateway that counts `cmd 7`s AND answers `cmd 3` from a shared flag — so the test gets
+    /// to be the valve that does, or does not, actually shut. The old `stub_gateway` could only ever
+    /// say `ret: 0`, which is exactly the lie this whole mechanism exists to stop believing.
+    async fn stub_valve_gateway() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let stops = Arc::new(AtomicUsize::new(0));
+        let watering = Arc::new(AtomicBool::new(true));
+        let (seen, valve) = (stops.clone(), watering.clone());
+        let app = Router::new().route(
+            "/api.shtml",
+            post(move |body: axum::body::Bytes| {
+                let (seen, valve) = (seen.clone(), valve.clone());
+                async move {
+                    let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                    match v.get("cmd").and_then(|c| c.as_i64()) {
+                        Some(7) => {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            axum::Json(serde_json::json!({ "ret": 0 }))
+                        }
+                        Some(3) => axum::Json(serde_json::json!({
+                            "dev_stat": [{
+                                "dev_id": "aaaabbbbccccdddd",
+                                "is_watering": valve.load(Ordering::SeqCst),
+                                "volume": 1.0,
+                            }]
+                        })),
+                        _ => axum::Json(serde_json::json!({ "ret": 0 })),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr.to_string(), stops, watering)
+    }
+
+    /// The owner's schedule with the same SHAPE and milliseconds for seconds, so the give-up boundary
+    /// is reachable in a test. The production numbers are pinned in close_watch.rs's own suite; what
+    /// these tests check is the WIRING, which no amount of pure testing can reach.
+    const FAST_CLOSE: crate::close_watch::CloseSchedule = crate::close_watch::CloseSchedule {
+        confirm_within_ms: 40,
+        retry_at_ms: &[10, 20, 40],
+        then_every_ms: 40,
+        give_up_ms: 200,
+    };
+
+    /// Drive `drive_closes` until nothing is closing, or `ms` of wall clock has gone by.
+    async fn run_closes(rt: &Shared, ms: u64) {
+        let client = http_client();
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        loop {
+            if rt.valve_closes.lock().await.is_empty() || Instant::now() > deadline {
+                return;
+            }
+            drive_closes(rt, &client, &FAST_CLOSE).await;
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+    }
+
+    async fn closing_rt(tag: &str) -> (Shared, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicBool>, BatchPosts) {
+        let (worker, posts) = stub_batch_worker(serde_json::json!({"status": "ok"})).await;
+        let (host, stops, watering) = stub_valve_gateway().await;
+        let base = temp_base(tag);
+        let mut cfg = valve_cfg(true);
+        cfg.linktap.host = host;
+        hub_config::write_config_in(&base, &cfg).unwrap();
+        (new_rt(base, worker), stops, watering, posts)
+    }
+
+    /// Every `linktap.valve.close_unconfirmed` the hub delivered, with its params.
+    fn unconfirmed_alerts(posts: &BatchPosts) -> Vec<HashMap<String, String>> {
+        let mut out = Vec::new();
+        for (_, body) in posts.lock().unwrap().iter() {
+            for it in body["items"].as_array().cloned().unwrap_or_default() {
+                if it["event"] == crate::close_watch::CLOSE_UNCONFIRMED_EVENT {
+                    let mut p = HashMap::new();
+                    for (k, v) in it["params"].as_object().cloned().unwrap_or_default() {
+                        p.insert(k, v.as_str().unwrap_or_default().to_string());
+                    }
+                    p.insert("__device".into(), it["device"].as_str().unwrap_or_default().to_string());
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_flood_close_the_gateway_took_but_the_valve_ignored_is_retried_and_then_alerted_once() {
+        use std::sync::atomic::Ordering;
+        // 🔴 THE EXACT FAILURE THIS WORK EXISTS FOR, AND IT USED TO BE INVISIBLE: the `cmd 7` is
+        // ACCEPTED (`ret: 0`) and the valve keeps watering. The old flood path sent one command, saw
+        // `reply.ok`, logged "closed" and told nobody anything, ever.
+        let (rt, stops, watering, posts) = closing_rt("close_unconfirmed").await;
+        watering.store(true, Ordering::SeqCst);
+
+        linktap_flood_stop_all(&rt).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "the flood close still sends its command at once");
+        assert_eq!(rt.valve_closes.lock().await.len(), 1, "…and the close is now WATCHED, not assumed");
+
+        run_closes(&rt, 4_000).await;
+        assert!(rt.valve_closes.lock().await.is_empty(), "the hub must GIVE UP, not retry forever");
+        let tries = stops.load(Ordering::SeqCst);
+        assert!(tries >= 3, "an unconfirmed close must be re-issued, got {tries} attempt(s) in total");
+
+        // And once it has given up it is silent: no tenth command, and no second alert.
+        run_closes(&rt, 200).await;
+        drain_reports(&rt).await;
+        assert_eq!(stops.load(Ordering::SeqCst), tries, "nothing may be sent after the give-up");
+
+        let alerts = unconfirmed_alerts(&posts);
+        assert_eq!(alerts.len(), 1, "exactly one alert per unconfirmed flood close, got {alerts:?}");
+        assert_eq!(alerts[0]["cause"], "flood");
+        assert_eq!(alerts[0]["__device"], "lt_aaaabbbbccccdddd");
+        assert_eq!(alerts[0]["attempts"], tries.to_string());
+        assert!(alerts[0].contains_key("secs"));
+    }
+
+    #[tokio::test]
+    async fn a_close_confirmed_on_the_first_read_issues_no_retry_and_no_alert() {
+        use std::sync::atomic::Ordering;
+        // The healthy case must stay quiet: one command, the valve reports shut, nothing else.
+        let (rt, stops, watering, posts) = closing_rt("close_confirmed").await;
+        watering.store(false, Ordering::SeqCst);
+
+        linktap_flood_stop_all(&rt).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        run_closes(&rt, 1_000).await;
+        drain_reports(&rt).await;
+
+        assert!(rt.valve_closes.lock().await.is_empty(), "a confirmed close is finished");
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "a valve that shut must not be told again");
+        assert!(unconfirmed_alerts(&posts).is_empty(), "nothing failed, so nobody is woken");
+    }
+
+    #[tokio::test]
+    async fn a_valve_that_shuts_mid_retry_stops_the_sequence_with_no_alert() {
+        use std::sync::atomic::Ordering;
+        let (rt, stops, watering, posts) = closing_rt("close_midretry").await;
+        watering.store(true, Ordering::SeqCst);
+        linktap_flood_stop_all(&rt).await;
+
+        // Let it retry at least once, then let the valve actually close.
+        let client = http_client();
+        let deadline = Instant::now() + Duration::from_millis(2_000);
+        while stops.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            drive_closes(&rt, &client, &FAST_CLOSE).await;
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+        let mid = stops.load(Ordering::SeqCst);
+        assert!(mid >= 2, "the test needs a retry to have happened first (got {mid})");
+        watering.store(false, Ordering::SeqCst);
+
+        run_closes(&rt, 1_000).await;
+        drain_reports(&rt).await;
+        assert!(rt.valve_closes.lock().await.is_empty());
+        assert_eq!(stops.load(Ordering::SeqCst), mid, "the sequence stops the moment the valve says shut");
+        assert!(unconfirmed_alerts(&posts).is_empty(), "it closed — there is nothing to alert about");
+    }
+
+    #[tokio::test]
+    async fn one_valve_never_gets_two_closes_driven_at_once() {
+        use std::sync::atomic::Ordering;
+        // ⚠️ THE GUARD IS THE SLOT, NOT THE CALLER'S MANNERS. Two flood alarms, an app's Close, and
+        // the poll loop's cutoff can all arrive inside one second; `claim_close` is what makes "one
+        // in-flight close per valve" true rather than intended.
+        let (rt, stops, watering, _posts) = closing_rt("close_once").await;
+        watering.store(true, Ordering::SeqCst);
+
+        linktap_flood_stop_all(&rt).await;
+        linktap_flood_stop_all(&rt).await;
+        linktap_flood_stop_all(&rt).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "a second flood alarm rides the sequence already running");
+
+        // A person's Close on the same valve, while that flood close is being retried.
+        let caller = Caller { uid: "u".into(), role: "control".into() };
+        let body = br#"{"devId":"aaaabbbbccccdddd","action":"close"}"#;
+        let a = do_valve(&rt, &caller, body).await;
+        assert_eq!(a.status, 200, "the press is answered — the valve is on its way shut either way");
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "…but it does NOT put a second cmd 7 on the wire");
+        // The slot still belongs to the FLOOD: a flood must never be reported as a failed press.
+        assert_eq!(
+            rt.valve_closes.lock().await["aaaabbbbccccdddd"].cause,
+            crate::close_watch::CloseCause::Flood
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flood_takes_over_a_manual_close_already_being_retried() {
+        use std::sync::atomic::Ordering;
+        // The one override: the owner pressed Close, it is not confirmed, and then the boat floods.
+        // The alarm must issue its own command and own the cause, or a failed flood shutoff would be
+        // reported to the owner as a failed button press.
+        let (rt, stops, watering, _posts) = closing_rt("close_override").await;
+        watering.store(true, Ordering::SeqCst);
+        let caller = Caller { uid: "u".into(), role: "control".into() };
+        let a = do_valve(&rt, &caller, br#"{"devId":"aaaabbbbccccdddd","action":"close"}"#).await;
+        assert_eq!(a.status, 200);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            rt.valve_closes.lock().await["aaaabbbbccccdddd"].cause,
+            crate::close_watch::CloseCause::Manual
+        );
+
+        linktap_flood_stop_all(&rt).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 2, "the flood issues its own close");
+        assert_eq!(
+            rt.valve_closes.lock().await["aaaabbbbccccdddd"].cause,
+            crate::close_watch::CloseCause::Flood,
+            "and owns the cause from here on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_close_that_is_never_confirmed_alerts_with_cause_manual() {
+        use std::sync::atomic::Ordering;
+        // 🔴 THE DECISION, STATED: a manual close is raised at the SAME severity as a flood one. The
+        // app answered the press with `{ok:true}` the moment the gateway accepted the command, so a
+        // valve that never shut afterwards is a person who has been told the water is off while it is
+        // still running. The `cause` param is how anyone downstream tells the two apart.
+        let (rt, stops, watering, posts) = closing_rt("close_manual_alert").await;
+        watering.store(true, Ordering::SeqCst);
+        let caller = Caller { uid: "u".into(), role: "control".into() };
+        assert_eq!(do_valve(&rt, &caller, br#"{"devId":"aaaabbbbccccdddd","action":"close"}"#).await.status, 200);
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+
+        run_closes(&rt, 4_000).await;
+        drain_reports(&rt).await;
+        let alerts = unconfirmed_alerts(&posts);
+        assert_eq!(alerts.len(), 1, "got {alerts:?}");
+        assert_eq!(alerts[0]["cause"], "manual");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_gateway_is_not_a_closed_valve() {
+        use std::sync::atomic::Ordering;
+        // ⚠️ THE DIRECTION THAT LOOKS CORRECT. A status read that fails says NOTHING about the valve;
+        // reading it as "not watering" would confirm the close and stand the hub down — silently, on
+        // exactly the boat whose gateway has just died. `watering_from_status` returns None and the
+        // driver treats None as still open, so this ends in the alert, not in a shrug.
+        let (worker, posts) = stub_batch_worker(serde_json::json!({"status": "ok"})).await;
+        let (host, stops, _watering) = stub_valve_gateway().await;
+        let base = temp_base("close_gw_dead");
+        let mut cfg = valve_cfg(true);
+        cfg.linktap.host = host;
+        hub_config::write_config_in(&base, &cfg).unwrap();
+        let rt = new_rt(base, worker);
+        linktap_flood_stop_all(&rt).await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        // The gateway disappears after the command was accepted: every later read is a transport
+        // failure, which `post_command` turns into `ret: None` and a Null body.
+        let dead = valve_cfg(true); // host 127.0.0.1:9, the discard port
+        hub_config::write_config_in(&rt.base, &dead).unwrap();
+        run_closes(&rt, 4_000).await;
+        drain_reports(&rt).await;
+        let alerts = unconfirmed_alerts(&posts);
+        assert_eq!(alerts.len(), 1, "an unanswerable valve must reach the owner, got {alerts:?}");
+        assert_eq!(alerts[0]["cause"], "flood");
     }
 
     #[tokio::test]

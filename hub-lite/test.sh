@@ -489,6 +489,12 @@ out=$(linktap_stop_body "CCCCDDDDEEEEFFFF" "aaaabbbbccccdddd")
 check "linktap_stop_body cmd 7 shape" '{"cmd":7,"gw_id":"CCCCDDDDEEEEFFFF","dev_id":"aaaabbbbccccdddd"}' "$out"
 
 # linktap_flood_close: stub curl, capture what would hit the gateway, check the spool line.
+#
+# ⚠️ ITS OWN STATE DIR. Since the close became a CLAIM (lt_claim_close), these calls write
+# `close.<dev>` records — and against the default /tmp/brvg-linktap a leftover from a previous run, or
+# from a hub-lite actually running on this machine, would make the claim refuse and every count below
+# read zero. A test whose result depends on /tmp is not a test.
+_LT_T=$(mktemp -d); _LT_SAVE="${LT_STATE_DIR:-}"; LT_STATE_DIR="$_LT_T"
 _CURL_LOG=$(mktemp); _SPOOL_T=$(mktemp)
 curl() { # capture -d body and the url (last arg)
   _body=""; _prev=""
@@ -509,11 +515,18 @@ check "the spool line carries the outcome" "ok=1" "$(head -1 "$_SPOOL_T" | cut -
 # a failing gateway spools ok=0 and does not abort the loop
 curl() { return 22; }
 : > "$_CURL_LOG"; : > "$_SPOOL_T"
+# The close claimed above is still in flight, and a flood does not override a flood — so this second
+# alarm would ride that sequence and send nothing. Clear it: what is under test here is a FRESH close
+# meeting a dead gateway.
+rm -f "$_LT_T"/close.*
 LINKTAP_HOST="192.168.8.20" LINKTAP_GW_ID="GW02" LINKTAP_DEV_IDS="aaaabbbbccccdddd" \
 BRVG_RELAY_SPOOL="$_SPOOL_T" linktap_flood_close
 check "a failed close is spooled as ok=0" "ok=0" "$(head -1 "$_SPOOL_T" | cut -f4)"
 unset -f curl
 rm -f "$_CURL_LOG" "$_SPOOL_T"
+check "a failed close is nonetheless WATCHED, so it is retried rather than lost" "1" \
+  "$(ls "$_LT_T"/close.* 2>/dev/null | wc -l | tr -d ' ')"
+LT_STATE_DIR="$_LT_SAVE"; rm -rf "$_LT_T"
 
 # unconfigured = strict no-op (every existing install)
 _SPOOL_T=$(mktemp)
@@ -600,6 +613,73 @@ check "decide: THE BUG CASE — hardware cap stop inside one poll = ended:volume
 check "decide: closed within a minute of duration = ended:timer" "ended:timer" "$(lt_decide watering 0 40 100 "" 590 600)"
 check "decide: early close, no explanation = ended:unknown" "ended:unknown" "$(lt_decide watering 0 5 100 "" 60 600)"
 check "decide: flood stop classifies as flood_shutoff" "ended:flood_shutoff" "$(lt_decide watering 0 30 0 "flood_shutoff" 60 7200)"
+
+# --- THE CLOSE: confirm, then retry (parity with daemon/src/close_watch.rs) ----------------------
+#
+# 🔴 THE FAILURE BEING TESTED IS AN ACCEPTED COMMAND OVER AN OPEN VALVE. `lt_post` exiting 0 means the
+# GATEWAY TOOK the request; the measured failure mode is a `ret: 0` on a command never delivered to the
+# valve over RF. Success is the valve's OWN reported state, and everything below is the schedule that
+# keeps asking it.
+check "close: the schedule is the owner's numbers — 5/10/20/40 then every 60, confirm 10, give up 300" \
+  "10|5 10 20 40|60|300" "$LT_CLOSE_CONFIRM_WITHIN|$LT_CLOSE_RETRY_AT|$LT_CLOSE_EVERY|$LT_CLOSE_GIVE_UP"
+check "close: attempt 1 is the close itself, due immediately" "0" "$(lt_close_due_at 1)"
+check "close: the named offsets" "5 10 20 40" \
+  "$(lt_close_due_at 2) $(lt_close_due_at 3) $(lt_close_due_at 4) $(lt_close_due_at 5)"
+check "close: then every 60 s, counted from the LAST named offset (40+60, not 60n)" "100 160 220 280" \
+  "$(lt_close_due_at 6) $(lt_close_due_at 7) $(lt_close_due_at 8) $(lt_close_due_at 9)"
+check "close: the tenth would fall past the 300 s give-up, so nine attempts is the ceiling" "340 yes" \
+  "$(lt_close_due_at 10) $([ "$(lt_close_due_at 10)" -gt "$LT_CLOSE_GIVE_UP" ] && echo yes || echo no)"
+
+# lt_close_step: first=1000, and the valve's own answer decides everything.
+check "close: a valve that reports SHUT is confirmed, whatever the clock says" "confirmed confirmed confirmed" \
+  "$(lt_close_step 1000 1000 1 0 1000) $(lt_close_step 1000 1000 1 0 1004) $(lt_close_step 1000 1000 9 0 1999)"
+check "close: still open before the first retry is due = wait" "wait" "$(lt_close_step 1000 1000 1 1 1004)"
+check "close: still open AT the first offset = reissue" "reissue" "$(lt_close_step 1000 1000 1 1 1005)"
+check "close: one second before the window closes it is still trying" "wait" "$(lt_close_step 1000 1280 9 1 1299)"
+check "close: at 300 s it gives up" "gave_up" "$(lt_close_step 1000 1280 9 1 1300)"
+check "close: and stays given up rather than starting again" "gave_up" "$(lt_close_step 1000 1280 9 1 9999)"
+(
+  # ⚠️ ORDER IS LOAD-BEARING: a retry falling due at the exact give-up instant must NOT put one more
+  # command on the wire after the hub has decided to stop trying.
+  LT_CLOSE_RETRY_AT="300"
+  check "close: the give-up boundary beats a retry due at the same instant" "gave_up" "$(lt_close_step 1000 1000 1 1 1300)"
+)
+check "close: the next look is the first retry, 5 s out" "5" "$(lt_close_next_look 1000 1000 1 1000)"
+check "close: out where retries are a minute apart, the CONFIRM deadline binds instead" "10" \
+  "$(lt_close_next_look 1000 1100 6 1100)"
+check "close: and once that read has happened the deadline is spent — the next look is the re-issue" "50" \
+  "$(lt_close_next_look 1000 1100 6 1110)"
+check "close: never zero, however late the caller is" "1" "$(lt_close_next_look 1000 1280 9 99999)"
+
+# 🔴 EMPTY IS NOT 0. A reply that does not say tells us nothing about the valve; reading it as "shut"
+# would confirm a close that never happened, on exactly the boat whose gateway has just died.
+check "close: is_watering true/1 reads open" "1 1 1" \
+  "$(printf '{"is_watering":true}' | lt_watering_from_status) $(printf '{"dev_stat":[{"is_watering":1}]}' | lt_watering_from_status) $(printf '{"is_watering":"1"}' | lt_watering_from_status)"
+check "close: is_watering false/0 reads shut" "0 0" \
+  "$(printf '{"is_watering":false}' | lt_watering_from_status) $(printf '{"dev_stat":[{"is_watering":0}]}' | lt_watering_from_status)"
+check "close: a reply that does not say is EMPTY, never 0" "" "$(printf '{"ret":5}' | lt_watering_from_status)"
+check "close: junk is EMPTY too" "" "$(printf 'not json at all' | lt_watering_from_status)"
+
+# One in-flight close per valve, with one exception.
+check "close: a flood overrides a manual or volume close in flight" "yes yes" \
+  "$(lt_close_overrides flood manual && echo yes || echo no) $(lt_close_overrides flood volume_cap && echo yes || echo no)"
+check "close: and nothing else overrides anything — including a flood over a flood" "no no no" \
+  "$(lt_close_overrides flood flood && echo yes || echo no) $(lt_close_overrides manual flood && echo yes || echo no) $(lt_close_overrides volume_cap manual && echo yes || echo no)"
+check "close: the cause marks the run with the reason that names it" "flood_shutoff volume_cap manual" \
+  "$(lt_close_end_reason flood) $(lt_close_end_reason volume_cap) $(lt_close_end_reason manual)"
+
+# ⚠️ THE EVENT NAME, against the worker's own three classifiers rather than against a comment claiming
+# it is safe: `is_flood_shutoff` IS the ported flood rule, `*_off`/`*.off` reads as an ALL-CLEAR, and
+# `*.change`/`*.measurement` reads as never-pushed telemetry.
+check "close: the alert name is not a flood alarm to the hub's own classifier" "no" \
+  "$(is_flood_shutoff "$LT_CLOSE_UNCONFIRMED_EVENT" && echo yes || echo no)"
+check "close: it is the one string all three repos answer to" "linktap.valve.close_unconfirmed" "$LT_CLOSE_UNCONFIRMED_EVENT"
+name_traps() { case "$1" in *flood*|*leak*|*alarm*|*off*|*.change|*.measurement|*closed*) echo dirty ;; *) echo clean ;; esac; }
+check "close: the trap check itself can fail (a name that would be read as an all-clear)" "dirty dirty dirty" \
+  "$(name_traps linktap.valve.close_off) $(name_traps linktap.flood.unconfirmed) $(name_traps linktap.valve.not_closed)"
+check "close: it carries no flood/leak/alarm, no off, no telemetry suffix, and not 'closed'" "clean" \
+  "$(name_traps "$LT_CLOSE_UNCONFIRMED_EVENT")"
+
 
 # lt_should_restart — only a timer expiry restarts
 lt_should_restart timer 1 && _r=yes || _r=no
@@ -983,9 +1063,21 @@ check "normal open: the software cutoff then fires at the cap" "1 volume_cap" "$
 sed 's/^LINKTAP_ALLOWED=1/LINKTAP_ALLOWED=0/' "$T/conf" > "$T/conf.noplan"
 r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\"durationSecs\":60,\"volumeCapL\":10}" BRVG_HUB_LITE_CONF="$T/conf.noplan")
 check "plan gate: an open on an unpermitted plan is 402" "402" "$(status_of "$r")"
+# ⚠️ FIRST, THE REFUSAL, because the cutoff close issued by the poll above is still in flight: a press
+# arriving while a close is being retried must NOT put a second cmd 7 on the wire for one valve, and the
+# FLOOD/volume cause must keep the slot (a failed cutoff close must never be reported as a failed press).
+: > "$SHIM_LOG"
+r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"close\"}" BRVG_HUB_LITE_CONF="$T/conf.noplan")
+check "close: a press while a close is in flight is answered, and sends nothing" "200 0" \
+  "$(status_of "$r") $(grep -c '\"cmd\":7' "$SHIM_LOG")"
+check "close: …and the volume_cap close keeps the valve's one slot" "volume_cap" "$(. "$T/lt/close.$DEV"; echo "$CL_CAUSE")"
+# Now as if that close had been confirmed (the poll removes the record), so the press is the first one.
+rm -f "$T/lt/close.$DEV"
 r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"close\"}" BRVG_HUB_LITE_CONF="$T/conf.noplan")
 check "plan gate: a CLOSE is never refused for the plan" "200" "$(status_of "$r")"
 check "close: marks the running cycle stop=manual, keeping its identity" "manual normal" "$(. "$T/lt/$DEV"; echo "$stop $mode")"
+check "close: and it is WATCHED — confirmed against the valve, not against the gateway's ack" "manual 1" \
+  "$(. "$T/lt/close.$DEV"; echo "$CL_CAUSE $CL_TRIES")"
 r=$(api GET /status "" BRVG_HUB_LITE_CONF="$T/conf.noplan")
 check "plan gate: no linktap capability without permission" "0" "$(body_of "$r" | grep -c '"linktap"')"
 r=$(api POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\"mode\":\"washdown\",\"durationSecs\":60,\"volumeCapL\":10}")
@@ -1207,7 +1299,14 @@ printf '{"is_watering":1,"volume":20}' > "$SHIM_CMD3"; : > "$SHIM_LOG"
 ( LT_STATE_DIR="$T/lt2"; BRVG_RELAY_SPOOL="$T/spool2"; . "$T/conf"; PATH="$T/bin:$PATH"; LINKTAP_ALLOWED=1
   curl() { case "$*" in *'"cmd":7'*) return 7 ;; *) command curl "$@" ;; esac; }
   linktap_tick )
-check "tick: a cutoff STOP that fails is un-marked, so the next poll cuts again (never left uncapped)" "" "$(. "$T/lt2/$DEV"; echo "$stop")"
+# 🔴 THE MARK NOW STAYS, AND THAT IS THE CHANGE. It used to be taken back after a single failed packet,
+# because `lt_decide` never cuts a run that carries a stop — so one lost packet left the only volume
+# enforcement there is off for the rest of the run. Un-marking bought the cap back by throwing the run's
+# classification away, and did nothing at all about the case that actually bites: a command the gateway
+# ACCEPTS and never delivers. The claim below owns the re-issue now, on a bounded schedule, and
+# `lt_close_abandon` releases the mark at the END of it (capped runs only) if the valve never shuts.
+check "tick: a cutoff STOP that fails keeps its mark and is WATCHED, not silently re-cut" "volume_cap volume_cap 1" \
+  "$(. "$T/lt2/$DEV"; echo "$stop") $(. "$T/lt2/close.$DEV"; echo "$CL_CAUSE $CL_TRIES")"
 check "tick: and the failure is reported" "1" "$(grep -c 'linktap.stop_failed&*.*gateway_unreachable$' "$T/spool2")"
 rm -f "$T/lt2/$DEV"
 echo 7 > "$SHIM_RC"
@@ -1217,6 +1316,130 @@ echo 0 > "$SHIM_RC"
 ( LT_STATE_DIR="$T/lt2"; BRVG_RELAY_SPOOL="$T/spool2"; . "$T/conf"; PATH="$T/bin:$PATH"; echo 22 > "$SHIM_RC"
   printf '1 0\n' > "$T/lt2/gw.watch"; rm -f "$T/lt2/$DEV"; linktap_flood_close; echo 0 > "$SHIM_RC" )
 check "flood close: a close the gateway did not take spools stop_failed with cause=flood" "1" "$(grep -c 'linktap.stop_failed.*cause=flood' "$T/spool2")"
+
+# --- CONFIRM-THEN-RETRY, through the real tick and driver ----------------------------------------
+#
+# 🔴 THE CASE: the gateway ACCEPTS the `cmd 7` (the shim answers `{"ret":0}`) and the valve keeps
+# reporting `is_watering:1`. Before this, every tier logged that as a successful close and told nobody.
+# The schedule here is SCALED — retries due at once, give up after a second — so the give-up boundary is
+# reachable without waiting five real minutes; the production numbers are pinned by the pure checks
+# above and by close_watch.rs's own suite.
+drive() {  # one lt_drive_closes pass against $T/lt2. $1 = give-up seconds (default 1).
+  ( LT_STATE_DIR="$T/lt2"; BRVG_RELAY_SPOOL="$T/spool2"; CONF="$T/conf"; . "$T/conf"; PATH="$T/bin:$PATH"
+    LT_CLOSE_RETRY_AT="0 0 0 0"; LT_CLOSE_EVERY=1; LT_CLOSE_CONFIRM_WITHIN=1; LT_CLOSE_GIVE_UP="${1:-1}"
+    lt_drive_closes )
+}
+claim() {  # a close of cause $1, exactly as the receiver / the door / the cutoff claim one
+  ( LT_STATE_DIR="$T/lt2"; BRVG_RELAY_SPOOL="$T/spool2"; CONF="$T/conf"; . "$T/conf"; PATH="$T/bin:$PATH"
+    lt_claim_close "$DEV" "$1" && echo send || echo skip )
+}
+cmd7s() { grep -c '"cmd":7' "$SHIM_LOG"; }
+
+rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 60 )) "" normal 86400 10 hub 0 0
+tick '{"is_watering":1,"volume":20}'
+check "close: the cutoff's close is CLAIMED and marked, and sent once" "volume_cap volume_cap 1 1" \
+  "$(. "$T/lt2/$DEV"; echo "$stop") $(. "$T/lt2/close.$DEV"; echo "$CL_CAUSE $CL_TRIES") $(cmd7s)"
+# ⚠️ EXPLICIT GIVE-UP WINDOWS, NOT SLEEPS. `drive 30` cannot give up (so it must re-issue) and
+# `drive 0` must (the window has passed) — a wall-clock `sleep 1` against a one-second window made
+# which branch ran depend on where the second boundary fell, and the suite flaked on exactly that.
+drive 30; drive 30
+check "close: an accepted command over an open valve is RE-ISSUED, not believed" "yes" \
+  "$([ "$(cmd7s)" -ge 2 ] && echo yes || echo no)"
+drive 0
+check "close: the hub gives up rather than retrying forever" "no" \
+  "$([ -f "$T/lt2/close.$DEV" ] && echo yes || echo no)"
+check "close: exactly one alert, naming the cause" "1" \
+  "$(grep -c "$LT_CLOSE_UNCONFIRMED_EVENT.*cause=volume_cap" "$T/spool2")"
+# ⚠️ ASSERT THE RELATIONSHIP, NOT A NUMBER: `attempts` must be what the hub actually put on the wire.
+check "close: the alert counts every attempt the hub really made" "$(cmd7s)" \
+  "$(grep -o 'attempts=[0-9]*' "$T/spool2" | cut -d= -f2)"
+check "close: giving up re-arms the software cutoff on a CAPPED run (it is the only one there is)" "" \
+  "$(. "$T/lt2/$DEV"; echo "$stop")"
+_n=$(cmd7s); drive 30; drive 0
+check "close: and nothing more is sent once it has given up" "$_n" "$(cmd7s)"
+check "close: nor a second alert" "1" "$(grep -c "$LT_CLOSE_UNCONFIRMED_EVENT" "$T/spool2")"
+
+# The healthy case must stay silent: one command, the valve reports shut, nothing else.
+rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 60 )) "" normal 86400 10 hub 0 0
+tick '{"is_watering":1,"volume":20}'
+printf '{"is_watering":0,"volume":20}' > "$SHIM_CMD3"; : > "$SHIM_LOG"
+drive 30
+check "close: a valve that reports SHUT confirms, and no retry is sent" "no 0" \
+  "$([ -f "$T/lt2/close.$DEV" ] && echo yes || echo no) $(cmd7s)"
+check "close: …and nobody is woken" "0" "$(grep -c "$LT_CLOSE_UNCONFIRMED_EVENT" "$T/spool2")"
+
+# A valve that shuts MID-RETRY stops the sequence where it is.
+rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 60 )) "" normal 86400 10 hub 0 0
+printf '{"is_watering":1,"volume":20}' > "$SHIM_CMD3"
+tick '{"is_watering":1,"volume":20}'
+drive 30
+_mid=$(cmd7s)
+printf '{"is_watering":0,"volume":20}' > "$SHIM_CMD3"
+drive 30; drive 0
+check "close: a valve that shuts mid-retry ends the sequence there" "no $_mid" \
+  "$([ -f "$T/lt2/close.$DEV" ] && echo yes || echo no) $(cmd7s)"
+check "close: …with no alert, because it closed" "0" "$(grep -c "$LT_CLOSE_UNCONFIRMED_EVENT" "$T/spool2")"
+
+# ⚠️ THE GUARD IS THE SLOT, NOT THE CALLER'S MANNERS — and the ONE exception is a flood.
+rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
+printf '{"is_watering":1,"volume":20}' > "$SHIM_CMD3"
+check "close: the first claim sends, a second for the same valve does not" "send skip skip" \
+  "$(claim manual) $(claim manual) $(claim volume_cap)"
+check "close: the slot still belongs to the press that took it" "manual" "$(. "$T/lt2/close.$DEV"; echo "$CL_CAUSE")"
+check "close: a FLOOD takes it over, and restarts the sequence as a flood" "send flood 1" \
+  "$(claim flood) $(. "$T/lt2/close.$DEV"; echo "$CL_CAUSE $CL_TRIES")"
+check "close: and a flood does not override a flood" "skip" "$(claim flood)"
+
+# The alert for a MANUAL close carries cause=manual — same event, same severity, different cause.
+rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 60 )) "" normal 86400 10 hub 0 0
+check "close: a manual claim marks the run manual" "send manual" "$(claim manual) $(. "$T/lt2/$DEV"; echo "$stop")"
+drive 0
+check "close: an unconfirmed manual close alerts too, saying which" "1" \
+  "$(grep -c "$LT_CLOSE_UNCONFIRMED_EVENT.*cause=manual" "$T/spool2")"
+
+# 🔴 A WASHDOWN KEEPS ITS MARK ON GIVE-UP. It has no cap, so releasing buys no cutoff — and it is the
+# one mode a handover can reopen, which would reprogram a valve the hub just failed to shut.
+rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 285 )) "" washdown 300 0 hub 1 0
+check "close: the flood claim marks the washdown" "send flood_shutoff" "$(claim flood) $(. "$T/lt2/$DEV"; echo "$stop")"
+drive 0
+check "close: a washdown that could not be closed KEEPS the mark that forbids its handover" "flood_shutoff" \
+  "$(. "$T/lt2/$DEV"; echo "$stop")"
+tick '{"is_watering":1,"volume":8,"remain_duration":15}'
+check "close: …so it is never handed over into a fresh run" "0" "$(grep -c '"cmd":6' "$SHIM_LOG")"
+
+# 🔴 THE UPGRADE-ERA FILE IS WHY THE MODE IS ASKED ON ITS OWN. A state file written before 0.15 carries
+# no `cap=` line and MEANS "the profile's Normal Run", so a washdown in one resolves to the profile's
+# 378 L — the cap test cannot catch it, and only the mode test keeps the handover forbidden.
+rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
+printf 'state=watering
+started=%s
+stop=
+mode=washdown
+prov=hub
+resume=1
+handover=0
+' "$(( $(date +%s) - 285 ))" > "$T/lt2/$DEV"
+check "close: an upgrade-era washdown file resolves to the profile cap" "washdown 378"   "$(lt_profile "$DEV"; lt_load_state "$T/lt2/$DEV" "$_p_dur" 378; echo "$_mode $_cap_eff")"
+claim flood >/dev/null
+check "close: marking it does NOT erase that cap (the mark rewrites the whole run)" "washdown 378" \
+  "$(. "$T/lt2/$DEV"; echo "$mode $cap")"
+drive 0
+check "close: …and it STILL keeps the mark that forbids its handover" "flood_shutoff"   "$(. "$T/lt2/$DEV"; echo "$stop")"
+
+# The WIRING: linktap_tick itself drives the confirm, so a close claimed by the receiver CGI or the LAN
+# door (different processes, same close.<dev> record) is answered by the poll loop.
+rm -f "$T/lt2/close.$DEV" "$T/lt2/$DEV"; : > "$T/spool2"
+check "close: a close claimed by another process is recorded" "send yes" \
+  "$(claim flood) $([ -f "$T/lt2/close.$DEV" ] && echo yes || echo no)"
+tick '{"is_watering":0,"volume":1}'
+check "close: and the very next tick confirms it against the valve" "no" \
+  "$([ -f "$T/lt2/close.$DEV" ] && echo yes || echo no)"
+printf '{"is_watering":1,"volume":3.2,"remain_duration":212}' > "$SHIM_CMD3"
 
 # The gateway push route: rings the loop for a watched valve, from the gateway's address only.
 rm -f "$T/lt/wake"
@@ -2632,8 +2855,11 @@ lt_x	linktap.cycle.change	mode=normal&reason=done" "$(cat "$C17/lo.spool")"
   drain_relay
 )
 check "batch: the resend-all round (seq 6) is still kind delta — a partial reading is never a keyframe" "1" "$(grep -c '"seq":6,.*"kind":"delta"' "$C17/batch")"
+# ⚠️ ITS OWN LT_STATE_DIR. The close is a CLAIM now, so this fresh `sh -c` would otherwise record it in
+# the machine's real /tmp/brvg-linktap — and a record left there by an earlier run, or by a hub-lite
+# actually running on this box, makes the claim refuse and this count read 0. (It did, once.)
 check "flood close is untouched by the cadence: the receiver still closes with the WAN down" "1" \
-  "$(LINKTAP_HOST=192.168.8.50 LINKTAP_GW_ID=GW02 LINKTAP_DEV_IDS=$DEV BRVG_RELAY_SPOOL="$C17/fspool" PATH="$T/bin:$PATH" sh -c ". \"$HL_DIR/brvg-hub-lite.sh\"; echo 0 > \"$SHIM_RC\"; : > \"$SHIM_LOG\"; linktap_flood_close; grep -c '\"cmd\":7' \"$SHIM_LOG\"")"
+  "$(LINKTAP_HOST=192.168.8.50 LINKTAP_GW_ID=GW02 LINKTAP_DEV_IDS=$DEV BRVG_RELAY_SPOOL="$C17/fspool" LT_STATE_DIR="$C17/ltflood" PATH="$T/bin:$PATH" sh -c ". \"$HL_DIR/brvg-hub-lite.sh\"; echo 0 > \"$SHIM_RC\"; : > \"$SHIM_LOG\"; linktap_flood_close; grep -c '\"cmd\":7' \"$SHIM_LOG\"")"
 
 # --- 0.18.3: self-update under a watchdog --------------------------------------------------------
 # The real self_update, guard and restore, against a temp root. opkg is a stub; "installing" writes a new
@@ -2667,7 +2893,9 @@ self_update 2>/dev/null
 check "self_update: installs the offered version" "0.18.4" "$("$W/root/usr/bin/brvg-hub-lite" --version)"
 check "self_update: the new version is on probation, from 0.18.3" "FROM=0.18.3 TO=0.18.4" "$(grep -E '^(FROM|TO)=' "$W/probation" | tr '\n' ' ' | sed 's/ $//')"
 check "self_update: the backup holds EVERY file (collector + door)" "usr/bin/brvg-hub-lite www/brvg/api/hub" "$(tar -tzf "$W/prev.tgz" | sort | tr '\n' ' ' | sed 's/ $//')"
-check "self_update: the guard was written by the OLD version" "1" "$(grep -c 'Written by hub-lite 0.18.3' "$W/guard")"
+# ⚠️ DERIVED, NOT A LITERAL. "The old version" is the script RUNNING this suite, so spelling it out
+# makes the check fail on the next release rather than on a real change (it did, on 0.18.4).
+check "self_update: the guard was written by the OLD version" "1" "$(grep -c "Written by hub-lite $HUB_LITE_VERSION" "$W/guard")"
 check "self_update: the guard service was written" "1" "$(grep -c 'while /bin/sh' "$W/guard.init")"
 check "self_update: no second update while one is on probation" "1:0" "$(self_update 2>/dev/null; echo "$?:$(grep -c upgrade "$W/opkg.log" | awk '{print $1-1}')")"
 
@@ -2703,7 +2931,9 @@ check "confirm: the new version's first successful report ends its probation" "g
 check "guard: after a confirmation it finishes without touching anything" "1:0.18.4" "$(GUARD_NOW=$DL GUARD_ROUTE=1 guard):$("$W/root/usr/bin/brvg-hub-lite" --version)"
 
 wd_reset; self_update 2>/dev/null
-probation_confirm 2>/dev/null   # HUB_LITE_VERSION is still 0.18.3 here: the OLD version reporting
+# Any version that is not the one on probation — named explicitly rather than leaning on the running
+# version being different from OFFER, which stopped being true the moment the release caught up to it.
+_hv=$HUB_LITE_VERSION; HUB_LITE_VERSION=0.0.1-somebody-else; probation_confirm 2>/dev/null; HUB_LITE_VERSION=$_hv
 check "confirm: a report from any other version does NOT confirm the new one" "present" "$([ -f "$W/probation" ] && echo present || echo gone)"
 
 wd_reset; OFFER=0.18.5; NEWBODY='#!/bin/sh

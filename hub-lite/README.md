@@ -216,6 +216,16 @@ If the app shows no position from the router, the order to check is: does `/dev/
   (`LIVE_ONLY_MODEM` / `LIVE_ONLY_LINKTAP` in `brvg-hub-lite.sh`, the Cloud's
   `src/liveTelemetryFields.ts`). Outside a lease a report carries only STATE. `wanKb_*` deltas are
   always sent. A field not in the list is sent. The LAN door's state and snapshots keep every field.
+- **A close is confirmed by the valve, not by the gateway (0.18.3; the daemon 0.3.56's
+  `close_watch.rs`).** Every `cmd 7` — the flood shutoff, the software volume cutoff and a manual
+  Close through `/api/hub/linktap/valve` — used to be judged by whether the gateway ACCEPTED the
+  command. It frequently answers `ret: 0` on a command it never delivers to the valve over RF, so a
+  valve could stay open with the close recorded as a success. Now each valve has at most one close in
+  flight (`close.<dev>` in the state dir, shared with the receiver CGI), success is `is_watering`
+  going false in the valve's own `cmd 3` status, and an unconfirmed close is re-issued at 5, 10, 20,
+  40 s and then every 60 s, giving up 5 minutes after the first attempt. Giving up spools
+  `linktap.valve.close_unconfirmed` (`cause=flood|volume_cap|manual`) so the owner is told the water
+  is still running, and re-arms the software cutoff on a capped run.
 - GPS **report-by-exception** (telemetry design §A7.2): local drag, zone and underway detection run
   on every sample; a position is SENT only when unarmed and it moved `GPS_DEADBAND_M` (default 50 m,
   floor 25 m) from the last sent one and more than twice its accuracy; every sample while leased;

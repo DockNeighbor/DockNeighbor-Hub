@@ -411,6 +411,38 @@ impl Runtime {
         }
     }
 
+    /// A close the hub GAVE UP ON stops holding the software volume cutoff off — on a CAPPED run
+    /// only. Returns whether the mark was released, for the log line.
+    ///
+    /// 🔴 THE TRAP THIS CLOSES. `stop_issued` does two jobs at once: it tells the end how to
+    /// classify, and it tells `cycle::step` not to fire the cutoff again. Marking a close and then
+    /// failing to land it therefore DISARMS the only volume enforcement that exists (the hardware
+    /// ignores `volume_limit` — proven inert on GW-02) for the rest of a run that is still passing
+    /// water. hub-lite had noticed the same hole and patched it by un-marking after a single failed
+    /// packet, which threw away the classification to save the cap; with a bounded retry sequence the
+    /// right moment is the END of it, not the first lost packet.
+    ///
+    /// ⚠️ A WASHDOWN KEEPS ITS MARK. A washdown carries cap 0, so releasing it buys no cutoff — and
+    /// it is the ONE mode `should_hand_over` can reopen, which would reprogram a valve the hub just
+    /// failed to shut into a fresh run. The mark is what forbids that, so it stays.
+    ///
+    /// ⚠️ THE `Washdown` TEST CANNOT FAIL ON ITS OWN HERE, and that is said out loud rather than left
+    /// to look proven: `start_hub_cycle` outlaws a washdown carrying a cap, so `mode == Washdown`
+    /// implies `volume_cap_l <= 0.0` and the next test already catches it. It is kept because hub-lite's
+    /// port DOES need it — an upgrade-era state file (`mode=washdown`, no `cap=` line) resolves to the
+    /// PROFILE's cap, where only the mode says what the run is — and the two hubs answer to one
+    /// contract. Mutation-checked 2026-09-24: removing this clause alone leaves the suite green here
+    /// and turns hub-lite's `STILL keeps the mark that forbids its handover` red.
+    pub fn note_stop_abandoned(&mut self, dev_id: &str) -> bool {
+        let Some(t) = self.tracks.get_mut(&linktap::normalize_dev_id(dev_id)) else { return false };
+        let State::Running(r) = &mut t.state else { return false };
+        if r.mode == cycle::Mode::Washdown || r.volume_cap_l <= 0.0 || r.stop_issued.is_none() {
+            return false;
+        }
+        r.stop_issued = None;
+        true
+    }
+
     pub fn ledger(&self, dev_id: &str) -> Option<&Ledger> {
         self.tracks.get(&linktap::normalize_dev_id(dev_id)).and_then(|t| t.ledger.as_ref())
     }
@@ -646,6 +678,41 @@ mod tests {
         assert_eq!(m.device, format!("lt_{DEV}"));
         let end = reports.iter().find(|x| x.event == "linktap.cycle.change").unwrap();
         assert!(end.params.iter().any(|(k, v)| k == "reason" && v == "unknown"));
+    }
+
+    #[test]
+    fn giving_up_on_a_close_re_arms_the_cutoff_on_a_capped_run_and_never_on_a_washdown() {
+        // 🔴 `stop_issued` DOES TWO JOBS, and the second one is a safety interlock: it is also what
+        // holds the software volume cutoff off. A close that is marked and then never lands would
+        // therefore disarm the only volume enforcement there is for the rest of a run still passing
+        // water — so when the retry sequence gives up, a CAPPED run gets its cutoff back.
+        let mut r = rt(VolUnit::Litre);
+        r.note_hub_open(DEV, T0, cycle::Mode::Normal, 3600, 100.0, false).unwrap();
+        r.note_stop(DEV, EndReason::VolumeCap);
+        // While the close is still being retried the cutoff stays off — no re-issue storm.
+        let (a, _) = r.observe(DEV, &json!({"is_watering":1,"volume":120}), T0 + 10_000);
+        assert_eq!(a, Action::None, "a close in flight must not be re-issued by the cutoff");
+        assert!(r.note_stop_abandoned(DEV), "a capped run releases its mark on give-up");
+        let (a2, _) = r.observe(DEV, &json!({"is_watering":1,"volume":130}), T0 + 20_000);
+        assert_eq!(a2, Action::Stop(EndReason::VolumeCap), "and the cutoff can cut again");
+
+        // ⚠️ A WASHDOWN KEEPS ITS MARK. It carries no cap, so releasing buys nothing — and it is the
+        // one mode `should_hand_over` can reopen, which would reprogram a valve we just failed to
+        // shut into a fresh run.
+        let mut w = rt(VolUnit::Litre);
+        w.note_hub_open(DEV, T0, cycle::Mode::Washdown, 3600, 0.0, true).unwrap();
+        w.note_stop(DEV, EndReason::FloodShutoff);
+        assert!(!w.note_stop_abandoned(DEV), "a washdown must keep the mark that forbids its handover");
+        match &w.tracks[DEV].state {
+            State::Running(run) => assert_eq!(run.stop_issued, Some(EndReason::FloodShutoff)),
+            _ => panic!("still running"),
+        }
+        // An idle valve, an unwatched valve and a run with no mark are all no-ops rather than panics.
+        let mut idle = rt(VolUnit::Litre);
+        assert!(!idle.note_stop_abandoned(DEV));
+        assert!(!idle.note_stop_abandoned("ffffeeeeddddcccc"));
+        idle.note_hub_open(DEV, T0, cycle::Mode::Normal, 3600, 100.0, false).unwrap();
+        assert!(!idle.note_stop_abandoned(DEV), "nothing was marked, so nothing is released");
     }
 
     #[test]

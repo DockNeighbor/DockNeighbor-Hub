@@ -101,6 +101,27 @@ pub fn coerce_watering(v: &serde_json::Value) -> bool {
     }
 }
 
+/// THE VALVE'S OWN ANSWER to "are you still running", out of a `cmd 3` reply — `Some(true)` open,
+/// `Some(false)` shut, `None` when this reply does not say.
+///
+/// 🔴 `None` IS NOT `Some(false)`, AND THE DIFFERENCE IS THE WHOLE VALUE OF THIS FUNCTION. It is the
+/// confirmation source for a close (close_watch.rs): a gateway that timed out, answered HTTP 500,
+/// returned junk, or replied about a valve it cannot reach over RF has told us NOTHING about the
+/// valve. Folding that into "not watering" would confirm a close that never happened — silently, and
+/// in the direction of looking correct. Callers must treat `None` as "still open, keep trying".
+///
+/// Reads the same `dev_stat[0]`-or-bare-object shape and the same `is_watering` field, through the
+/// same `coerce_watering`, that the poll loop already feeds to the cycle machine — so a close is
+/// confirmed by exactly the fact the rest of the hub calls "the valve is open".
+pub fn watering_from_status(data: &serde_json::Value) -> Option<bool> {
+    let d = data
+        .get("dev_stat")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .unwrap_or(data);
+    d.get("is_watering").map(coerce_watering)
+}
+
 /// Does this valve actually METER flow? `is_flm_plugin` is authoritative when present. LinkTap
 /// meters on the G2/G2S only, so a non-metering valve can only ever be bounded by TIME.
 pub fn reports_volume(data: &serde_json::Value) -> bool {
@@ -330,6 +351,22 @@ mod tests {
         // The three transport failures post_command produces: no connection, non-2xx, not JSON.
         let dead = GatewayReply { ok: false, ret: None, data: serde_json::Value::Null, error: Some("timed out".into()) };
         assert!(!reply_reached_gateway(&dead));
+    }
+
+    #[test]
+    fn the_valves_own_state_is_read_from_a_status_reply_and_silence_is_not_shut() {
+        // Both shapes the gateway uses, and the `1`/`"true"` spellings coerce_watering accepts.
+        assert_eq!(watering_from_status(&json!({ "dev_stat": [{ "is_watering": true }] })), Some(true));
+        assert_eq!(watering_from_status(&json!({ "dev_stat": [{ "is_watering": "0" }] })), Some(false));
+        assert_eq!(watering_from_status(&json!({ "is_watering": 1 })), Some(true));
+        assert_eq!(watering_from_status(&json!({ "is_watering": false })), Some(false));
+        // 🔴 SILENCE IS NOT "SHUT". A reply that does not carry the field — a `ret: 5` refusal, a
+        // transport failure's Null, an empty dev_stat — must be None, because close_watch.rs reads
+        // `Some(false)` as "the close is CONFIRMED" and would otherwise confirm on a timeout.
+        assert_eq!(watering_from_status(&json!({ "ret": 5 })), None);
+        assert_eq!(watering_from_status(&json!({ "dev_stat": [] })), None);
+        assert_eq!(watering_from_status(&serde_json::Value::Null), None);
+        assert_eq!(watering_from_status(&json!({ "dev_stat": [{ "volume": 1.0 }] })), None);
     }
 
     #[test]
