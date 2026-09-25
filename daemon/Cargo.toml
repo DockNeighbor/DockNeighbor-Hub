@@ -1,5 +1,5 @@
 # The BRVG HUB DAEMON — the desktop hub as its own application (owner ruling 2026-08-19,
-# HUB-PROXY.md): "the hub needs to be its own installer and application for both OSX and windows.
+# sc4-internal docs/ONSITE.md §7): "the hub needs to be its own installer and application for both OSX and windows.
 # you can install a hub only on both platforms without the UI." Public by the same ruling: "i want
 # the standalone hub code to be all public."
 #
@@ -21,7 +21,7 @@ rust-version = "1.77.2"
 license = "Apache-2.0"
 
 # Its own workspace on purpose: this crate builds separately (its own lockfile, its own releases —
-# HUB-PROXY.md increment D), and the app consumes it only as a path dependency.
+# sc4-internal docs/ONSITE.md §7), and the app consumes it only as a path dependency.
 [workspace]
 
 [lib]

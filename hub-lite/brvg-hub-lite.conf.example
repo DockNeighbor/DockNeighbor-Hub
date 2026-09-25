@@ -51,7 +51,7 @@ AT_PORT=/dev/ttyUSB2
 # Raw NMEA serial device for GPS_SOURCE=nmea (e.g. a u-blox USB dongle: /dev/ttyACM0).
 GPS_DEVICE=""
 
-# --- Relay (X750-class routers — HUB-PROXY.md relay tier) ---------------------------------------
+# --- Relay (X750-class routers — sc4-internal docs/ONSITE.md) ------------------------------------
 # When enabled, a small LAN-only web listener (uhttpd) receives the Shellys' webhooks locally and
 # this hub-lite rolls them up into ONE cloud report per interval — the metered link pays per TLS
 # handshake, not per byte, so fewer connections is the whole saving. Alarms are never held: the
