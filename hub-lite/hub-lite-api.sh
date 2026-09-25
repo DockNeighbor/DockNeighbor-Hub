@@ -43,6 +43,7 @@ RT_FILE="${BRVG_HUB_LITE_ROUTERS:-/usr/libexec/brvg-hub-lite/routers}"
 DN_OS_UPGRADE="${BRVG_DN_OS_UPGRADE:-/usr/sbin/dn-os-upgrade}"
 DN_PKG_UPGRADE="${BRVG_DN_PKG_UPGRADE:-/usr/sbin/dn-pkg-upgrade}"
 DN_RELEASE="${BRVG_DN_RELEASE:-/etc/dn-release}"
+DN_NET="${BRVG_DN_NET:-/usr/sbin/dn-net}"
 export LT_STATE_DIR
 
 # The first-run window, from service start: the daemon's adopt::ADOPTION_WINDOW.
@@ -197,6 +198,20 @@ authorize() {
     configure)  fail 403 "changing the hub's settings needs an admin, co-owner or owner" ;;
     administer) fail 403 "rotating or removing the hub needs a co-owner or the owner" ;;
     *)          fail 403 "this key may not read this hub" ;;
+  esac
+}
+
+# Run dn-net VERB with BODY on stdin and answer with what it said: 0 -> 200 + its JSON, 2 -> 400 + its reason,
+# anything else -> 500. Absent (not DockNeighbor OS) -> 501.
+net_call() {
+  [ -x "$DN_NET" ] || fail 501 "not DockNeighbor OS"
+  _ne=$(mktemp 2>/dev/null || echo "/tmp/brvg-net.$$")
+  _no=$(printf '%s' "${2:-}" | "$DN_NET" "$1" 2>"$_ne"); _nr=$?
+  _nm=$(head -c 300 "$_ne" 2>/dev/null | tr '\n' ' '); rm -f "$_ne"
+  case "$_nr" in
+    0) reply 200 "$_no" ;;
+    2) fail 400 "${_nm:-bad request}" ;;
+    *) fail 500 "${_nm:-dn-net $1 failed}" ;;
   esac
 }
 
@@ -619,6 +634,30 @@ case "$method:$verb" in
     run_detached "$DN_PKG_UPGRADE"
     reply 202 '{"status":"package upgrade started"}'
     ;;
+
+  # ---- DN device API: the router's network (0.18.6) -------------------------------------------
+  # The app's NetworkDeviceDriver, route for route, over DockNeighbor OS's dn-net (JSON in, JSON out; its exit 2 is
+  # a 400 with its reason). Reading is monitor, changing is configure (owner, 2026-09-25: reboot included).
+  # A monitor gets Wi-Fi WITHOUT its keys. Only on DockNeighbor OS: anywhere else 501, the app keeps the vendor's way.
+  GET:/net/wan)               authorize monitor;   net_call wan ;;
+  GET:/net/lan)               authorize monitor;   net_call lan-get ;;
+  POST:/net/lan)              authorize configure; read_body; net_call lan-set "$BODY" ;;
+  GET:/net/wifi)              authorize monitor
+                              if role_may "$ROLE" configure; then net_call wifi-get; else DN_NET_REDACT=1 net_call wifi-get; fi ;;
+  POST:/net/wifi)             authorize configure; read_body; net_call wifi-set "$BODY" ;;
+  GET:/net/uplink)            authorize monitor;   net_call uplink-get ;;
+  POST:/net/uplink)           authorize configure; read_body; net_call uplink-join "$BODY" ;;
+  DELETE:/net/uplink)         authorize configure; net_call uplink-disconnect ;;
+  # A scan takes the radio off-channel for seconds, so it is a configure action, not a read.
+  GET:/net/uplink/scan)       authorize configure; net_call uplink-scan ;;
+  GET:/net/uplink/saved)      authorize monitor;   net_call uplink-saved ;;
+  DELETE:/net/uplink/saved)   authorize configure; read_body; net_call uplink-forget "$BODY" ;;
+  GET:/net/clients)           authorize monitor;   net_call clients ;;
+  POST:/net/clients/block)    authorize configure; read_body; net_call client-block "$BODY" ;;
+  GET:/net/reservations)      authorize monitor;   net_call reservations ;;
+  POST:/net/reservations)     authorize configure; read_body; net_call reservation-add "$BODY" ;;
+  DELETE:/net/reservations)   authorize configure; read_body; net_call reservation-remove "$BODY" ;;
+  POST:/reboot)               authorize configure; net_call reboot ;;
 
   # ---- identity / bootstrap (OPEN, first run only) ----------------------------------------------
   # Setup from the app with no SSH, the daemon's h_identity/h_bootstrap: open only while the router

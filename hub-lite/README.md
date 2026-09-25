@@ -60,6 +60,12 @@ worker on a timer, so the vehicle reports without the app being onsite.
   firmware from the signed channel; the check runs first, so a refusal comes back as an error; the flash runs
   detached; 202), `GET` / `POST /api/hub/os/packages` (level 1 for DockNeighbor OS's own dn-* packages; 202).
   Reading is `monitor`; changing the firmware is `administer`.
+- **The DN device API** (0.18.7), also DockNeighbor OS only (501 elsewhere): the app's `NetworkDeviceDriver`, route
+  for route, over DockNeighbor OS's `dn-net`. `GET /api/hub/net/wan`; `GET`/`POST /net/lan`; `GET`/`POST /net/wifi`;
+  `GET`/`POST`/`DELETE /net/uplink` (join takes `role`: `lan` = the boat's own network, open like LAN; `wan` = an
+  internet uplink, restricted; default `wan`); `GET /net/uplink/scan`; `GET`/`DELETE /net/uplink/saved`;
+  `GET /net/clients`, `POST /net/clients/block`; `GET`/`POST`/`DELETE /net/reservations`; `POST /api/hub/reboot`.
+  Reading is `monitor` (Wi-Fi WITHOUT its keys); every change, the scan and reboot are `configure`.
 
 **Deliberately NOT here** (a full hub, or the app, does these)
 - The relay socket — a persistent WebSocket from busybox ash is not worth the overlay.

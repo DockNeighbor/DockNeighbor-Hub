@@ -3092,6 +3092,69 @@ check "os: a monitor's refused POSTs ran nothing" "0" "$(grep -c -e 'os apply' -
 r=$(osapi POST /os/upgrade "" OS_AVAIL=0.1.4 HTTP_AUTHORIZATION="Bearer wrong")
 check "os/upgrade: a wrong key is 401" "401" "$(status_of "$r")"
 
+# --- 0.18.7: the DN device API routes (/api/hub/net/*, /api/hub/reboot) -------------------------
+N="$T/net"; mkdir -p "$N"
+cat > "$N/dn-net" <<'EOF_NET'
+#!/bin/sh
+_b=$(cat)
+printf '%s|%s|%s\n' "$1" "$_b" "${DN_NET_REDACT:-}" >> "$NET_DIR/calls"
+case "${NET_RC:-0}" in
+  0) echo "{\"verb\":\"$1\"}" ;;
+  2) echo "the DHCP range must lie inside the LAN" >&2; exit 2 ;;
+  *) echo "uci commit wireless failed" >&2; exit 1 ;;
+esac
+EOF_NET
+chmod 755 "$N/dn-net"
+netapi() { api "$@" NET_DIR="$N" BRVG_DN_NET="$N/dn-net"; }
+last() { tail -1 "$N/calls"; }
+printf '# test keys\n%s monitor\n%s control\n' "$(printf '%s' 'mon-key' | sha256sum | cut -c1-64)" "$(printf '%s' 'ctl-key' | sha256sum | cut -c1-64)" > "$N/keys"
+as_monitor() { netapi "$@" HTTP_AUTHORIZATION="Bearer mon-key" BRVG_MEMBER_KEYS="$N/keys"; }
+as_control() { netapi "$@" HTTP_AUTHORIZATION="Bearer ctl-key" BRVG_MEMBER_KEYS="$N/keys"; }
+
+r=$(api GET /net/wan "" BRVG_DN_NET="$N/absent")
+check "net: not DockNeighbor OS is 501, so the app keeps the vendor's way" "501" "$(status_of "$r")"
+: > "$N/calls"; r=$(netapi GET /net/wan "")
+check "net/wan: dn-net's answer, passed through" "200 wan" "$(status_of "$r") $(body_of "$r" | sed -n 's/.*"verb":"\([^"]*\)".*/\1/p')"
+: > "$N/calls"; r=$(netapi POST /net/lan '{"ip":"10.20.0.1"}')
+check "net/lan: POST hands the body to lan-set on stdin" "200 lan-set|{\"ip\":\"10.20.0.1\"}|" "$(status_of "$r") $(last)"
+r=$(netapi POST /net/lan '{"ip":"10.20.0.1"}' NET_RC=2)
+check "net: dn-net's refusal (exit 2) is a 400 with its reason" "400 1" "$(status_of "$r") $(body_of "$r" | grep -c 'inside the LAN')"
+r=$(netapi POST /net/wifi '{"iface":"dn_ap"}' NET_RC=1)
+check "net: dn-net's failure is a 500 with its reason" "500 1" "$(status_of "$r") $(body_of "$r" | grep -c 'uci commit')"
+
+# Map: each route reaches the right verb.
+: > "$N/calls"
+netapi GET /net/lan "" >/dev/null; netapi GET /net/wifi "" >/dev/null; netapi POST /net/wifi '{}' >/dev/null
+netapi GET /net/uplink "" >/dev/null; netapi POST /net/uplink '{"ssid":"B","role":"lan"}' >/dev/null; netapi DELETE /net/uplink "" >/dev/null
+netapi GET /net/uplink/scan "" >/dev/null; netapi GET /net/uplink/saved "" >/dev/null; netapi DELETE /net/uplink/saved '{"ssid":"B"}' >/dev/null
+netapi GET /net/clients "" >/dev/null; netapi POST /net/clients/block '{"mac":"aa:bb:cc:00:00:01","blocked":true}' >/dev/null
+netapi GET /net/reservations "" >/dev/null; netapi POST /net/reservations '{"mac":"aa:bb:cc:00:00:01","ip":"192.168.8.21"}' >/dev/null
+netapi DELETE /net/reservations '{"mac":"aa:bb:cc:00:00:01"}' >/dev/null; netapi POST /reboot "" >/dev/null
+check "net: every route reaches its dn-net verb" \
+  "lan-get wifi-get wifi-set uplink-get uplink-join uplink-disconnect uplink-scan uplink-saved uplink-forget clients client-block reservations reservation-add reservation-remove reboot" \
+  "$(cut -d'|' -f1 "$N/calls" | tr '\n' ' ' | sed 's/ $//')"
+check "net: the uplink role in the body reaches dn-net" "1" "$(grep -c '^uplink-join|.*"role":"lan"' "$N/calls")"
+
+# Who may: reading is monitor, changing is configure (reboot included, owner 2026-09-25); a monitor never sees keys.
+: > "$N/calls"; r=$(netapi GET /net/wifi "")
+check "net/wifi: an owner gets the keys (no redaction)" "200 wifi-get||" "$(status_of "$r") $(last)"
+: > "$N/calls"; r=$(as_monitor GET /net/wifi "")
+check "net/wifi: a monitor gets Wi-Fi WITHOUT its keys" "200 wifi-get||1" "$(status_of "$r") $(last)"
+: > "$N/calls"
+for _rt in "GET /net/wan" "GET /net/lan" "GET /net/uplink" "GET /net/uplink/saved" "GET /net/clients" "GET /net/reservations"; do
+  set -- $_rt; r=$(as_monitor "$1" "$2" ""); [ "$(status_of "$r")" = 200 ] || echo "monitor refused $_rt" >> "$N/refused"
+done
+check "net: a monitor may read every GET route but the scan" "" "$(cat "$N/refused" 2>/dev/null)"
+: > "$N/calls"
+for _rt in "POST /net/lan" "POST /net/wifi" "POST /net/uplink" "DELETE /net/uplink" "GET /net/uplink/scan" "DELETE /net/uplink/saved" "POST /net/clients/block" "POST /net/reservations" "DELETE /net/reservations" "POST /reboot"; do
+  set -- $_rt; r=$(as_monitor "$1" "$2" '{}'); [ "$(status_of "$r")" = 403 ] || echo "monitor allowed $_rt" >> "$N/allowed"
+  r=$(as_control "$1" "$2" '{}'); [ "$(status_of "$r")" = 403 ] || echo "control allowed $_rt" >> "$N/allowed"
+done
+check "net: monitor and control are refused every change (403), the scan and reboot included" "" "$(cat "$N/allowed" 2>/dev/null)"
+check "net: ...and not one refused call reached dn-net" "0" "$(wc -l < "$N/calls" | tr -d ' ')"
+r=$(netapi POST /reboot "" HTTP_AUTHORIZATION="Bearer wrong")
+check "reboot: a wrong key is 401" "401" "$(status_of "$r")"
+
 [ -n "${KEEP_T:-}" ] && echo "T=$T" || rm -rf "$T"
 
 # --- the PACKAGED scripts are the tested scripts ----------------------------------------------
