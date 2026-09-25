@@ -2514,11 +2514,20 @@ lt_mark_stop() {
 LT_CLOSE_CONFIRM_WITHIN="${LT_CLOSE_CONFIRM_WITHIN:-10}"
 LT_CLOSE_RETRY_AT="${LT_CLOSE_RETRY_AT:-5 10 20 40}"
 LT_CLOSE_EVERY="${LT_CLOSE_EVERY:-60}"
-# 🔴 QUOTED IN WORDS A CUSTOMER READS: the worker's approved alert text (DockNeighbor-Cloud
-# alertText.ts, owner 2026-09-25) says "after 5 minutes of retries", pinned there against its own
-# CLOSE_GIVE_UP_MS. Shorten this window without changing that copy and the product lies to the person
-# it is warning. Change both, and the daemon's CloseSchedule::PRODUCTION with them.
-LT_CLOSE_GIVE_UP="${LT_CLOSE_GIVE_UP:-300}"
+# 🔴 TWO NUMBERS SINCE 2026-09-25, AND THE SPLIT IS THE OWNER'S. Asked whether to move the
+# give-up window from 5 minutes to 30, he chose: TELL ME AT FIVE, KEEP TRYING TO THIRTY. That value had
+# been both the end of retrying and the moment he was told, and it matters because it IS the warning
+# delay — waiting thirty minutes to speak would leave someone whose flood shutoff failed unaware while
+# water ran.
+#
+# LT_CLOSE_ALERT_AT IS QUOTED IN WORDS A CUSTOMER READS: the worker's approved text (DockNeighbor-Cloud
+# alertText.ts) says "after 5 minutes of retries", pinned there against its own CLOSE_ALERT_AT_MS.
+# Move it without changing that copy and the product lies to the person it is warning. LT_CLOSE_GIVE_UP
+# is quoted by NOTHING, deliberately: he is told what is true when it is known, not promised a deadline
+# he never hears. Keep both in lockstep with the daemon's CloseSchedule::PRODUCTION;
+# check-valve-close-window-drift.mjs compares all of it.
+LT_CLOSE_ALERT_AT="${LT_CLOSE_ALERT_AT:-300}"
+LT_CLOSE_GIVE_UP="${LT_CLOSE_GIVE_UP:-1800}"
 
 # ⚠️ CROSS-REPO CONTRACT — the same string in the daemon (close_watch::CLOSE_UNCONFIRMED_EVENT) and in
 # the worker (hubValveState.ts HUB_VALVE_CLOSE_UNCONFIRMED_EVENT). It carries no "flood", "leak" or
@@ -2562,6 +2571,19 @@ lt_close_step() {
   if [ "$_cs_el" -ge "$(lt_close_due_at $(( $3 + 1 )))" ]; then echo reissue; else echo wait; fi
 }
 
+# PURE: must the owner be told about this close NOW? $1 first  $2 alerted(0/1)  $3 watering(0/1)  $4 now.
+#
+# Separate from lt_close_step on purpose (same shape as the daemon's `alert_due`): the alert point and
+# the end of retrying are two different instants, and folding them into one answer would put the caller
+# back to treating "tell him" and "stop trying" as one decision — the very thing the split replaced.
+# True at most once per close; the caller records CL_ALERTED once it has spoken.
+lt_close_alert_due() {
+  [ "$3" = "1" ] || return 1
+  [ "${2:-0}" = "1" ] && return 1
+  _ca_el=$(( $4 - $1 )); [ "$_ca_el" -lt 0 ] && _ca_el=0
+  [ "$_ca_el" -ge "$LT_CLOSE_ALERT_AT" ]
+}
+
 # PURE: seconds until this close must be looked at again. $1 first  $2 last  $3 tries  $4 now.
 # The smaller of "the next re-issue falls due" and "this issue's confirm deadline expires", so every
 # command is answered inside LT_CLOSE_CONFIRM_WITHIN even out where the re-issues are a minute apart.
@@ -2573,6 +2595,14 @@ lt_close_next_look() {
   _cn_t=$(( $1 + $(lt_close_due_at $(( $3 + 1 ))) ))
   _cn_conf=$(( $2 + LT_CLOSE_CONFIRM_WITHIN ))
   [ "$_cn_conf" -gt "$4" ] && [ "$_cn_conf" -lt "$_cn_t" ] && _cn_t="$_cn_conf"
+  # ⚠️ AND THE ALERT POINT, while it is still ahead and unspoken ($5, default 0). Out past the
+  # named offsets the re-issues are a minute apart, so without this the five-minute alert would be
+  # delivered whenever the next re-issue happened to land — up to 60 s late, on the one alert whose
+  # whole value is promptness.
+  if [ "${5:-0}" != "1" ]; then
+    _cn_al=$(( $1 + LT_CLOSE_ALERT_AT ))
+    [ "$_cn_al" -gt "$4" ] && [ "$_cn_al" -lt "$_cn_t" ] && _cn_t="$_cn_al"
+  fi
   _cn_give=$(( $1 + LT_CLOSE_GIVE_UP ))
   [ "$_cn_give" -lt "$_cn_t" ] && _cn_t="$_cn_give"
   _cn_s=$(( _cn_t - $4 )); [ "$_cn_s" -lt 1 ] && _cn_s=1
@@ -2598,7 +2628,7 @@ lt_watering_from_status() {
 # Load $LT_STATE_DIR/close.<dev> into _cl_cause _cl_first _cl_last _cl_tries. Non-zero when there is
 # no close in flight (or the record is unusable, which is treated the same way).
 lt_close_load() {
-  CL_CAUSE=""; CL_FIRST=""; CL_LAST=""; CL_TRIES=""
+  CL_CAUSE=""; CL_FIRST=""; CL_LAST=""; CL_TRIES=""; CL_ALERTED=""
   [ -f "$1" ] || return 1
   # shellcheck disable=SC1090
   . "$1"
@@ -2608,6 +2638,9 @@ lt_close_load() {
   _cl_first="$CL_FIRST"
   _cl_last="${CL_LAST:-$CL_FIRST}"
   _cl_tries="${CL_TRIES:-1}"
+  # Absent in records written before 0.18.5 — an upgrade mid-close reads as "not yet told", which is
+  # the safe direction: at worst he hears once more about a valve that is still open.
+  _cl_alerted="${CL_ALERTED:-0}"
   return 0
 }
 
@@ -2615,7 +2648,7 @@ lt_close_load() {
 # lt_write_state: the receiver CGI and the poll loop are different processes reading the same file.
 lt_close_write() {
   _cwf="$1.$$"
-  printf 'CL_CAUSE=%s\nCL_FIRST=%s\nCL_LAST=%s\nCL_TRIES=%s\n' "$2" "$3" "$4" "$5" > "$_cwf" 2>/dev/null \
+  printf 'CL_CAUSE=%s\nCL_FIRST=%s\nCL_LAST=%s\nCL_TRIES=%s\nCL_ALERTED=%s\n' "$2" "$3" "$4" "$5" "${6:-0}" > "$_cwf" 2>/dev/null \
     && mv "$_cwf" "$1" 2>/dev/null
   rm -f "$_cwf" 2>/dev/null
   return 0
@@ -2684,7 +2717,7 @@ lt_drive_closes() {
     _dc_d="${_dc_f##*/close.}"
     [ -n "$_dc_d" ] || continue
     lt_close_load "$_dc_f" || { rm -f "$_dc_f"; continue; }
-    _dc_cause="$_cl_cause"; _dc_first="$_cl_first"; _dc_last="$_cl_last"; _dc_tries="$_cl_tries"
+    _dc_cause="$_cl_cause"; _dc_first="$_cl_first"; _dc_last="$_cl_last"; _dc_tries="$_cl_tries"; _dc_alerted="$_cl_alerted"
     # Unknown is "still open" (see lt_watering_from_status).
     _dc_w=""
     if _dc_reply=$(lt_post "{\"cmd\":3,\"gw_id\":\"$LINKTAP_GW_ID\",\"dev_id\":\"$_dc_d\"}" 10); then
@@ -2692,37 +2725,53 @@ lt_drive_closes() {
     fi
     [ -n "$_dc_w" ] || _dc_w=1
     _dc_now=$(date +%s)
+    # 🔴 TELL THE OWNER AT LT_CLOSE_ALERT_AT, AND KEEP TRYING (owner 2026-09-25). Outside the
+    # case below because it is not a branch of the same decision — retrying continues straight across
+    # this boundary. Recorded BEFORE the spool, the same ordering as every other mark here: a hub that
+    # dies between the two must not wake and tell him a second time.
+    if lt_close_alert_due "$_dc_first" "$_dc_alerted" "$_dc_w" "$_dc_now"; then
+      _dc_alerted=1
+      lt_close_write "$_dc_f" "$_dc_cause" "$_dc_first" "$_dc_last" "$_dc_tries" 1
+      log "linktap: ${_dc_d} - close STILL not confirmed after $(( _dc_now - _dc_first ))s (${_dc_tries} attempts, ${_dc_cause} close) - telling the owner; retries continue to ${LT_CLOSE_GIVE_UP}s"
+      # 🔴 THE OWNER'S ASK (Jonathan, 2026-09-24): "this also should tell the user if it was not able
+      # to close the valve during a flood event". Same alert for a volume-cutoff close and a manual
+      # one — that cutoff is the only volume enforcement there is, and a person who pressed Close was
+      # told it worked; `cause` is what tells them apart downstream.
+      lt_spool "lt_${_dc_d}" "$LT_CLOSE_UNCONFIRMED_EVENT" "cause=${_dc_cause}&attempts=${_dc_tries}&secs=$(( _dc_now - _dc_first ))"
+    fi
     case "$(lt_close_step "$_dc_first" "$_dc_last" "$_dc_tries" "$_dc_w" "$_dc_now")" in
       confirmed)
         rm -f "$_dc_f"
         log "linktap: ${_dc_d} - the valve reports CLOSED (${_dc_cause} close confirmed after ${_dc_tries} attempt(s))"
         ;;
       wait)
-        _dc_look=$(lt_close_next_look "$_dc_first" "$_dc_last" "$_dc_tries" "$_dc_now")
+        _dc_look=$(lt_close_next_look "$_dc_first" "$_dc_last" "$_dc_tries" "$_dc_now" "$_dc_alerted")
         { [ -z "$LT_CLOSE_LOOK" ] || [ "$_dc_look" -lt "$LT_CLOSE_LOOK" ]; } && LT_CLOSE_LOOK="$_dc_look"
         ;;
       reissue)
         _dc_tries=$(( _dc_tries + 1 ))
         # Recorded before the command goes out, the same ordering as the first attempt — and it is
         # also what stops a second pass re-sending the same attempt.
-        lt_close_write "$_dc_f" "$_dc_cause" "$_dc_first" "$_dc_now" "$_dc_tries"
+        lt_close_write "$_dc_f" "$_dc_cause" "$_dc_first" "$_dc_now" "$_dc_tries" "$_dc_alerted"
         if lt_post "$(linktap_stop_body "$LINKTAP_GW_ID" "$_dc_d")" 5 >/dev/null; then _dc_took="took it"; else _dc_took="refused it"; fi
         log "linktap: ${_dc_d} - close not confirmed after $(( _dc_now - _dc_first ))s, re-issuing cmd 7 (attempt ${_dc_tries}) - gateway ${_dc_took}"
         # Deliberately NO linktap.stop_failed per retry: the first attempt's failure is already
         # reported by its caller, and one event per retry would be nine events per dead gateway.
-        _dc_look=$(lt_close_next_look "$_dc_first" "$_dc_now" "$_dc_tries" "$_dc_now")
+        _dc_look=$(lt_close_next_look "$_dc_first" "$_dc_now" "$_dc_tries" "$_dc_now" "$_dc_alerted")
         { [ -z "$LT_CLOSE_LOOK" ] || [ "$_dc_look" -lt "$LT_CLOSE_LOOK" ]; } && LT_CLOSE_LOOK="$_dc_look"
         ;;
       gave_up)
         rm -f "$_dc_f"
-        log "linktap: ${_dc_d} - GAVE UP closing the valve after ${_dc_tries} attempt(s) over $(( _dc_now - _dc_first ))s (${_dc_cause} close) - alerting the owner"
+        log "linktap: ${_dc_d} - GAVE UP closing the valve after ${_dc_tries} attempt(s) over $(( _dc_now - _dc_first ))s (${_dc_cause} close) - the owner was told at ${LT_CLOSE_ALERT_AT}s"
         lt_profile "$_dc_d"
         lt_close_abandon "$LT_STATE_DIR/$_dc_d" "$_p_dur" "$_p_cap"
-        # 🔴 THE OWNER'S ASK (Jonathan, 2026-09-24): "this also should tell the user if it was not able
-        # to close the valve during a flood event". Same alert for a volume-cutoff close and a manual
-        # one — that cutoff is the only volume enforcement there is, and a person who pressed Close was
-        # told it worked; `cause` is what tells them apart downstream.
-        lt_spool "lt_${_dc_d}" "$LT_CLOSE_UNCONFIRMED_EVENT" "cause=${_dc_cause}&attempts=${_dc_tries}&secs=$(( _dc_now - _dc_first ))"
+        # ⚠️ NO SPOOL HERE. He heard about this valve at LT_CLOSE_ALERT_AT; raising the event
+        # again would be a second alert about one failure, 25 minutes later, saying the same thing.
+        # Giving up is not news to him — it is the hub ending a sequence he already knows failed.
+        #
+        # The cap release (lt_close_abandon) stays HERE and not at the alert: between the two instants
+        # the hub issues cmd 7 every 60 s, the same command the cutoff would send, so releasing early
+        # would buy nothing and would set the cutoff and the retry loop chasing one valve.
         ;;
     esac
   done

@@ -82,7 +82,14 @@ pub struct CloseSchedule {
     pub retry_at_ms: &'static [i64],
     /// After `retry_at_ms` is exhausted, one re-issue this often.
     pub then_every_ms: i64,
-    /// Milliseconds from the first attempt at which the hub stops trying and tells the owner.
+    /// Milliseconds from the first attempt at which the OWNER IS TOLD the valve did not close.
+    ///
+    /// 🔴 THIS IS THE NUMBER IN THE ALERT, and it is deliberately NOT `give_up_ms`. The worker's
+    /// approved text says *"after 5 minutes of retries"*; `CLOSE_ALERT_AT_MS` in
+    /// DockNeighbor-Cloud `hubValveState.ts` mirrors THIS field, and a Cloud test parses the minutes
+    /// back out of the sentence. Move this and the copy turns red, which is the point.
+    pub alert_at_ms: i64,
+    /// Milliseconds from the first attempt at which the hub stops trying. Later than `alert_at_ms`.
     pub give_up_ms: i64,
 }
 
@@ -104,17 +111,27 @@ impl CloseSchedule {
     /// exists for it recovers a lost RF delivery three seconds sooner. Moving the first retry to
     /// 10 s would spend that recovery time to save a command; the owner owns that trade, so his
     /// number is kept and the interaction is written down here rather than quietly adjusted.
-    /// 🔴 `give_up_ms` IS QUOTED IN WORDS A CUSTOMER READS. The worker's approved alert text
+    /// 🔴 TWO NUMBERS SINCE 2026-09-25, AND THE SPLIT IS THE OWNER'S. Asked whether to move the
+    /// give-up window from 5 minutes to 30, he chose (a): TELL ME AT FIVE, KEEP TRYING TO THIRTY.
+    /// The distinction had not existed before — one value both ended the retrying and triggered the
+    /// alert — and it matters because that value IS the warning delay. Waiting thirty minutes to
+    /// speak would leave someone whose flood shutoff failed unaware while water ran; splitting buys
+    /// 25 further minutes of recovery attempts and costs nothing in warning speed.
+    ///
+    /// 🔴 `alert_at_ms` IS QUOTED IN WORDS A CUSTOMER READS. The worker's approved alert text
     /// (DockNeighbor-Cloud `alertText.ts`, owner 2026-09-25) says *"after 5 minutes of retries"*, and
-    /// its `CLOSE_GIVE_UP_MS` mirrors this constant with a test that parses the number back out of
-    /// the sentence. Shortening this window without changing that copy makes the product lie to the
-    /// person it is warning; the Cloud test turns red only if `CLOSE_GIVE_UP_MS` moves with it, so
-    /// change BOTH. Same for hub-lite's `LT_CLOSE_GIVE_UP`.
+    /// its `CLOSE_ALERT_AT_MS` mirrors THAT field with a test that parses the number back out of the
+    /// sentence. Moving it without changing the copy makes the product lie to the person it is
+    /// warning. `give_up_ms` is quoted by NOTHING, on purpose: the owner is told what is true when it
+    /// is known, not promised a deadline he never hears. Same split in hub-lite
+    /// (`LT_CLOSE_ALERT_AT` / `LT_CLOSE_GIVE_UP`), and `check-valve-close-window-drift.mjs` compares
+    /// all of it.
     pub const PRODUCTION: CloseSchedule = CloseSchedule {
         confirm_within_ms: 10 * SEC,
         retry_at_ms: &[5 * SEC, 10 * SEC, 20 * SEC, 40 * SEC],
         then_every_ms: 60 * SEC,
-        give_up_ms: 300 * SEC,
+        alert_at_ms: 300 * SEC,
+        give_up_ms: 1800 * SEC,
     };
 }
 
@@ -128,6 +145,12 @@ pub struct CloseWatch {
     pub last_ms: i64,
     /// How many `cmd 7`s this sequence has sent, including the first. Never zero.
     pub attempts: u32,
+    /// Has the owner already been told about THIS sequence?
+    ///
+    /// Exists because the alert now fires long before the retrying stops: without it, every pass
+    /// after the five-minute mark would raise the event again — 25 further minutes of a 60-second
+    /// loop, so roughly 25 duplicate alerts per stuck valve.
+    pub alerted: bool,
 }
 
 impl CloseWatch {
@@ -135,7 +158,7 @@ impl CloseWatch {
     /// the reply is not evidence, and a hub that dies between the send and the record must not
     /// forget it asked.
     pub fn opened(cause: CloseCause, at_ms: i64) -> CloseWatch {
-        CloseWatch { cause, first_ms: at_ms, last_ms: at_ms, attempts: 1 }
+        CloseWatch { cause, first_ms: at_ms, last_ms: at_ms, attempts: 1, alerted: false }
     }
 }
 
@@ -148,8 +171,23 @@ pub enum CloseStep {
     Reissue,
     /// Still open, nothing due yet.
     Wait,
-    /// Still open and the give-up window has passed: stop trying and tell the owner.
+    /// Still open and the give-up window has passed: stop trying.
+    ///
+    /// ⚠️ NO LONGER "AND TELL THE OWNER" — he was told at `alert_at_ms`, long before this. A caller
+    /// that raises the event here as well sends it twice.
     GaveUp,
+}
+
+/// PURE: must the owner be told about this valve NOW?
+///
+/// Separate from `close_step` on purpose. The alert point and the end of retrying are two different
+/// instants, and folding them into one enum would put the caller back in the position of treating
+/// "tell him" and "stop trying" as the same decision — which is exactly the design the owner's split
+/// replaced. Retrying continues across this boundary and `close_step` is not consulted about it.
+///
+/// True at most once per sequence: the caller sets `alerted` when it has spoken.
+pub fn alert_due(s: &CloseSchedule, w: &CloseWatch, watering: bool, now_ms: i64) -> bool {
+    watering && !w.alerted && (now_ms - w.first_ms).max(0) >= s.alert_at_ms
 }
 
 /// Elapsed milliseconds, from the first attempt, at which attempt number `n` falls due. `n` is 1-based,
@@ -202,12 +240,17 @@ pub fn next_look_ms(s: &CloseSchedule, w: &CloseWatch, now_ms: i64) -> i64 {
     let due = w.first_ms + due_at_ms(s, w.attempts + 1);
     let confirm_by = w.last_ms + s.confirm_within_ms;
     let give_up_at = w.first_ms + s.give_up_ms;
+    // ⚠️ AND THE ALERT POINT, while it is still ahead. Out past the named offsets the re-issues are a
+    // minute apart, so without this the five-minute alert would be delivered whenever the next
+    // re-issue happened to land — up to 60 s late, on the one alert whose whole value is promptness.
+    let alert_at = if w.alerted { i64::MAX } else { w.first_ms + s.alert_at_ms };
     // ⚠️ A DEADLINE ALREADY PAST IS NOT A DEADLINE. The confirm window binds only while it is still
     // ahead of us: once this issue HAS been answered (the read that just happened), keeping it in the
     // minimum pins the target at `now` and the caller spins on a 1 ms nap until the next re-issue
     // falls due — a poll storm produced by the very thing meant to bound one. Found by test, not by
     // reading: `every_issue_is_answered_inside_the_confirm_window` asked for 50 s and got 0.
     let target = if confirm_by > now_ms { due.min(confirm_by) } else { due };
+    let target = if alert_at > now_ms { target.min(alert_at) } else { target };
     target.min(give_up_at).saturating_sub(now_ms).max(1)
 }
 
@@ -267,9 +310,53 @@ mod tests {
         assert_eq!(S.confirm_within_ms, 10_000);
         assert_eq!(S.retry_at_ms, &[5_000, 10_000, 20_000, 40_000]);
         assert_eq!(S.then_every_ms, 60_000);
-        assert_eq!(S.give_up_ms, 300_000);
+        // 🔴 THE SPLIT (owner, 2026-09-25, option a): "tell me at 5, keep trying to 30."
+        assert_eq!(S.alert_at_ms, 300_000);
+        assert_eq!(S.give_up_ms, 1_800_000);
         // …and stated once more in the units the owner used, so a unit slip cannot read as green.
-        assert_eq!(S.give_up_ms / SEC, 5 * 60);
+        assert_eq!(S.alert_at_ms / SEC, 5 * 60);
+        assert_eq!(S.give_up_ms / SEC, 30 * 60);
+        // The RELATIONSHIP, which is the part that must hold whatever the two values become: the owner
+        // is told while the hub is still trying. If these ever crossed or met, the alert would fire at
+        // or after the last retry and the split would be undone without either literal looking wrong.
+        assert!(S.alert_at_ms < S.give_up_ms);
+    }
+
+    #[test]
+    fn the_owner_is_told_once_at_the_alert_point_and_not_before() {
+        let mut w = CloseWatch::opened(CloseCause::Flood, T0);
+        // Silent for the whole first five minutes — the retries are doing their job and there is
+        // nothing to tell him yet.
+        assert!(!alert_due(&S, &w, true, at(0)));
+        assert!(!alert_due(&S, &w, true, at(299)));
+        assert!(alert_due(&S, &w, true, at(300)));
+        // A valve that reports itself shut is never alerted about, at any instant.
+        assert!(!alert_due(&S, &w, false, at(300)));
+        assert!(!alert_due(&S, &w, false, at(1800)));
+        // Once spoken, never again — without this the 60-second loop would raise it ~25 more times
+        // between the alert and the give-up.
+        w.alerted = true;
+        for t in [300, 301, 900, 1799, 1800, 3600] {
+            assert!(!alert_due(&S, &w, true, at(t)), "re-alerted at {t}s");
+        }
+    }
+
+    #[test]
+    fn retrying_continues_across_the_alert_point() {
+        // The point of the split: being told is not being given up on. At 5 minutes the hub speaks and
+        // KEEPS ISSUING, which is where the extra 25 minutes of recovery chances come from.
+        let mut w = CloseWatch::opened(CloseCause::Flood, T0);
+        w.attempts = 9;         // where the ladder stands at the alert point
+        w.alerted = true;       // he has been told
+        w.last_ms = at(280);
+        // Not instantly — the ladder still governs WHEN. At the alert point nine attempts have been
+        // made and the tenth is due at 340 s, so 301 s is still a wait; the alert did not disturb it.
+        assert_eq!(close_step(&S, &w, true, at(301)), CloseStep::Wait);
+        assert_eq!(close_step(&S, &w, true, at(340)), CloseStep::Reissue);
+        // …and it is still re-issuing a full 25 minutes past the moment he was told.
+        assert_eq!(close_step(&S, &w, true, at(1799)), CloseStep::Reissue);
+        // …and stops at thirty minutes, not five.
+        assert_eq!(close_step(&S, &w, true, at(1800)), CloseStep::GaveUp);
     }
 
     #[test]
@@ -285,10 +372,18 @@ mod tests {
         assert_eq!(due_at_ms(&S, 7) / SEC, 160);
         assert_eq!(due_at_ms(&S, 8) / SEC, 220);
         assert_eq!(due_at_ms(&S, 9) / SEC, 280);
-        // The tenth would fall at 340 s, past the 300 s give-up — so nine attempts is the ceiling,
-        // which is what bounds the traffic this whole mechanism can produce for one valve.
+        // Nine attempts have been made by the time the owner is TOLD (the tenth falls at 340 s, past
+        // the 300 s alert point) — which is why the alert's `attempts` param reads 9.
         assert_eq!(due_at_ms(&S, 10) / SEC, 340);
-        assert!(due_at_ms(&S, 10) > S.give_up_ms);
+        assert!(due_at_ms(&S, 9) <= S.alert_at_ms && due_at_ms(&S, 10) > S.alert_at_ms);
+        // 🔴 AND THE REAL CEILING IS NOW 34, NOT 9 — the cost of the owner's 30-minute retry window,
+        // stated here so it is a measured number rather than a surprise on the RF budget. One `cmd 7`
+        // plus one status read a minute for a valve that is stuck, which is the same RATE as before;
+        // only the duration grew.
+        assert_eq!(due_at_ms(&S, 34) / SEC, 1780);
+        assert!(due_at_ms(&S, 34) < S.give_up_ms);
+        assert_eq!(due_at_ms(&S, 35) / SEC, 1840);
+        assert!(due_at_ms(&S, 35) > S.give_up_ms);
     }
 
     #[test]
@@ -305,13 +400,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfirmed_close_retries_on_schedule_and_gives_up_at_five_minutes() {
+    fn an_unconfirmed_close_retries_tells_the_owner_at_five_and_gives_up_at_thirty() {
         // The whole failure this module exists for: the command succeeded, the valve never shut.
         // Walk the real clock and count what the hub would send.
         let mut w = CloseWatch::opened(CloseCause::Flood, T0);
         let mut issued_at: Vec<i64> = vec![0];
         let mut t = 0;
-        while t <= 400 {
+        let mut told_at: Option<i64> = None;
+        while t <= 2000 {
+            if alert_due(&S, &w, true, at(t)) {
+                told_at = Some(t);
+                w.alerted = true;
+            }
             match close_step(&S, &w, true, at(t)) {
                 CloseStep::Reissue => {
                     w.attempts += 1;
@@ -324,19 +424,24 @@ mod tests {
             }
             t += 1;
         }
-        assert_eq!(issued_at, vec![0, 5, 10, 20, 40, 100, 160, 220, 280]);
-        assert_eq!(w.attempts, 9);
-        // Gave up at 300 s exactly — not at 299, and not by running out of offsets.
-        assert_eq!(close_step(&S, &w, true, at(299)), CloseStep::Wait);
-        assert_eq!(close_step(&S, &w, true, at(300)), CloseStep::GaveUp);
-        assert_eq!(close_step(&S, &w, true, at(3600)), CloseStep::GaveUp);
+        // The first nine issues are unchanged — the ladder did not move, only the deadline did.
+        assert_eq!(&issued_at[..9], &[0, 5, 10, 20, 40, 100, 160, 220, 280]);
+        // Told at five minutes exactly, while still issuing.
+        assert_eq!(told_at, Some(300));
+        // Then a command a minute out to thirty minutes: 34 in total, the last at 1780 s.
+        assert_eq!(w.attempts, 34);
+        assert_eq!(issued_at.last().copied(), Some(1780));
+        // Gave up at 1800 s exactly — not at 1799, and not by running out of offsets.
+        assert_eq!(close_step(&S, &w, true, at(1799)), CloseStep::Wait);
+        assert_eq!(close_step(&S, &w, true, at(1800)), CloseStep::GaveUp);
+        assert_eq!(close_step(&S, &w, true, at(7200)), CloseStep::GaveUp);
     }
 
     #[test]
     fn the_give_up_boundary_beats_a_retry_that_falls_due_at_the_same_instant() {
         // Order matters: a watch whose next retry is due at 300 s must NOT send a tenth command on
         // its way out. Constructed so due_at_ms(attempts+1) == give_up_ms exactly.
-        const TIGHT: CloseSchedule = CloseSchedule { confirm_within_ms: 10 * SEC, retry_at_ms: &[300 * SEC], then_every_ms: 60 * SEC, give_up_ms: 300 * SEC };
+        const TIGHT: CloseSchedule = CloseSchedule { confirm_within_ms: 10 * SEC, retry_at_ms: &[300 * SEC], then_every_ms: 60 * SEC, alert_at_ms: 100 * SEC, give_up_ms: 300 * SEC };
         let s = TIGHT;
         let w = CloseWatch::opened(CloseCause::Flood, T0);
         assert_eq!(due_at_ms(&s, 2), s.give_up_ms);

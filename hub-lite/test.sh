@@ -620,29 +620,45 @@ check "decide: flood stop classifies as flood_shutoff" "ended:flood_shutoff" "$(
 # GATEWAY TOOK the request; the measured failure mode is a `ret: 0` on a command never delivered to the
 # valve over RF. Success is the valve's OWN reported state, and everything below is the schedule that
 # keeps asking it.
-check "close: the schedule is the owner's numbers — 5/10/20/40 then every 60, confirm 10, give up 300" \
-  "10|5 10 20 40|60|300" "$LT_CLOSE_CONFIRM_WITHIN|$LT_CLOSE_RETRY_AT|$LT_CLOSE_EVERY|$LT_CLOSE_GIVE_UP"
+check "close: the schedule is the owner's numbers — 5/10/20/40 then every 60, confirm 10, tell at 300, give up 1800" \
+  "10|5 10 20 40|60|300|1800" "$LT_CLOSE_CONFIRM_WITHIN|$LT_CLOSE_RETRY_AT|$LT_CLOSE_EVERY|$LT_CLOSE_ALERT_AT|$LT_CLOSE_GIVE_UP"
+# THE RELATIONSHIP, which must hold whatever the two become: he is told while the hub is still trying.
+check "close: the owner is told BEFORE the hub stops trying" "yes" \
+  "$([ "$LT_CLOSE_ALERT_AT" -lt "$LT_CLOSE_GIVE_UP" ] && echo yes || echo no)"
 check "close: attempt 1 is the close itself, due immediately" "0" "$(lt_close_due_at 1)"
 check "close: the named offsets" "5 10 20 40" \
   "$(lt_close_due_at 2) $(lt_close_due_at 3) $(lt_close_due_at 4) $(lt_close_due_at 5)"
 check "close: then every 60 s, counted from the LAST named offset (40+60, not 60n)" "100 160 220 280" \
   "$(lt_close_due_at 6) $(lt_close_due_at 7) $(lt_close_due_at 8) $(lt_close_due_at 9)"
-check "close: the tenth would fall past the 300 s give-up, so nine attempts is the ceiling" "340 yes" \
-  "$(lt_close_due_at 10) $([ "$(lt_close_due_at 10)" -gt "$LT_CLOSE_GIVE_UP" ] && echo yes || echo no)"
+check "close: nine attempts have been made by the time he is TOLD (the tenth falls at 340 s)" "340 yes" \
+  "$(lt_close_due_at 10) $([ "$(lt_close_due_at 10)" -gt "$LT_CLOSE_ALERT_AT" ] && echo yes || echo no)"
+# 🔴 THE REAL CEILING IS 34, the cost of the owner's 30-minute retry window — a measured number
+# rather than a surprise on the RF budget. Same RATE as before (one cmd 7 a minute); only the duration grew.
+check "close: 34 attempts is the ceiling, the last at 1780 s" "1780 1840 yes" \
+  "$(lt_close_due_at 34) $(lt_close_due_at 35) $([ "$(lt_close_due_at 34)" -lt "$LT_CLOSE_GIVE_UP" ] && [ "$(lt_close_due_at 35)" -gt "$LT_CLOSE_GIVE_UP" ] && echo yes || echo no)"
+# lt_close_alert_due: silent for five minutes, once at five, never again.
+check "close: silent before the alert point, then told exactly once" "no yes no" \
+  "$(lt_close_alert_due 1000 0 1 1299 && echo yes || echo no) $(lt_close_alert_due 1000 0 1 1300 && echo yes || echo no) $(lt_close_alert_due 1000 1 1 1300 && echo yes || echo no)"
+check "close: a valve that reports SHUT is never alerted about" "no" \
+  "$(lt_close_alert_due 1000 0 0 9999 && echo yes || echo no)"
 
 # lt_close_step: first=1000, and the valve's own answer decides everything.
 check "close: a valve that reports SHUT is confirmed, whatever the clock says" "confirmed confirmed confirmed" \
   "$(lt_close_step 1000 1000 1 0 1000) $(lt_close_step 1000 1000 1 0 1004) $(lt_close_step 1000 1000 9 0 1999)"
 check "close: still open before the first retry is due = wait" "wait" "$(lt_close_step 1000 1000 1 1 1004)"
 check "close: still open AT the first offset = reissue" "reissue" "$(lt_close_step 1000 1000 1 1 1005)"
-check "close: one second before the window closes it is still trying" "wait" "$(lt_close_step 1000 1280 9 1 1299)"
-check "close: at 300 s it gives up" "gave_up" "$(lt_close_step 1000 1280 9 1 1300)"
-check "close: and stays given up rather than starting again" "gave_up" "$(lt_close_step 1000 1280 9 1 9999)"
+# 🔴 RETRYING CONTINUES ACROSS THE ALERT POINT — being told is not being given up on, which is
+# the whole of the owner's split. At 300 s (elapsed) the hub speaks and keeps issuing to 1800 s.
+check "close: at the alert point it is still working, not finished" "reissue" "$(lt_close_step 1000 1280 9 1 1340)"
+check "close: still re-issuing 25 minutes after he was told" "reissue" "$(lt_close_step 1000 2740 33 1 2780)"
+check "close: one second before the window closes it is still trying" "wait" "$(lt_close_step 1000 2780 34 1 2799)"
+check "close: at 1800 s it gives up" "gave_up" "$(lt_close_step 1000 2780 34 1 2800)"
+check "close: and stays given up rather than starting again" "gave_up" "$(lt_close_step 1000 2780 34 1 99999)"
 (
   # ⚠️ ORDER IS LOAD-BEARING: a retry falling due at the exact give-up instant must NOT put one more
   # command on the wire after the hub has decided to stop trying.
-  LT_CLOSE_RETRY_AT="300"
-  check "close: the give-up boundary beats a retry due at the same instant" "gave_up" "$(lt_close_step 1000 1000 1 1 1300)"
+  LT_CLOSE_RETRY_AT="1800"
+  check "close: the give-up boundary beats a retry due at the same instant" "gave_up" "$(lt_close_step 1000 1000 1 1 2800)"
 )
 check "close: the next look is the first retry, 5 s out" "5" "$(lt_close_next_look 1000 1000 1 1000)"
 check "close: out where retries are a minute apart, the CONFIRM deadline binds instead" "10" \
@@ -1324,9 +1340,12 @@ check "flood close: a close the gateway did not take spools stop_failed with cau
 # The schedule here is SCALED — retries due at once, give up after a second — so the give-up boundary is
 # reachable without waiting five real minutes; the production numbers are pinned by the pure checks
 # above and by close_watch.rs's own suite.
-drive() {  # one lt_drive_closes pass against $T/lt2. $1 = give-up seconds (default 1).
+drive() {  # one lt_drive_closes pass against $T/lt2. $1 = give-up seconds (default 1), $2 = alert-at (default 0).
+  # ⚠️ TWO WINDOWS SINCE THE OWNER'S SPLIT. The alert defaults to 0 — "tell him on the first pass"
+  # — so a test that only wants to exercise re-issuing still produces the alert exactly where production
+  # would, at the start of the sequence rather than at its end.
   ( LT_STATE_DIR="$T/lt2"; BRVG_RELAY_SPOOL="$T/spool2"; CONF="$T/conf"; . "$T/conf"; PATH="$T/bin:$PATH"
-    LT_CLOSE_RETRY_AT="0 0 0 0"; LT_CLOSE_EVERY=1; LT_CLOSE_CONFIRM_WITHIN=1; LT_CLOSE_GIVE_UP="${1:-1}"
+    LT_CLOSE_RETRY_AT="0 0 0 0"; LT_CLOSE_EVERY=1; LT_CLOSE_CONFIRM_WITHIN=1; LT_CLOSE_GIVE_UP="${1:-1}"; LT_CLOSE_ALERT_AT="${2:-0}"
     lt_drive_closes )
 }
 claim() {  # a close of cause $1, exactly as the receiver / the door / the cutoff claim one
@@ -1351,9 +1370,11 @@ check "close: the hub gives up rather than retrying forever" "no" \
   "$([ -f "$T/lt2/close.$DEV" ] && echo yes || echo no)"
 check "close: exactly one alert, naming the cause" "1" \
   "$(grep -c "$LT_CLOSE_UNCONFIRMED_EVENT.*cause=volume_cap" "$T/spool2")"
-# ⚠️ ASSERT THE RELATIONSHIP, NOT A NUMBER: `attempts` must be what the hub actually put on the wire.
-check "close: the alert counts every attempt the hub really made" "$(cmd7s)" \
-  "$(grep -o 'attempts=[0-9]*' "$T/spool2" | cut -d= -f2)"
+# ⚠️ ASSERT THE RELATIONSHIP, NOT A NUMBER. `attempts` is what the hub had put on the wire WHEN IT
+# SPOKE — which since the split is no longer the final total, because it kept trying afterwards. These
+# were equal before, and asserting equality again is exactly how a silent revert to one window passes.
+check "close: the alert counts the attempts made when he was told, and the hub tried on" "yes" \
+  "$([ "$(grep -o 'attempts=[0-9]*' "$T/spool2" | cut -d= -f2)" -le "$(cmd7s)" ] && echo yes || echo no)"
 check "close: giving up re-arms the software cutoff on a CAPPED run (it is the only one there is)" "" \
   "$(. "$T/lt2/$DEV"; echo "$stop")"
 _n=$(cmd7s); drive 30; drive 0
@@ -1375,10 +1396,13 @@ rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
 lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 60 )) "" normal 86400 10 hub 0 0
 printf '{"is_watering":1,"volume":20}' > "$SHIM_CMD3"
 tick '{"is_watering":1,"volume":20}'
-drive 30
+# ⚠️ ALERT POINT AT 30 s, DELIBERATELY OUT OF REACH. This case is "the valve shut before we ever
+# had to speak", so the sequence must end on the CONFIRMATION. Left at the default 0 it would alert on
+# the first pass and then close — true to production, but a different scenario from the one named here.
+drive 30 30
 _mid=$(cmd7s)
 printf '{"is_watering":0,"volume":20}' > "$SHIM_CMD3"
-drive 30; drive 0
+drive 30 30; drive 0 30
 check "close: a valve that shuts mid-retry ends the sequence there" "no $_mid" \
   "$([ -f "$T/lt2/close.$DEV" ] && echo yes || echo no) $(cmd7s)"
 check "close: …with no alert, because it closed" "0" "$(grep -c "$LT_CLOSE_UNCONFIRMED_EVENT" "$T/spool2")"

@@ -2759,6 +2759,31 @@ async fn drive_closes(
         // failing in the direction of looking correct. Keep trying instead.
         let watering = linktap::watering_from_status(&reply.data).unwrap_or(true);
         let now = now_ms();
+        // 🔴 TELL THE OWNER AT `alert_at_ms`, AND KEEP TRYING. Owner's ruling 2026-09-25 (option a):
+        // told at five minutes, still re-issuing to thirty. Handled here rather than as a `CloseStep`
+        // because it is not a branch of the same decision — retrying continues straight across this
+        // boundary, so folding the two together is what the split was chosen to avoid.
+        let mut w = w;
+        if crate::close_watch::alert_due(sched, &w, watering, now) {
+            let mut next = w;
+            next.alerted = true;
+            // Recorded BEFORE the report goes out, the same ordering as every other mark here: a hub
+            // that dies between the two must not wake up and tell him a second time.
+            if !settle_close(rt, &id, w, Some(next)).await {
+                continue;
+            }
+            w = next;
+            crate::hlog!(
+                "linktap: {id} - close STILL not confirmed after {}s ({} attempts, {} close) - telling the owner; retries continue to {}s",
+                (now - w.first_ms) / 1000, w.attempts, w.cause.as_str(), sched.give_up_ms / 1000
+            );
+            report_event(rt, &crate::linktap_runtime::Report {
+                token: None,
+                device: format!("lt_{id}"),
+                event: crate::close_watch::CLOSE_UNCONFIRMED_EVENT.into(),
+                params: crate::close_watch::unconfirmed_params(&w, now),
+            }).await;
+        }
         match crate::close_watch::close_step(sched, &w, watering, now) {
             CloseStep::Confirmed => {
                 if settle_close(rt, &id, w, None).await {
@@ -2803,8 +2828,8 @@ async fn drive_closes(
                     continue;
                 }
                 crate::hlog!(
-                    "linktap: {id} - GAVE UP closing the valve after {} attempt(s) over {}s ({} close) - alerting the owner",
-                    w.attempts, (now - w.first_ms) / 1000, w.cause.as_str()
+                    "linktap: {id} - GAVE UP closing the valve after {} attempt(s) over {}s ({} close) - the owner was told at {}s",
+                    w.attempts, (now - w.first_ms) / 1000, w.cause.as_str(), sched.alert_at_ms / 1000
                 );
                 // 🔴 THE MARK IS KEPT, EXCEPT ON A CAPPED RUN. Leaving `stop_issued` set is right for
                 // everything that reads it — the end still classifies honestly, and neither the
@@ -2824,12 +2849,15 @@ async fn drive_closes(
                 if released {
                     crate::hlog!("linktap: {id} - the volume cutoff is armed again for this run");
                 }
-                report_event(rt, &crate::linktap_runtime::Report {
-                    token: None,
-                    device: format!("lt_{id}"),
-                    event: crate::close_watch::CLOSE_UNCONFIRMED_EVENT.into(),
-                    params: crate::close_watch::unconfirmed_params(&w, now),
-                }).await;
+                // ⚠️ NO EVENT HERE. The owner heard about this valve at `alert_at_ms`; raising
+                // CLOSE_UNCONFIRMED_EVENT again would be a second alert about one failure, 25 minutes
+                // after the first and saying the same thing. Giving up is not news to him — it is the
+                // hub ending a sequence he already knows failed.
+                //
+                // The cutoff re-arm above is deliberately still HERE and not at the alert: between
+                // the two instants the hub is issuing `cmd 7` every 60 s, which is the same command
+                // the cutoff would send, so releasing the mark early would buy nothing and would let
+                // the cutoff and the retry loop both chase one valve.
             }
         }
     }
@@ -6559,7 +6587,12 @@ mod tests {
         confirm_within_ms: 40,
         retry_at_ms: &[10, 20, 40],
         then_every_ms: 40,
-        give_up_ms: 200,
+        // The ALERT point stays at 200 so the existing wiring assertions still describe the moment the
+        // owner is told; give-up moves out to 400, which is where the two now differ (owner's split,
+        // 2026-09-25). The gap between them is what `the_owner_is_told_once_and_the_retries_continue`
+        // below exercises.
+        alert_at_ms: 200,
+        give_up_ms: 400,
     };
 
     /// Drive `drive_closes` until nothing is closing, or `ms` of wall clock has gone by.
@@ -6630,8 +6663,19 @@ mod tests {
         assert_eq!(alerts.len(), 1, "exactly one alert per unconfirmed flood close, got {alerts:?}");
         assert_eq!(alerts[0]["cause"], "flood");
         assert_eq!(alerts[0]["__device"], "lt_aaaabbbbccccdddd");
-        assert_eq!(alerts[0]["attempts"], tries.to_string());
         assert!(alerts[0].contains_key("secs"));
+
+        // 🔴 THE SPLIT, PROVEN THROUGH THE REAL LOOP (owner 2026-09-25): the alert carries the attempts
+        // made when he was TOLD, and the hub went on trying afterwards — so this count is strictly
+        // below the final total. Before the split these were the same number, and asserting equality
+        // is exactly how a silent revert to one-number behaviour would pass.
+        let told_after: usize = alerts[0]["attempts"].parse().expect("attempts is a number");
+        assert!(
+            told_after < tries,
+            "the owner was told after {told_after} attempts and the hub then stopped at {tries}: \
+             retrying did not continue past the alert",
+        );
+        assert!(told_after >= 1, "the alert must report the attempts already made, got {told_after}");
     }
 
     #[tokio::test]
