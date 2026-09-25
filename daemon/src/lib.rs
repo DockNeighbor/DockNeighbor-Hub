@@ -6,6 +6,7 @@ pub mod adopt;
 pub mod gateway_http;
 pub mod hub_config;
 pub mod cycle;
+pub mod close_watch;
 pub mod linktap_runtime;
 pub mod linktap;
 pub mod gps;

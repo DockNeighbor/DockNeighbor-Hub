@@ -746,11 +746,20 @@ case "$method:$verb" in
     case "$_mode" in washdown|tankfill) : ;; *) _mode=normal ;; esac
     case "$_action" in
       close)
-        # Marked only once the gateway TOOK the stop: a run carrying a stop is never volume-cut or
-        # handed over, so a close that failed must not leave the running cycle looking stopped.
-        lt_post "$(linktap_stop_body "$LINKTAP_GW_ID" "$_dev")" 10 >/dev/null \
-          || fail 502 "the gateway did not accept that command"
-        lt_mark_stop "$LT_STATE_DIR/$_dev" manual
+        # 🔴 CLAIMED AND MARKED BEFORE THE COMMAND GOES OUT (brvg-hub-lite.sh lt_claim_close), so this
+        # press is confirmed against the VALVE'S own state and re-issued on the schedule rather than
+        # believed because the gateway answered `ret: 0`. It used to be marked only AFTER the gateway
+        # took the stop, to keep a failed close from leaving the run looking stopped — a real problem
+        # then, because nothing retried; the retry sequence answers it properly now, and releases the
+        # mark itself if it has to give up on a capped run (lt_close_abandon).
+        #
+        # A close ALREADY in flight answers this press: a second concurrent `cmd 7` at one valve is the
+        # one thing the slot exists to prevent, and the valve is on its way shut either way. The 200 is
+        # unchanged in both cases — the app's contract is `{"ok":true}`.
+        if lt_claim_close "$_dev" manual; then
+          lt_post "$(linktap_stop_body "$LINKTAP_GW_ID" "$_dev")" 10 >/dev/null \
+            || fail 502 "the gateway did not accept that command"
+        fi
         lt_wake
         reply 200 '{"ok":true}'
         ;;
