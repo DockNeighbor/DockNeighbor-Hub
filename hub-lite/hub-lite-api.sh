@@ -658,6 +658,10 @@ case "$method:$verb" in
   POST:/net/reservations)     authorize configure; read_body; net_call reservation-add "$BODY" ;;
   DELETE:/net/reservations)   authorize configure; read_body; net_call reservation-remove "$BODY" ;;
   POST:/reboot)               authorize configure; net_call reboot ;;
+  # router | bridge (owner 2026-09-25: "disables the firewall and just bridges everything on the LAN"). Switching
+  # moves the router onto the boat network's own addressing; dn-net reverts by itself if it gets no address.
+  GET:/net/mode)              authorize monitor;   net_call mode-get ;;
+  POST:/net/mode)             authorize configure; read_body; net_call mode-set "$BODY" ;;
 
   # ---- identity / bootstrap (OPEN, first run only) ----------------------------------------------
   # Setup from the app with no SSH, the daemon's h_identity/h_bootstrap: open only while the router
