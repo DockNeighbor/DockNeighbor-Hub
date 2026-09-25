@@ -26,8 +26,16 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.18.2"
-HUB_LITE_BACKUP="/etc/brvg-hub-lite.prev"
+HUB_LITE_VERSION="0.18.3"
+# Self-update under a watchdog (0.18.3): see self_update. Every path overridable for hub-lite/test.sh.
+HUB_LITE_BACKUP="${BRVG_HUB_LITE_BACKUP:-/etc/brvg-hub-lite.prev.tgz}"   # every file of the running hub-lite
+HUB_LITE_LEGACY_BACKUP="/etc/brvg-hub-lite.prev"                      # the single-script backup before 0.18.3
+HUB_LITE_PROBATION="${BRVG_HUB_LITE_PROBATION:-/etc/brvg-hub-lite.probation}"
+HUB_LITE_SKIP="${BRVG_HUB_LITE_SKIP:-/etc/brvg-hub-lite.skip}"
+HUB_LITE_GUARD="${BRVG_HUB_LITE_GUARD:-/etc/brvg-hub-lite.guard}"
+HUB_LITE_GUARD_INIT="${BRVG_HUB_LITE_GUARD_INIT:-/etc/init.d/brvg-hub-lite-guard}"
+HUB_LITE_ROOT="${BRVG_HUB_LITE_ROOT:-/}"
+HUB_LITE_PROBATION_SEC="${BRVG_HUB_LITE_PROBATION_SEC:-600}"
 
 # The LAST telemetry this hub-lite composed, as JSON, for the LAN management door to serve
 # (hub-lite-mgmt.sh). Written by the same code that reports to the cloud, so the two can never
@@ -579,6 +587,7 @@ EOF_DEVS
   if [ "$_verdict" = "sent" ]; then
     PENDING_ACK=""
     LAST_REPORT_OK_AT=$(date +%s)
+    probation_confirm
     echo "$_seq" > "$RELAY_SEQ_FILE"
     # Persist last-sent per device so the next delta knows what "unchanged" means.
     while IFS= read -r _dev; do
@@ -1200,6 +1209,7 @@ send_event() {
   fi
   PENDING_ACK=""   # the worker saw our acks; anything still queued comes back below
   LAST_REPORT_OK_AT=$(date +%s)   # any successful report resets the anchor heartbeat clock
+  probation_confirm
   LAST_REPLY="$_resp"
   _cmds=$(printf '%s' "$_resp" | parse_commands)
   [ -n "$_cmds" ] && run_commands "$_cmds"
@@ -1250,7 +1260,9 @@ run_commands() {
       # the extra send would just fail) or the update verbs (the hub-lite is being replaced).
       report_now)   log "command: report_now"; FOLLOWUP_REPORT=1 ;;
       self_update)  log "command: self_update"; self_update ;;
-      rollback_agent) log "command: rollback_agent"; restore_hub_lite "requested" ;;
+      # The version being rolled back is skip-listed, and any probation ends here.
+      rollback_agent) log "command: rollback_agent"
+                      restore_hub_lite "requested" && { skip_version "$HUB_LITE_VERSION"; rm -f "$HUB_LITE_PROBATION"; } ;;
       reboot)       log "command: reboot"; (sleep 5; reboot) >/dev/null 2>&1 & ;;
       reboot_modem) log "command: reboot_modem"; at_cmd 'AT+CFUN=1,1' 5 >/dev/null 2>&1 ;;
       reset_data)   log "command: reset_data"; at_cmd 'AT+QGDCNT=0' 3 >/dev/null 2>&1; FOLLOWUP_REPORT=1 ;;
@@ -1325,17 +1337,136 @@ hub_lite_path() {
   command -v brvg-hub-lite 2>/dev/null || echo /usr/bin/brvg-hub-lite
 }
 
-# Restore the kept-back copy of the previous hub-lite. Used both by the rollback verb and
-# automatically when a freshly installed hub-lite fails its smoke check.
+# --- Self-update under a watchdog (0.18.3) ------------------------------------------------------
+# Owner requirement 2026-09-24: an update must never leave a vessel silent. self_update keeps EVERY file of the
+# running hub-lite (the collector, the /api/hub door, the CGIs, the init script), installs from the signed feed,
+# and puts the new version on PROBATION. Its first successful report to the cloud confirms it; on a router not yet
+# enrolled (no cloud to report to) its own door answering locally with the new version does. Unconfirmed after
+# HUB_LITE_PROBATION_SEC while the router HAS a default route, the guard restores the kept copy and skip-lists
+# that version, so self_update and update_check never offer it again. With no default route the new version is
+# kept: its silence proves nothing.
+#
+# The guard is written by the version being REPLACED, into /etc (not a package file), and runs as its own procd
+# service. So a new version that can't run at all is still rolled back, a reboot during probation doesn't lose
+# it, and nothing depends on the cloud, which a broken version can't reach anyway.
+
+# The files of the installed hub-lite: opkg's list when the package manager installed it, else the paths the
+# app's over-SSH installer writes. Existing regular files only.
+hub_lite_files() {
+  { if opkg status brvg-hub-lite 2>/dev/null | grep -q '^Status:.* installed'; then
+      opkg files brvg-hub-lite 2>/dev/null | sed 1d
+    else
+      printf '%s\n' "$(hub_lite_path)" /etc/init.d/brvg-hub-lite /www/brvg/api/hub /www/brvg/cgi-bin/report \
+        /www/brvg/cgi-bin/mgmt /www/brvg/cgi-bin/gps /usr/libexec/brvg-hub-lite/routers \
+        /usr/libexec/brvg-hub-lite/feed-setup /usr/bin/brvg-setup-usb-gps
+    fi; } | while IFS= read -r _f; do [ -f "$_f" ] && printf '%s\n' "$_f"; done
+}
+
+# Keep the running hub-lite, all of it, as a tarball of paths relative to $HUB_LITE_ROOT.
+backup_hub_lite() {
+  _bl=$(hub_lite_files | sed 's|^/||')
+  [ -n "$_bl" ] || return 1
+  # shellcheck disable=SC2086  # the paths are opkg's own and contain no spaces
+  tar -czf "$HUB_LITE_BACKUP.tmp" -C "$HUB_LITE_ROOT" $_bl 2>/dev/null &&
+    mv "$HUB_LITE_BACKUP.tmp" "$HUB_LITE_BACKUP"
+}
+
+# Restore the kept-back copy of the previous hub-lite. Used by the rollback verb and by the smoke check.
+# (The guard carries its own copy of the restore: it must work even when THIS code is the broken version.)
 restore_hub_lite() {
-  _self=$(hub_lite_path)
-  if [ ! -s "$HUB_LITE_BACKUP" ]; then
+  if [ -s "$HUB_LITE_BACKUP" ]; then
+    tar -xzf "$HUB_LITE_BACKUP" -C "$HUB_LITE_ROOT" 2>/dev/null || { log "rollback: restore failed ($1)"; return 1; }
+  elif [ -s "$HUB_LITE_LEGACY_BACKUP" ]; then
+    _self=$(hub_lite_path)
+    cp "$HUB_LITE_LEGACY_BACKUP" "$_self" && chmod 0755 "$_self" || { log "rollback: copy failed"; return 1; }
+  else
     log "rollback: no previous version kept ($1)"
     return 1
   fi
-  cp "$HUB_LITE_BACKUP" "$_self" && chmod 0755 "$_self" || { log "rollback: copy failed"; return 1; }
   log "rolled back to the previous hub-lite ($1); restarting"
-  [ -x /etc/init.d/brvg-hub-lite ] && (sleep 2; /etc/init.d/brvg-hub-lite restart) >/dev/null 2>&1 &
+  [ -z "$BRVG_HUB_LITE_TEST" ] && [ -x /etc/init.d/brvg-hub-lite ] &&
+    (sleep 2; /etc/init.d/brvg-hub-lite restart) >/dev/null 2>&1 &
+  return 0
+}
+
+# PURE-ish: a version this router rolled back, which must never be installed or offered again.
+is_skipped() { [ -f "$HUB_LITE_SKIP" ] && grep -qxF "$1" "$HUB_LITE_SKIP"; }
+skip_version() { is_skipped "$1" || echo "$1" >> "$HUB_LITE_SKIP"; }
+
+# Called after EVERY successful report. Cheap when there is no probation.
+probation_confirm() {
+  [ -f "$HUB_LITE_PROBATION" ] || return 0
+  [ "$(sed -n 's/^TO=//p' "$HUB_LITE_PROBATION")" = "$HUB_LITE_VERSION" ] || return 0
+  rm -f "$HUB_LITE_PROBATION"
+  log "self_update: $HUB_LITE_VERSION confirmed: it reported to the cloud"
+}
+
+# The guard, as written by THIS version for the next one. One evaluation per run: exit 0 = keep watching,
+# exit 1 = finished (it then disables and deletes itself). GUARD_NOW / GUARD_ROUTE / GUARD_DOOR /
+# GUARD_NO_SERVICE are for hub-lite/test.sh only.
+guard_script() {
+  printf '#!/bin/sh\n# Written by hub-lite %s during self_update. Not a package file: it must outlive the package it guards.\n' "$HUB_LITE_VERSION"
+  printf "P='%s'; B='%s'; S='%s'; CONF='%s'; INIT='%s'; ROOT='%s'; PORT='%s'\n" \
+    "$HUB_LITE_PROBATION" "$HUB_LITE_BACKUP" "$HUB_LITE_SKIP" "$CONF" "$HUB_LITE_GUARD_INIT" "$HUB_LITE_ROOT" "${RECEIVER_PORT:-8722}"
+  cat <<'EOF_GUARD'
+finish() {
+  if [ -z "${GUARD_NO_SERVICE:-}" ]; then "$INIT" disable 2>/dev/null; rm -f "$INIT" "$0"; fi
+  exit 1
+}
+say() { logger -t brvg-hub-lite "guard: $*" 2>/dev/null; echo "guard: $*"; }
+[ -f "$P" ] || finish                  # confirmed by the new version, or cleared
+TO=$(sed -n 's/^TO=//p' "$P")
+DEADLINE=$(sed -n 's/^DEADLINE=//p' "$P" | tr -cd 0-9)
+[ "${GUARD_NOW:-$(date +%s)}" -ge "${DEADLINE:-0}" ] || exit 0
+# Not enrolled: there is no cloud to report to, so the door answering with the new version is the proof.
+if ! grep -q '^VID=.' "$CONF" 2>/dev/null; then
+  door=${GUARD_DOOR-$(curl -s -m 5 "http://127.0.0.1:$PORT/api/hub/ping" 2>/dev/null)}
+  case "$door" in *"\"version\":\"$TO\""*) rm -f "$P"; say "kept $TO: not enrolled, and its door answers"; finish ;; esac
+fi
+if [ -n "${GUARD_ROUTE:-}" ]; then route=$GUARD_ROUTE
+else
+  route=0
+  { ip -4 route show default 2>/dev/null | grep -q . || route -n 2>/dev/null | grep -q '^0\.0\.0\.0'; } && route=1
+fi
+if [ "$route" = 1 ]; then
+  if tar -xzf "$B" -C "$ROOT" 2>/dev/null; then
+    grep -qxF "$TO" "$S" 2>/dev/null || echo "$TO" >> "$S"
+    rm -f "$P"
+    say "rolled back $TO: not confirmed within its probation while the router had a default route"
+    [ -z "${GUARD_NO_SERVICE:-}" ] && /etc/init.d/brvg-hub-lite restart >/dev/null 2>&1
+  else
+    rm -f "$P"
+    say "could not restore the previous hub-lite over $TO"
+  fi
+else
+  rm -f "$P"
+  say "kept $TO: no default route during its probation, so its silence proves nothing"
+fi
+finish
+EOF_GUARD
+}
+
+guard_init() {
+  cat <<EOF_INIT
+#!/bin/sh /etc/rc.common
+# Written by hub-lite $HUB_LITE_VERSION's self_update: runs $HUB_LITE_GUARD every 30 s until the probation it
+# watches is over, then the guard disables and deletes this file. Survives a reboot during probation.
+START=99
+USE_PROCD=1
+start_service() {
+	procd_open_instance
+	procd_set_param command /bin/sh -c 'while /bin/sh $HUB_LITE_GUARD; do sleep 30; done'
+	procd_close_instance
+}
+EOF_INIT
+}
+
+# $1 the version being replaced, $2 the version just installed.
+probation_start() {
+  printf 'FROM=%s\nTO=%s\nDEADLINE=%s\n' "$1" "$2" "$(( $(date +%s) + HUB_LITE_PROBATION_SEC ))" > "$HUB_LITE_PROBATION"
+  guard_script > "$HUB_LITE_GUARD" && chmod 0755 "$HUB_LITE_GUARD"
+  guard_init > "$HUB_LITE_GUARD_INIT" && chmod 0755 "$HUB_LITE_GUARD_INIT"
+  [ -z "$BRVG_HUB_LITE_TEST" ] && { "$HUB_LITE_GUARD_INIT" enable; "$HUB_LITE_GUARD_INIT" start; } >/dev/null 2>&1
   return 0
 }
 
@@ -1346,9 +1477,11 @@ self_update() {
     log "self_update: no opkg on this platform — skipping"
     return 0
   fi
+  if [ -f "$HUB_LITE_PROBATION" ]; then
+    log "self_update: $(sed -n 's/^TO=//p' "$HUB_LITE_PROBATION") is still on probation — not stacking another update"
+    return 1
+  fi
   _self=$(hub_lite_path)
-  # Keep the running hub-lite so a bad release is one command (or one failed smoke check) from undone.
-  cp "$_self" "$HUB_LITE_BACKUP" 2>/dev/null && chmod 0644 "$HUB_LITE_BACKUP" 2>/dev/null
   # What we are running BEFORE opkg touches anything — the only reliable way to tell an actual
   # upgrade from a no-op. See the restart guard below.
   _before=$("$_self" --version 2>/dev/null)
@@ -1359,6 +1492,16 @@ self_update() {
     log "self_update: feed refresh failed (offline, or the feed signature did not verify)"
     return 1
   fi
+  _offer=$(opkg list brvg-hub-lite 2>/dev/null | awk '$1 == "brvg-hub-lite" { print $3 }' | tail -1)
+  if [ -n "$_offer" ] && is_skipped "$_offer"; then
+    log "self_update: $_offer was rolled back on this router — not installing it again"
+    return 1
+  fi
+  # No update without a way back.
+  if ! backup_hub_lite; then
+    log "self_update: could not keep the running hub-lite, so a bad release could not be undone — not updating"
+    return 1
+  fi
   if ! opkg upgrade brvg-hub-lite >/dev/null 2>&1; then
     log "self_update: no upgrade applied (already current, or the package failed verification)"
     return 1
@@ -1367,6 +1510,7 @@ self_update() {
   # Smoke-check the thing we just installed BEFORE trusting it to keep the vehicle reporting.
   if ! "$_self" --version >/dev/null 2>&1; then
     log "self_update: the new hub-lite failed its version check"
+    skip_version "$_offer"
     restore_hub_lite "failed smoke check"
     return 1
   fi
@@ -1386,7 +1530,8 @@ self_update() {
     log "self_update: already current ($_after) — nothing installed, not restarting"
     return 0
   fi
-  log "self_update: installed $_after (was ${_before:-unknown}); restarting"
+  probation_start "$_before" "$_after"
+  log "self_update: installed $_after (was ${_before:-unknown}); on probation for ${HUB_LITE_PROBATION_SEC}s; restarting"
   [ -x /etc/init.d/brvg-hub-lite ] && (sleep 2; /etc/init.d/brvg-hub-lite restart) >/dev/null 2>&1 &
   return 0
 }
@@ -3010,7 +3155,8 @@ update_check() {
   [ -n "$_uc_feed" ] || return 0
   _uc_v=$(curl -fsSL --max-time 20 "$_uc_feed/Packages" 2>/dev/null | feed_version)
   [ -n "$_uc_v" ] || return 0
-  if version_newer "$_uc_v" "$HUB_LITE_VERSION"; then
+  # A version this router rolled back is never offered again.
+  if version_newer "$_uc_v" "$HUB_LITE_VERSION" && ! is_skipped "$_uc_v"; then
     [ "$(cat "$HUB_LITE_UPDATE" 2>/dev/null)" = "$_uc_v" ] || log "update available: $_uc_v (running $HUB_LITE_VERSION)"
     echo "$_uc_v" > "$HUB_LITE_UPDATE"
   else
