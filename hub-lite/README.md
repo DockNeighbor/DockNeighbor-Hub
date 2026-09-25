@@ -49,6 +49,11 @@ worker on a timer, so the vehicle reports without the app being onsite.
   or offered again). With no route, the new version is kept: its silence proves nothing. The guard is written by
   the OUTGOING version into `/etc` and runs as its own procd service, so it survives a reboot and needs neither the
   new code nor the cloud. `rollback_agent` restores and skip-lists too.
+  Since 0.18.4 the probation is armed BEFORE opkg runs, the guard's restore re-enables the service (the package's
+  prerm disables it), and every path that replaces the running hub-lite (the cloud's `self_update` and
+  `rollback_agent` verbs, the app's `/api/hub/update` door) runs through `run_detached`: its own session, off
+  procd's pipes, logging to syslog. Stopping the service SIGTERMs its main process, which is the one that would
+  otherwise be running the update.
 
 **Deliberately NOT here** (a full hub, or the app, does these)
 - The relay socket — a persistent WebSocket from busybox ash is not worth the overlay.

@@ -2882,7 +2882,9 @@ opkg() {
   case "$1" in
     update) return 0 ;;
     list) echo "brvg-hub-lite - $OFFER - test" ;;
-    upgrade) printf '%s\n' "$NEWBODY" > "$W/root/usr/bin/brvg-hub-lite"; echo "door v$OFFER" > "$W/root/www/brvg/api/hub" ;;
+    upgrade) [ -f "$HUB_LITE_PROBATION" ] && echo armed >> "$W/armed.log"
+             [ -n "${UPGRADE_FAILS:-}" ] && return 1
+             printf '%s\n' "$NEWBODY" > "$W/root/usr/bin/brvg-hub-lite"; echo "door v$OFFER" > "$W/root/www/brvg/api/hub" ;;
   esac
 }
 guard() { GUARD_NO_SERVICE=1 sh "$HUB_LITE_GUARD" >/dev/null 2>&1; echo $?; }
@@ -2895,7 +2897,8 @@ check "self_update: the new version is on probation, from 0.18.3" "FROM=0.18.3 T
 check "self_update: the backup holds EVERY file (collector + door)" "usr/bin/brvg-hub-lite www/brvg/api/hub" "$(tar -tzf "$W/prev.tgz" | sort | tr '\n' ' ' | sed 's/ $//')"
 # ⚠️ DERIVED, NOT A LITERAL. "The old version" is the script RUNNING this suite, so spelling it out
 # makes the check fail on the next release rather than on a real change (it did, on 0.18.4).
-check "self_update: the guard was written by the OLD version" "1" "$(grep -c "Written by hub-lite $HUB_LITE_VERSION" "$W/guard")"
+# The TRAILING SPACE in the pattern is load-bearing too (#169): without it 0.18.4 also matches 0.18.45.
+check "self_update: the guard was written by the RUNNING (outgoing) version" "1" "$(grep -c "Written by hub-lite $HUB_LITE_VERSION " "$W/guard")"
 check "self_update: the guard service was written" "1" "$(grep -c 'while /bin/sh' "$W/guard.init")"
 check "self_update: no second update while one is on probation" "1:0" "$(self_update 2>/dev/null; echo "$?:$(grep -c upgrade "$W/opkg.log" | awk '{print $1-1}')")"
 
@@ -2954,6 +2957,52 @@ echo 0.18.4'
   probation_start 0.18.3 0.18.4 2>/dev/null
 )
 check "self_update via the app's door (BRVG_HUB_LITE_TEST set): the guard is enabled AND started" "enable start" "$(tr '\n' ' ' < "$W/procd.log" 2>/dev/null | sed 's/ $//')"
+
+# 0.18.4: armed BEFORE opkg, so an upgrade interrupted halfway is already guarded.
+wd_reset; OFFER=0.18.4; NEWBODY='#!/bin/sh
+echo 0.18.4'; rm -f "$W/armed.log"
+self_update 2>/dev/null
+check "0.18.4: the probation is armed BEFORE opkg runs" "armed" "$(cat "$W/armed.log" 2>/dev/null)"
+# In a subshell: a prefix assignment on a shell FUNCTION persists (and is exported) in POSIX sh.
+wd_reset; rm -f "$W/armed.log"; ( UPGRADE_FAILS=1; self_update 2>/dev/null )
+check "0.18.4: a failed upgrade clears the probation it armed" "gone" "$([ -f "$W/probation" ] && echo present || echo gone)"
+
+# The guard's restore re-ENABLES the service as well as restarting it: the package's prerm disables it.
+wd_reset; self_update 2>/dev/null; DL=$(sed -n 's/^DEADLINE=//p' "$W/probation"); echo 'VID=v_x' > "$CONF"
+printf '#!/bin/sh\necho "$1" >> "%s"\n' "$W/svc.log" > "$W/svc"; chmod 755 "$W/svc"
+sed -i.bak "s|SVC='[^']*'|SVC='$W/svc'|" "$W/guard"
+GUARD_NOW=$DL GUARD_ROUTE=1 sh "$W/guard" >/dev/null 2>&1
+check "0.18.4: the guard's rollback enables AND restarts the service" "enable restart" "$(tr '\n' ' ' < "$W/svc.log" 2>/dev/null | sed 's/ $//')"
+
+# The update and rollback verbs never run inside the daemon (its stop would kill them): they go to run_detached.
+(
+  run_detached() { echo "$1" >> "$W/detached.log"; }
+  self_update() { echo inline >> "$W/detached.log"; }
+  restore_hub_lite() { echo inline >> "$W/detached.log"; }
+  run_commands "c1:self_update c2:rollback_agent" 2>/dev/null
+)
+check "0.18.4: the cloud's self_update and rollback_agent verbs run detached, never inline" "self_update rollback_requested" \
+  "$(tr '\n' ' ' < "$W/detached.log" 2>/dev/null | sed 's/ $//')"
+check "0.18.4: the app's /api/hub/update door uses the same detached runner" "1" "$(grep -c '^    run_detached self_update$' "$HL_DIR/hub-lite-api.sh")"
+
+# The station's regression, on the real run_detached: kill the "daemon's" whole process group mid-update; the
+# detached work must still finish. Needs setsid (Linux, and every router); skipped where there is none (macOS).
+if command -v setsid >/dev/null 2>&1; then
+  printf '%s\n' '. "$HL_DIR/brvg-hub-lite.sh"' 'slow_job() { sleep 2; echo finished > "$W/job.out"; }' > "$W/lib.sh"
+  cp "$HL_DIR/brvg-hub-lite.sh" "$W/bin.sh"; cat >> "$W/bin.sh" <<'EOF_SJ'
+slow_job() { sleep 2; echo finished > "$SJ_OUT"; }
+EOF_SJ
+  rm -f "$W/job.out"
+  SJ_OUT="$W/job.out" BRVG_HUB_LITE_TEST=1 HL_BIN="$W/bin.sh" setsid sh -c '. "$HL_BIN"; hub_lite_path() { echo "$HL_BIN"; }; run_detached slow_job; sleep 30' &
+  # `kill -TERM -<pgid>`, not `kill -TERM -- -<pgid>`: dash's kill rejects the `--` form, and silently killing
+  # nothing made this check pass with setsid removed. So also assert the group really died.
+  _dp=$!; sleep 1; kill -TERM "-$_dp" 2>/dev/null; sleep 3
+  check "0.18.4: the daemon's process group really was killed (else the next check proves nothing)" "dead" \
+    "$(kill -0 "$_dp" 2>/dev/null && echo alive || echo dead)"
+  check "0.18.4: detached work survives killing the daemon's whole process group" "finished" "$(cat "$W/job.out" 2>/dev/null)"
+else
+  echo "skip - 0.18.4: process-group survival (no setsid here; CI and routers have it)"
+fi
 
 wd_reset; hub_lite_files() { :; }; OFFER=0.18.4
 check "self_update: no update without a way back (nothing to back up)" "1:0" "$(self_update 2>/dev/null; echo "$?:$(grep -c '^upgrade' "$W/opkg.log")")"
