@@ -7,6 +7,7 @@ pub mod gateway_http;
 pub mod hub_config;
 pub mod cycle;
 pub mod close_watch;
+pub mod update_gate;
 pub mod linktap_runtime;
 pub mod linktap;
 pub mod gps;
