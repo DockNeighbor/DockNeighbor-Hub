@@ -2482,6 +2482,10 @@ lt_mark_stop() {
 LT_CLOSE_CONFIRM_WITHIN="${LT_CLOSE_CONFIRM_WITHIN:-10}"
 LT_CLOSE_RETRY_AT="${LT_CLOSE_RETRY_AT:-5 10 20 40}"
 LT_CLOSE_EVERY="${LT_CLOSE_EVERY:-60}"
+# 🔴 QUOTED IN WORDS A CUSTOMER READS: the worker's approved alert text (DockNeighbor-Cloud
+# alertText.ts, owner 2026-09-25) says "after 5 minutes of retries", pinned there against its own
+# CLOSE_GIVE_UP_MS. Shorten this window without changing that copy and the product lies to the person
+# it is warning. Change both, and the daemon's CloseSchedule::PRODUCTION with them.
 LT_CLOSE_GIVE_UP="${LT_CLOSE_GIVE_UP:-300}"
 
 # ⚠️ CROSS-REPO CONTRACT — the same string in the daemon (close_watch::CLOSE_UNCONFIRMED_EVENT) and in

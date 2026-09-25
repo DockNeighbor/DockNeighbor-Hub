@@ -104,6 +104,12 @@ impl CloseSchedule {
     /// exists for it recovers a lost RF delivery three seconds sooner. Moving the first retry to
     /// 10 s would spend that recovery time to save a command; the owner owns that trade, so his
     /// number is kept and the interaction is written down here rather than quietly adjusted.
+    /// 🔴 `give_up_ms` IS QUOTED IN WORDS A CUSTOMER READS. The worker's approved alert text
+    /// (DockNeighbor-Cloud `alertText.ts`, owner 2026-09-25) says *"after 5 minutes of retries"*, and
+    /// its `CLOSE_GIVE_UP_MS` mirrors this constant with a test that parses the number back out of
+    /// the sentence. Shortening this window without changing that copy makes the product lie to the
+    /// person it is warning; the Cloud test turns red only if `CLOSE_GIVE_UP_MS` moves with it, so
+    /// change BOTH. Same for hub-lite's `LT_CLOSE_GIVE_UP`.
     pub const PRODUCTION: CloseSchedule = CloseSchedule {
         confirm_within_ms: 10 * SEC,
         retry_at_ms: &[5 * SEC, 10 * SEC, 20 * SEC, 40 * SEC],
