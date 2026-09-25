@@ -68,7 +68,8 @@ worker on a timer, so the vehicle reports without the app being onsite.
   `GET`/`POST /net/mode` (`router`, or `bridge`: no firewall, no NAT, the WAN port bridged into the LAN; 0.18.8).
   Reading is `monitor` (Wi-Fi WITHOUT its keys); every change, the scan and reboot are `configure`.
   `POST /net/admin-password` `{current, next}` changes root's password (0.18.9): `administer`, like the firmware, and
-  only with the current password (checked on the router; a wrong one is a 400).
+  only with the current password (checked on the router; a wrong one is a 400). It is LAN only: the other DN device API
+  and OS routes may also be relayed from shore (0.18.9), but a relayed body crosses the cloud, so the password never is.
 
 **Deliberately NOT here** (a full hub, or the app, does these)
 - The relay socket — a persistent WebSocket from busybox ash is not worth the overlay.

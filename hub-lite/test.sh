@@ -2698,6 +2698,16 @@ _fr='{"type":"call","id":"c1","uid":"u","role":"control","method":"POST","path":
 check "frame: body unescaped" '{"devId":"a","action":"open"}' "$(printf '%s' "$_fr" | live_frame_str body)"
 check "frame: a key inside the body is never read as the frame's" "monitor" \
   "$(printf '%s' '{"type":"call","id":"c1","uid":"u","role":"monitor","method":"POST","path":"/p","body":"{\"role\":\"owner\"}"}' | live_frame_str role)"
+_lpa=""
+for _rt in "GET /api/hub/net/wan" "GET /api/hub/net/wifi" "POST /api/hub/net/mode" "DELETE /api/hub/net/uplink" "POST /api/hub/reboot" \
+           "GET /api/hub/os/check" "POST /api/hub/os/upgrade" "POST /api/hub/os/packages"; do
+  set -- $_rt; live_path_allowed "$1" "$2" || _lpa="$_lpa [$_rt]"
+done
+check "relay: the DN device API and OS routes may be relayed from shore" "" "$_lpa"
+live_path_allowed POST /api/hub/net/admin-password && _lpa=relayed || _lpa=refused
+check "relay: admin-password is NEVER relayed (the password stays on the boat's network)" "refused" "$_lpa"
+live_path_allowed GET /api/hub/net/admin-password && _lpa=relayed || _lpa=refused
+check "relay: ...by no method" "refused" "$_lpa"
 check "frame: an absent body is absent" "" "$(printf '%s' '{"type":"call","id":"c1","role":"monitor","method":"GET","path":"/api/hub/status"}' | live_frame_str body)"
 check "result body: escaped for JSON" 'a \"q\" \\ b\nc' "$(printf 'a "q" \\ b\nc\n' | json_escape_body)"
 : > "$SHIM_LOG"

@@ -3780,6 +3780,15 @@ live_path_allowed() {
   case "$1:$2" in
     GET:/api/hub/status|GET:/api/hub/logs|GET:/api/hub/linktap/state|GET:/api/hub/routers|GET:/api/hub/gps/live) return 0 ;;
     POST:/api/hub/config|POST:/api/hub/token|POST:/api/hub/clear|POST:/api/hub/update|POST:/api/hub/linktap/valve|POST:/api/hub/routers|POST:/api/hub/gps) return 0 ;;
+    # The DN device API and the OS upgrades (DockNeighbor OS; 501 elsewhere), so the app reaches them from shore.
+    # The door's own role gate still decides. NOT admin-password: a relayed body crosses the cloud, and the router's
+    # password travels only on the boat's own network.
+    GET:/api/hub/net/wan|GET:/api/hub/net/lan|GET:/api/hub/net/wifi|GET:/api/hub/net/uplink|GET:/api/hub/net/uplink/scan) return 0 ;;
+    GET:/api/hub/net/uplink/saved|GET:/api/hub/net/clients|GET:/api/hub/net/reservations|GET:/api/hub/net/mode) return 0 ;;
+    POST:/api/hub/net/lan|POST:/api/hub/net/wifi|POST:/api/hub/net/uplink|POST:/api/hub/net/clients/block) return 0 ;;
+    POST:/api/hub/net/reservations|POST:/api/hub/net/mode|POST:/api/hub/reboot) return 0 ;;
+    DELETE:/api/hub/net/uplink|DELETE:/api/hub/net/uplink/saved|DELETE:/api/hub/net/reservations) return 0 ;;
+    GET:/api/hub/os|GET:/api/hub/os/check|GET:/api/hub/os/packages|POST:/api/hub/os/upgrade|POST:/api/hub/os/packages) return 0 ;;
   esac
   return 1
 }
