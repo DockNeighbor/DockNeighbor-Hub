@@ -54,6 +54,12 @@ worker on a timer, so the vehicle reports without the app being onsite.
   `rollback_agent` verbs, the app's `/api/hub/update` door) runs through `run_detached`: its own session, off
   procd's pipes, logging to syslog. Stopping the service SIGTERMs its main process, which is the one that would
   otherwise be running the update.
+- **DockNeighbor OS routes** (0.18.5), only when the router runs [DockNeighbor OS](https://github.com/DockNeighbor/DockNeighbor-OS)
+  (anywhere else they answer **501**, so the app keeps the vendor's way):
+  `GET /api/hub/os` (profile + version), `GET /api/hub/os/check` and `POST /api/hub/os/upgrade` (level 2, the whole
+  firmware from the signed channel; the check runs first, so a refusal comes back as an error; the flash runs
+  detached; 202), `GET` / `POST /api/hub/os/packages` (level 1 for DockNeighbor OS's own dn-* packages; 202).
+  Reading is `monitor`; changing the firmware is `administer`.
 
 **Deliberately NOT here** (a full hub, or the app, does these)
 - The relay socket — a persistent WebSocket from busybox ash is not worth the overlay.
