@@ -20,7 +20,7 @@ start_service() {
     procd_close_instance
 
     # A dedicated uhttpd serves BOTH CGIs on the vessel LAN:
-    #   /cgi-bin/report — the relay tier's webhook receiver (HUB-PROXY.md)
+    #   /cgi-bin/report — the relay tier's webhook receiver (sc4-internal docs/ONSITE.md)
     #   /cgi-bin/mgmt   — the management door (hub-lite 0.14.0)
     #
     # ⚠️ NOT GATED ON HUB_LITE_ENABLED any more (2026-08-21). That flag turns on the RELAY TIER, and
