@@ -662,6 +662,9 @@ case "$method:$verb" in
   # moves the router onto the boat network's own addressing; dn-net reverts by itself if it gets no address.
   GET:/net/mode)              authorize monitor;   net_call mode-get ;;
   POST:/net/mode)             authorize configure; read_body; net_call mode-set "$BODY" ;;
+  # Root's password is the router's SSH login, a level above its settings: administer, like changing the firmware.
+  # dn-net also requires the CURRENT password, so this key alone never takes the login. Body {current, next}.
+  POST:/net/admin-password)   authorize administer; read_body; net_call admin-password "$BODY" ;;
 
   # ---- identity / bootstrap (OPEN, first run only) ----------------------------------------------
   # Setup from the app with no SSH, the daemon's h_identity/h_bootstrap: open only while the router
