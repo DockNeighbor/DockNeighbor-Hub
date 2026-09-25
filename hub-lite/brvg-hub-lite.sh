@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.18.5"
+HUB_LITE_VERSION="0.18.6"
 # Self-update under a watchdog (0.18.3): see self_update. Every path overridable for hub-lite/test.sh.
 HUB_LITE_BACKUP="${BRVG_HUB_LITE_BACKUP:-/etc/brvg-hub-lite.prev.tgz}"   # every file of the running hub-lite
 HUB_LITE_LEGACY_BACKUP="/etc/brvg-hub-lite.prev"                      # the single-script backup before 0.18.3
