@@ -3130,10 +3130,12 @@ netapi GET /net/uplink/scan "" >/dev/null; netapi GET /net/uplink/saved "" >/dev
 netapi GET /net/clients "" >/dev/null; netapi POST /net/clients/block '{"mac":"aa:bb:cc:00:00:01","blocked":true}' >/dev/null
 netapi GET /net/reservations "" >/dev/null; netapi POST /net/reservations '{"mac":"aa:bb:cc:00:00:01","ip":"192.168.8.21"}' >/dev/null
 netapi DELETE /net/reservations '{"mac":"aa:bb:cc:00:00:01"}' >/dev/null; netapi POST /reboot "" >/dev/null
+netapi GET /net/mode "" >/dev/null; netapi POST /net/mode '{"mode":"bridge"}' >/dev/null
 check "net: every route reaches its dn-net verb" \
-  "lan-get wifi-get wifi-set uplink-get uplink-join uplink-disconnect uplink-scan uplink-saved uplink-forget clients client-block reservations reservation-add reservation-remove reboot" \
+  "lan-get wifi-get wifi-set uplink-get uplink-join uplink-disconnect uplink-scan uplink-saved uplink-forget clients client-block reservations reservation-add reservation-remove reboot mode-get mode-set" \
   "$(cut -d'|' -f1 "$N/calls" | tr '\n' ' ' | sed 's/ $//')"
 check "net: the uplink role in the body reaches dn-net" "1" "$(grep -c '^uplink-join|.*"role":"lan"' "$N/calls")"
+check "net/mode: the requested mode reaches dn-net" "1" "$(grep -c '^mode-set|.*"mode":"bridge"' "$N/calls")"
 
 # Who may: reading is monitor, changing is configure (reboot included, owner 2026-09-25); a monitor never sees keys.
 : > "$N/calls"; r=$(netapi GET /net/wifi "")
@@ -3141,12 +3143,12 @@ check "net/wifi: an owner gets the keys (no redaction)" "200 wifi-get||" "$(stat
 : > "$N/calls"; r=$(as_monitor GET /net/wifi "")
 check "net/wifi: a monitor gets Wi-Fi WITHOUT its keys" "200 wifi-get||1" "$(status_of "$r") $(last)"
 : > "$N/calls"
-for _rt in "GET /net/wan" "GET /net/lan" "GET /net/uplink" "GET /net/uplink/saved" "GET /net/clients" "GET /net/reservations"; do
+for _rt in "GET /net/wan" "GET /net/lan" "GET /net/uplink" "GET /net/uplink/saved" "GET /net/clients" "GET /net/reservations" "GET /net/mode"; do
   set -- $_rt; r=$(as_monitor "$1" "$2" ""); [ "$(status_of "$r")" = 200 ] || echo "monitor refused $_rt" >> "$N/refused"
 done
 check "net: a monitor may read every GET route but the scan" "" "$(cat "$N/refused" 2>/dev/null)"
 : > "$N/calls"
-for _rt in "POST /net/lan" "POST /net/wifi" "POST /net/uplink" "DELETE /net/uplink" "GET /net/uplink/scan" "DELETE /net/uplink/saved" "POST /net/clients/block" "POST /net/reservations" "DELETE /net/reservations" "POST /reboot"; do
+for _rt in "POST /net/lan" "POST /net/wifi" "POST /net/uplink" "DELETE /net/uplink" "GET /net/uplink/scan" "DELETE /net/uplink/saved" "POST /net/clients/block" "POST /net/reservations" "DELETE /net/reservations" "POST /reboot" "POST /net/mode"; do
   set -- $_rt; r=$(as_monitor "$1" "$2" '{}'); [ "$(status_of "$r")" = 403 ] || echo "monitor allowed $_rt" >> "$N/allowed"
   r=$(as_control "$1" "$2" '{}'); [ "$(status_of "$r")" = 403 ] || echo "control allowed $_rt" >> "$N/allowed"
 done
