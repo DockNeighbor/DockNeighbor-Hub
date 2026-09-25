@@ -3032,6 +3032,66 @@ wd_reset; hub_lite_files() { :; }; OFFER=0.18.4
 check "self_update: no update without a way back (nothing to back up)" "1:0" "$(self_update 2>/dev/null; echo "$?:$(grep -c '^upgrade' "$W/opkg.log")")"
 unset -f opkg hub_lite_files hub_lite_path
 
+# --- 0.18.5: the /api/hub/os routes (DockNeighbor OS, both upgrade levels) -----------------------
+O="$T/os"; mkdir -p "$O"
+printf 'DN_OS_PROFILE=hub-lite\nDN_OS_VERSION=0.1.3\nDN_OS_UPSTREAM="OpenWrt 24.10.8 ramips/mt76x8"\n' > "$O/release"
+# OS_AVAIL: what the stub channel offers. The stubs record every call in $O/calls.
+cat > "$O/dn-os-upgrade" <<'EOF_UP'
+#!/bin/sh
+echo "os $*" >> "$OS_DIR/calls"
+[ -n "${OS_FAIL:-}" ] && { echo "the channel manifest is not signed by a DockNeighbor OS key" >&2; exit 1; }
+u=false; [ "$OS_AVAIL" != "0.1.3" ] && u=true
+[ "$1" = check ] && echo "{ \"current\": \"0.1.3\", \"available\": \"$OS_AVAIL\", \"upgrade\": $u, \"hubLite\": \"0.18.5\" }"
+exit 0
+EOF_UP
+cat > "$O/dn-pkg-upgrade" <<'EOF_PU'
+#!/bin/sh
+echo "pkg $*" >> "$OS_DIR/calls"
+echo '{ "upgraded": [ { "package": "dn-handoff", "from": "1.1.0-r1", "to": "1.2.0-r1" } ] }'
+EOF_PU
+chmod 755 "$O/dn-os-upgrade" "$O/dn-pkg-upgrade"
+osapi() { api "$@" OS_DIR="$O" BRVG_DN_OS_UPGRADE="$O/dn-os-upgrade" BRVG_DN_PKG_UPGRADE="$O/dn-pkg-upgrade" BRVG_DN_RELEASE="$O/release"; }
+waitcall() { _n=0; while [ $_n -lt 20 ] && ! grep -q "$1" "$O/calls" 2>/dev/null; do sleep 0.2; _n=$((_n + 1)); done; grep -c "$1" "$O/calls" 2>/dev/null; }
+
+r=$(osapi GET /os "")
+check "os: the profile and version come from /etc/dn-release" "200 hub-lite 0.1.3" \
+  "$(status_of "$r") $(body_of "$r" | sed -n 's/.*"profile":"\([^"]*\)".*"version":"\([^"]*\)".*/\1 \2/p')"
+r=$(api GET /os "" BRVG_DN_OS_UPGRADE="$O/absent" BRVG_DN_RELEASE="$O/absent")
+check "os: not DockNeighbor OS is 501, so the app keeps the vendor's way" "501" "$(status_of "$r")"
+r=$(api POST /os/upgrade "" BRVG_DN_OS_UPGRADE="$O/absent")
+check "os/upgrade: not DockNeighbor OS is 501" "501" "$(status_of "$r")"
+
+: > "$O/calls"; r=$(osapi GET /os/check "" OS_AVAIL=0.1.4)
+check "os/check: the upgrader's own answer, passed through" "200 1" "$(status_of "$r") $(body_of "$r" | grep -c '"available": "0.1.4"')"
+r=$(osapi GET /os/check "" OS_AVAIL=0.1.4 OS_FAIL=1)
+check "os/check: a refused channel is 502 with the upgrader's reason" "502 1" "$(status_of "$r") $(body_of "$r" | grep -c 'not signed')"
+
+: > "$O/calls"; r=$(osapi POST /os/upgrade "" OS_AVAIL=0.1.3)
+check "os/upgrade: nothing newer is 409 and nothing is applied" "409 0" "$(status_of "$r") $(grep -c 'os apply' "$O/calls")"
+: > "$O/calls"; r=$(osapi POST /os/upgrade "" OS_AVAIL=0.1.4 OS_FAIL=1)
+check "os/upgrade: a refused check is 502 and nothing is applied" "502 0" "$(status_of "$r") $(grep -c 'os apply' "$O/calls")"
+: > "$O/calls"; r=$(osapi POST /os/upgrade "" OS_AVAIL=0.1.4)
+check "os/upgrade: an upgrade is 202, checked first" "202 os check" "$(status_of "$r") $(sed -n 1p "$O/calls")"
+check "os/upgrade: ...then applied, detached" "1" "$(waitcall 'os apply')"
+
+: > "$O/calls"; r=$(osapi GET /os/packages "")
+check "os/packages: what would be upgraded, changing nothing" "200 pkg --check" "$(status_of "$r") $(sed -n 1p "$O/calls")"
+: > "$O/calls"; r=$(osapi POST /os/packages "")
+check "os/packages: POST is 202 and runs the upgrader, detached" "202 1" "$(status_of "$r") $(waitcall '^pkg $')"
+
+# Who may: reading is monitor, changing the firmware is administer (hub_server.rs may_administer).
+printf '# test keys\n%s monitor\n' "$(printf '%s' 'mon-key' | sha256sum | cut -c1-64)" > "$O/keys"
+: > "$O/calls"
+r=$(osapi GET /os/check "" OS_AVAIL=0.1.4 HTTP_AUTHORIZATION="Bearer mon-key" BRVG_MEMBER_KEYS="$O/keys")
+check "os/check: a monitor may read" "200" "$(status_of "$r")"
+r=$(osapi POST /os/upgrade "" OS_AVAIL=0.1.4 HTTP_AUTHORIZATION="Bearer mon-key" BRVG_MEMBER_KEYS="$O/keys")
+check "os/upgrade: a monitor may NOT upgrade the firmware" "403" "$(status_of "$r")"
+r=$(osapi POST /os/packages "" HTTP_AUTHORIZATION="Bearer mon-key" BRVG_MEMBER_KEYS="$O/keys")
+check "os/packages: a monitor may NOT upgrade packages" "403" "$(status_of "$r")"
+check "os: a monitor's refused POSTs ran nothing" "0" "$(grep -c -e 'os apply' -e '^pkg $' "$O/calls")"
+r=$(osapi POST /os/upgrade "" OS_AVAIL=0.1.4 HTTP_AUTHORIZATION="Bearer wrong")
+check "os/upgrade: a wrong key is 401" "401" "$(status_of "$r")"
+
 [ -n "${KEEP_T:-}" ] && echo "T=$T" || rm -rf "$T"
 
 # --- the PACKAGED scripts are the tested scripts ----------------------------------------------

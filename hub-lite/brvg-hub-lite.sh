@@ -1337,7 +1337,9 @@ run_commands() {
 # attacker-controlled string anywhere in this path: no URL, no version, no filename.
 
 hub_lite_path() {
-  # Where this script is installed. Falls back to the packaged path.
+  # Where this script is installed: the door's configured BRVG_HUB_LITE_BIN first (run_detached sources this
+  # path, and a missing file there would silently run nothing), then PATH, then the packaged path.
+  [ -n "${BRVG_HUB_LITE_BIN:-}" ] && [ -r "$BRVG_HUB_LITE_BIN" ] && { echo "$BRVG_HUB_LITE_BIN"; return; }
   command -v brvg-hub-lite 2>/dev/null || echo /usr/bin/brvg-hub-lite
 }
 
@@ -1358,7 +1360,8 @@ hub_lite_path() {
 # log pipe, logging to syslog itself. The update and rollback verbs REPLACE the running service, and the package's
 # prerm stops it: procd SIGTERMs the daemon's main process (measured on OpenWrt 24.10.8, 2026-09-25: only the main
 # pid), which is exactly the process that would otherwise be running them. Before 0.18.4 the cloud's self_update
-# verb ran inline there, so opkg finished but the smoke check, probation and guard never did. $1 = function name.
+# verb ran inline there, so opkg finished but the smoke check, probation and guard never did. $1 = a function
+# name, or a command line (the /api/hub/os routes run DockNeighbor OS's upgraders through it too).
 run_detached() {
   _rd_bin=$(hub_lite_path); _rd_ss=""
   command -v setsid >/dev/null 2>&1 && _rd_ss=setsid

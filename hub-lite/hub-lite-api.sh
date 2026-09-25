@@ -39,6 +39,10 @@ RELOAD_FILE="${BRVG_HUB_LITE_RELOAD:-/tmp/brvg-hub-lite.reload}"
 KEYS_FILE="${BRVG_MEMBER_KEYS:-/etc/brvg-hub-lite.keys}"
 KEYS_STALE="${BRVG_MEMBER_KEYS_STALE:-/tmp/brvg-hub-lite.keys-stale}"
 RT_FILE="${BRVG_HUB_LITE_ROUTERS:-/usr/libexec/brvg-hub-lite/routers}"
+# DockNeighbor OS (0.18.5): the firmware under the hub-lite, when it is ours. Absent anywhere else.
+DN_OS_UPGRADE="${BRVG_DN_OS_UPGRADE:-/usr/sbin/dn-os-upgrade}"
+DN_PKG_UPGRADE="${BRVG_DN_PKG_UPGRADE:-/usr/sbin/dn-pkg-upgrade}"
+DN_RELEASE="${BRVG_DN_RELEASE:-/etc/dn-release}"
 export LT_STATE_DIR
 
 # The first-run window, from service start: the daemon's adopt::ADOPTION_WINDOW.
@@ -50,6 +54,7 @@ MAX_BODY=16384
 reason() {
   case "$1" in
     200) echo '200 OK' ;;
+    202) echo '202 Accepted' ;;
     204) echo '204 No Content' ;;
     400) echo '400 Bad Request' ;;
     401) echo '401 Unauthorized' ;;
@@ -60,6 +65,7 @@ reason() {
     422) echo '422 Unprocessable Entity' ;;
     500) echo '500 Internal Server Error' ;;
     501) echo '501 Not Implemented' ;;
+    502) echo '502 Bad Gateway' ;;
     502) echo '502 Bad Gateway' ;;
     503) echo '503 Service Unavailable' ;;
     *)   echo "$1 Error" ;;
@@ -571,6 +577,47 @@ case "$method:$verb" in
     load_lib
     run_detached self_update
     reply 200 '{"status":"update started"}'
+    ;;
+
+  # ---- DockNeighbor OS: the firmware under the hub-lite (0.18.5) --------------------------------
+  # Both upgrade levels for the OS itself; the hub-lite's own level 1 stays POST /update. Only on DockNeighbor
+  # OS (github.com/DockNeighbor/DockNeighbor-OS): anywhere else 501, and the app keeps the vendor's way.
+  # Checks answer synchronously, so a refusal comes back as an error; the work itself runs detached, because a
+  # level-2 upgrade reboots the router and a package upgrade may restart this door's own service. 202 = started.
+  GET:/os)
+    authorize monitor
+    [ -x "$DN_OS_UPGRADE" ] && [ -r "$DN_RELEASE" ] || fail 501 "not DockNeighbor OS"
+    _osp=$(sed -n 's/^DN_OS_PROFILE=//p' "$DN_RELEASE" | tr -d '"'); _osv=$(sed -n 's/^DN_OS_VERSION=//p' "$DN_RELEASE" | tr -d '"')
+    _osu=$(sed -n 's/^DN_OS_UPSTREAM=//p' "$DN_RELEASE" | tr -d '"')
+    reply 200 "{\"profile\":\"$(esc "$_osp")\",\"version\":\"$(esc "$_osv")\",\"upstream\":\"$(esc "$_osu")\"}"
+    ;;
+  GET:/os/check)
+    authorize monitor
+    [ -x "$DN_OS_UPGRADE" ] || fail 501 "not DockNeighbor OS"
+    _osc=$("$DN_OS_UPGRADE" check 2>&1) || fail 502 "$_osc"
+    reply 200 "$_osc"
+    ;;
+  POST:/os/upgrade)
+    authorize administer
+    [ -x "$DN_OS_UPGRADE" ] || fail 501 "not DockNeighbor OS"
+    _osc=$("$DN_OS_UPGRADE" check 2>&1) || fail 502 "$_osc"
+    printf '%s' "$_osc" | grep -q '"upgrade": *true' || fail 409 "already at the channel's version"
+    load_lib
+    run_detached "$DN_OS_UPGRADE apply"
+    reply 202 "{\"status\":\"upgrade started\",\"check\":$_osc}"
+    ;;
+  GET:/os/packages)
+    authorize monitor
+    [ -x "$DN_PKG_UPGRADE" ] || fail 501 "not DockNeighbor OS"
+    _osk=$("$DN_PKG_UPGRADE" --check 2>&1) || fail 502 "$_osk"
+    reply 200 "$_osk"
+    ;;
+  POST:/os/packages)
+    authorize administer
+    [ -x "$DN_PKG_UPGRADE" ] || fail 501 "not DockNeighbor OS"
+    load_lib
+    run_detached "$DN_PKG_UPGRADE"
+    reply 202 '{"status":"package upgrade started"}'
     ;;
 
   # ---- identity / bootstrap (OPEN, first run only) ----------------------------------------------
