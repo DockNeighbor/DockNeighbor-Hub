@@ -131,9 +131,11 @@ pub fn authorize<'a>(keys: &'a [MemberKey], presented: &str) -> Option<&'a Membe
 /// The role matrix, hub-side — a deliberate MIRROR of vehicleCapabilities.ts, not a new scheme.
 /// Renaming/re-timing the hub is `change_settings` (admin+); handing it a rotated token or tearing
 /// it down is device-lifecycle work (`add_device`/`remove_device` grade — coowner/owner).
-pub fn may_configure(role: &str) -> bool {
-    matches!(role, "owner" | "coowner" | "admin")
-}
+// 🔴 `may_configure` WAS REMOVED 2026-09-25, not redefined (owner ruling — settings are owner/coowner).
+// Deleting it rather than narrowing it means a future settings route cannot reach for a name that reads
+// like "may change settings" and quietly get the old, wider set: there is no such function to call, so
+// the compiler refuses instead of the reviewer having to notice. hub-lite's `configure` level was retired
+// the same way, and for the same reason.
 pub fn may_administer(role: &str) -> bool {
     matches!(role, "owner" | "coowner")
 }
@@ -837,8 +839,13 @@ async fn do_status(rt: &Rt) -> Answer {
 }
 
 async fn do_config(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
-    if !may_configure(&caller.role) {
-        return err(403, "changing the hub's settings needs an admin, co-owner or owner");
+    // 🔴 OWNER RULING 2026-09-25: "owner and co-owner only for bridge mode as with all router and hub
+    // settings". This was `may_configure` (owner|coowner|admin) — the daemon's ONLY settings route open
+    // to a Limited Admin, and the counterpart of the fourteen hub-lite routes that moved with it.
+    // `do_routers` already split read/change as control/administer, so the daemon was stricter than
+    // hub-lite everywhere except here; the two tiers now agree.
+    if !may_administer(&caller.role) {
+        return err(403, "changing the hub's settings needs a co-owner or the owner");
     }
     let req: ConfigReq = match serde_json::from_slice(body) {
         Ok(r) => r,
@@ -4872,8 +4879,9 @@ mod tests {
     #[test]
     fn write_gates_mirror_the_vehicle_role_matrix() {
         // change_settings grade
-        for r in ["owner", "coowner", "admin"] { assert!(may_configure(r), "{r}"); }
-        for r in ["control", "monitor", "", "garbage"] { assert!(!may_configure(r), "{r}"); }
+        // Settings are administer now (owner ruling 2026-09-25), so an `admin` is NOT among them —
+        // asserted here as well as at the route, because this is the line somebody would widen first.
+        for r in ["admin", "control", "monitor", "", "garbage"] { assert!(!may_administer(r), "{r}"); }
         // device-lifecycle grade
         for r in ["owner", "coowner"] { assert!(may_administer(r), "{r}"); }
         for r in ["admin", "control", "monitor", ""] { assert!(!may_administer(r), "{r}"); }
@@ -4973,7 +4981,7 @@ mod tests {
     async fn config_writes_require_the_settings_grade_and_persist_to_the_store() {
         let base = temp_base("config");
         hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
-        let (origin, _rt) = spawn_server(base.clone(), vec![key("monitor"), key("admin")]).await;
+        let (origin, _rt) = spawn_server(base.clone(), vec![key("monitor"), key("admin"), key("owner")]).await;
         let c = reqwest::Client::new();
 
         // monitor: authenticated but not entitled — 403, and the store is untouched.
@@ -4982,8 +4990,16 @@ mod tests {
         assert_eq!(r.status(), 403);
         assert_eq!(hub_config::read_config_in(&base).name, "Central");
 
-        // admin: entitled for settings.
+        // 🔴 ADMIN IS NO LONGER ENTITLED (owner ruling 2026-09-25: settings are owner/coowner). This
+        // block asserted 200 until that day, which is the evidence the capability was real and is the
+        // reason this test had to change rather than merely pass.
         let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("admin").key)
+            .json(&serde_json::json!({"name": "Hacked By Admin"})).send().await.unwrap();
+        assert_eq!(r.status(), 403);
+        assert_eq!(hub_config::read_config_in(&base).name, "Central", "a refused write must not persist");
+
+        // owner: entitled for settings.
+        let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("owner").key)
             .json(&serde_json::json!({"name": "  Boat PC  ", "heartbeatSecs": 45})).send().await.unwrap();
         assert_eq!(r.status(), 200);
         let cfg = hub_config::read_config_in(&base);
@@ -4991,8 +5007,9 @@ mod tests {
         assert_eq!(cfg.heartbeat_secs, 45);
         assert_eq!(cfg.token, "hubtok-secret"); // untouched by a settings write
 
-        // Below the heartbeat floor is an explicit 422, not a silent clamp.
-        let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("admin").key)
+        // Below the heartbeat floor is an explicit 422, not a silent clamp. Owner key, because an admin
+        // no longer gets far enough to be told its value is wrong — the gate answers first.
+        let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("owner").key)
             .json(&serde_json::json!({"heartbeatSecs": 5})).send().await.unwrap();
         assert_eq!(r.status(), 422);
         assert_eq!(hub_config::read_config_in(&base).heartbeat_secs, 45);
@@ -6455,16 +6472,21 @@ mod tests {
     async fn the_webhook_secret_is_set_through_config_and_never_read_back() {
         let base = temp_base("shelly_secret_cfg");
         hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
-        let (origin, _rt) = spawn_server(base.clone(), vec![key("monitor"), key("admin")]).await;
+        let (origin, _rt) = spawn_server(base.clone(), vec![key("monitor"), key("admin"), key("owner")]).await;
         let c = reqwest::Client::new();
 
-        // Settings grade, like every other field on this endpoint.
-        let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("monitor").key)
-            .json(&serde_json::json!({"shellySecret": "s3cr3t"})).send().await.unwrap();
-        assert_eq!(r.status(), 403);
-        assert!(hub_config::read_config_in(&base).shelly_secret.is_empty());
+        // Settings grade, like every other field on this endpoint — and since 2026-09-25 that grade is
+        // owner/coowner, so an admin is refused here too. Worth one extra case rather than a swapped
+        // key: the shelly secret is a credential, and "who may set it" is exactly the question the
+        // owner's ruling narrowed.
+        for who in ["monitor", "admin"] {
+            let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key(who).key)
+                .json(&serde_json::json!({"shellySecret": "s3cr3t"})).send().await.unwrap();
+            assert_eq!(r.status(), 403, "{who} must not set the webhook secret");
+            assert!(hub_config::read_config_in(&base).shelly_secret.is_empty());
+        }
 
-        let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("admin").key)
+        let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("owner").key)
             .json(&serde_json::json!({"shellySecret": "  s3cr3t\n"})).send().await.unwrap();
         assert_eq!(r.status(), 200);
         assert_eq!(hub_config::read_config_in(&base).shelly_secret, "s3cr3t", "trimmed — a pasted newline must not break every comparison");
@@ -6475,7 +6497,7 @@ mod tests {
         assert_eq!(v["shellyIngestArmed"], true);
 
         // Empty disarms it deliberately — that is how a rotated secret is taken back.
-        let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("admin").key)
+        let r = c.post(format!("{origin}/api/hub/config")).header(KEY_HEADER, key("owner").key)
             .json(&serde_json::json!({"shellySecret": ""})).send().await.unwrap();
         let v: serde_json::Value = r.json().await.unwrap();
         assert_eq!(v["shellyIngestArmed"], false);

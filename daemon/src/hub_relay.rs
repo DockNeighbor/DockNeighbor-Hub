@@ -751,7 +751,11 @@ mod tests {
         let c1 = next(&mut rx).await;
         assert_eq!(c1["id"], "c1");
         assert_eq!(c1["status"], 403, "a monitor must not be able to reconfigure the hub");
-        assert!(c1["body"].as_str().unwrap().contains("admin"));
+        // The refusal names who MAY, and since 2026-09-25 that is no longer an admin (owner ruling:
+        // settings are owner/coowner). Asserted on the words the caller actually receives, because a
+        // 403 whose text still offered "admin" would tell a Limited Admin to try again forever.
+        assert!(c1["body"].as_str().unwrap().contains("co-owner"), "got {}", c1["body"]);
+        assert!(!c1["body"].as_str().unwrap().contains("admin,"), "the refusal must not still offer admin");
 
         let c2 = next(&mut rx).await;
         assert_eq!(c2["id"], "c2");
