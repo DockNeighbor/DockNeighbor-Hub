@@ -64,7 +64,8 @@ worker on a timer, so the vehicle reports without the app being onsite.
   for route, over DockNeighbor OS's `dn-net`. `GET /api/hub/net/wan`; `GET`/`POST /net/lan`; `GET`/`POST /net/wifi`;
   `GET`/`POST`/`DELETE /net/uplink` (join takes `role`: `lan` = the boat's own network, open like LAN; `wan` = an
   internet uplink, restricted; default `wan`); `GET /net/uplink/scan`; `GET`/`DELETE /net/uplink/saved`;
-  `GET /net/clients`, `POST /net/clients/block`; `GET`/`POST`/`DELETE /net/reservations`; `POST /api/hub/reboot`.
+  `GET /net/clients`, `POST /net/clients/block`; `GET`/`POST`/`DELETE /net/reservations`; `POST /api/hub/reboot`;
+  `GET`/`POST /net/mode` (`router`, or `bridge`: no firewall, no NAT, the WAN port bridged into the LAN; 0.18.8).
   Reading is `monitor` (Wi-Fi WITHOUT its keys); every change, the scan and reboot are `configure`.
 
 **Deliberately NOT here** (a full hub, or the app, does these)
