@@ -42,6 +42,13 @@ worker on a timer, so the vehicle reports without the app being onsite.
 - A **bounded relay spool** (300 lines, oldest readings shed before alarms), drained whether or not
   the relay tier is on, with a 30 s retry while a failed batch or an undelivered alarm waits.
 - **Update visibility**: the signed feed's newer version, as `updateAvailable` and `update=`.
+- **Self-update under a watchdog** (0.18.3). `self_update` keeps every file of the running hub-lite, installs from
+  the signed feed, and puts the new version on **probation**. Its first successful report confirms it; on a router
+  not yet enrolled, its door answering locally with the new version does. Unconfirmed after 10 minutes while the
+  router **has a default route**, a guard restores the previous version and skip-lists the bad one (never installed
+  or offered again). With no route, the new version is kept: its silence proves nothing. The guard is written by
+  the OUTGOING version into `/etc` and runs as its own procd service, so it survives a reboot and needs neither the
+  new code nor the cloud. `rollback_agent` restores and skip-lists too.
 
 **Deliberately NOT here** (a full hub, or the app, does these)
 - The relay socket — a persistent WebSocket from busybox ash is not worth the overlay.

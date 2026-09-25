@@ -2635,6 +2635,100 @@ check "batch: the resend-all round (seq 6) is still kind delta — a partial rea
 check "flood close is untouched by the cadence: the receiver still closes with the WAN down" "1" \
   "$(LINKTAP_HOST=192.168.8.50 LINKTAP_GW_ID=GW02 LINKTAP_DEV_IDS=$DEV BRVG_RELAY_SPOOL="$C17/fspool" PATH="$T/bin:$PATH" sh -c ". \"$HL_DIR/brvg-hub-lite.sh\"; echo 0 > \"$SHIM_RC\"; : > \"$SHIM_LOG\"; linktap_flood_close; grep -c '\"cmd\":7' \"$SHIM_LOG\"")"
 
+# --- 0.18.3: self-update under a watchdog --------------------------------------------------------
+# The real self_update, guard and restore, against a temp root. opkg is a stub; "installing" writes a new
+# collector script whose --version says what the fake feed offers.
+W="$T/wd"; mkdir -p "$W"
+HUB_LITE_NO_SERVICE=1
+wd_reset() {
+  rm -rf "$W"; mkdir -p "$W/root/usr/bin" "$W/root/www/brvg/api"
+  printf '#!/bin/sh\necho 0.18.3\n' > "$W/root/usr/bin/brvg-hub-lite"; chmod 755 "$W/root/usr/bin/brvg-hub-lite"
+  echo 'door v0.18.3' > "$W/root/www/brvg/api/hub"
+  HUB_LITE_ROOT="$W/root"; HUB_LITE_BACKUP="$W/prev.tgz"; HUB_LITE_PROBATION="$W/probation"
+  HUB_LITE_SKIP="$W/skip"; HUB_LITE_GUARD="$W/guard"; HUB_LITE_GUARD_INIT="$W/guard.init"; CONF="$W/conf"
+  : > "$W/opkg.log"
+}
+hub_lite_path() { echo "$W/root/usr/bin/brvg-hub-lite"; }
+hub_lite_files() { printf '%s\n' /usr/bin/brvg-hub-lite /www/brvg/api/hub; }
+# OFFER: the version the fake feed carries. NEWBODY: what "installing" it writes as the collector.
+opkg() {
+  echo "$*" >> "$W/opkg.log"
+  case "$1" in
+    update) return 0 ;;
+    list) echo "brvg-hub-lite - $OFFER - test" ;;
+    upgrade) printf '%s\n' "$NEWBODY" > "$W/root/usr/bin/brvg-hub-lite"; echo "door v$OFFER" > "$W/root/www/brvg/api/hub" ;;
+  esac
+}
+guard() { GUARD_NO_SERVICE=1 sh "$HUB_LITE_GUARD" >/dev/null 2>&1; echo $?; }
+
+wd_reset; OFFER=0.18.4; NEWBODY='#!/bin/sh
+echo 0.18.4'
+self_update 2>/dev/null
+check "self_update: installs the offered version" "0.18.4" "$("$W/root/usr/bin/brvg-hub-lite" --version)"
+check "self_update: the new version is on probation, from 0.18.3" "FROM=0.18.3 TO=0.18.4" "$(grep -E '^(FROM|TO)=' "$W/probation" | tr '\n' ' ' | sed 's/ $//')"
+check "self_update: the backup holds EVERY file (collector + door)" "usr/bin/brvg-hub-lite www/brvg/api/hub" "$(tar -tzf "$W/prev.tgz" | sort | tr '\n' ' ' | sed 's/ $//')"
+check "self_update: the guard was written by the OLD version" "1" "$(grep -c 'Written by hub-lite 0.18.3' "$W/guard")"
+check "self_update: the guard service was written" "1" "$(grep -c 'while /bin/sh' "$W/guard.init")"
+check "self_update: no second update while one is on probation" "1:0" "$(self_update 2>/dev/null; echo "$?:$(grep -c upgrade "$W/opkg.log" | awk '{print $1-1}')")"
+
+DL=$(sed -n 's/^DEADLINE=//p' "$W/probation")
+check "guard: before the deadline it keeps watching" "0" "$(GUARD_NOW=$((DL - 1)) guard)"
+check "guard: ...and changes nothing" "0.18.4" "$("$W/root/usr/bin/brvg-hub-lite" --version)"
+
+echo 'VID=v_x' > "$CONF"
+check "guard: enrolled, unconfirmed, WITH a route: it finishes" "1" "$(GUARD_NOW=$DL GUARD_ROUTE=1 guard)"
+check "guard: ...and the previous collector is back" "0.18.3" "$("$W/root/usr/bin/brvg-hub-lite" --version)"
+check "guard: ...and the previous door is back (every file, not just the collector)" "door v0.18.3" "$(cat "$W/root/www/brvg/api/hub")"
+check "guard: ...and 0.18.4 is skip-listed" "0.18.4" "$(cat "$W/skip")"
+check "guard: ...and the probation is over" "gone" "$([ -f "$W/probation" ] && echo present || echo gone)"
+check "self_update: a skip-listed version is never installed again" "1:0" "$(self_update 2>/dev/null; echo "$?:$(grep -c '^upgrade' "$W/opkg.log" | awk '{print $1-1}')")"
+
+wd_reset; self_update 2>/dev/null; DL=$(sed -n 's/^DEADLINE=//p' "$W/probation"); echo 'VID=v_x' > "$CONF"
+check "guard: enrolled, unconfirmed, NO route: kept (its silence proves nothing)" "1" "$(GUARD_NOW=$DL GUARD_ROUTE=0 guard)"
+check "guard: ...still the new version" "0.18.4" "$("$W/root/usr/bin/brvg-hub-lite" --version)"
+check "guard: ...and nothing skip-listed" "no" "$([ -s "$W/skip" ] && echo yes || echo no)"
+
+wd_reset; self_update 2>/dev/null; DL=$(sed -n 's/^DEADLINE=//p' "$W/probation")
+check "guard: NOT enrolled and its door answers with the new version: kept" "1" \
+  "$(GUARD_NOW=$DL GUARD_ROUTE=1 GUARD_DOOR='{"ok":true,"version":"0.18.4"}' guard)"
+check "guard: ...still the new version" "0.18.4" "$("$W/root/usr/bin/brvg-hub-lite" --version)"
+
+wd_reset; self_update 2>/dev/null; DL=$(sed -n 's/^DEADLINE=//p' "$W/probation")
+check "guard: NOT enrolled and the door is silent, with a route: rolled back" "1" "$(GUARD_NOW=$DL GUARD_ROUTE=1 GUARD_DOOR='' guard)"
+check "guard: ...the previous version is back" "0.18.3" "$("$W/root/usr/bin/brvg-hub-lite" --version)"
+
+wd_reset; self_update 2>/dev/null; DL=$(sed -n 's/^DEADLINE=//p' "$W/probation")
+_hv=$HUB_LITE_VERSION; HUB_LITE_VERSION=0.18.4; probation_confirm 2>/dev/null; HUB_LITE_VERSION=$_hv
+check "confirm: the new version's first successful report ends its probation" "gone" "$([ -f "$W/probation" ] && echo present || echo gone)"
+check "guard: after a confirmation it finishes without touching anything" "1:0.18.4" "$(GUARD_NOW=$DL GUARD_ROUTE=1 guard):$("$W/root/usr/bin/brvg-hub-lite" --version)"
+
+wd_reset; self_update 2>/dev/null
+probation_confirm 2>/dev/null   # HUB_LITE_VERSION is still 0.18.3 here: the OLD version reporting
+check "confirm: a report from any other version does NOT confirm the new one" "present" "$([ -f "$W/probation" ] && echo present || echo gone)"
+
+wd_reset; OFFER=0.18.5; NEWBODY='#!/bin/sh
+exit 1'
+self_update 2>/dev/null
+check "smoke check: a new version that can't report its version is rolled back at once" "0.18.3" "$("$W/root/usr/bin/brvg-hub-lite" --version)"
+check "smoke check: ...and skip-listed" "0.18.5" "$(cat "$W/skip")"
+check "smoke check: ...and never put on probation" "gone" "$([ -f "$W/probation" ] && echo present || echo gone)"
+
+# The /api/hub/update door runs self_update with BRVG_HUB_LITE_TEST=1 (to skip the main loop). The guard
+# service must still be enabled and started on that path: record what probation_start asks procd for.
+wd_reset; OFFER=0.18.4; NEWBODY='#!/bin/sh
+echo 0.18.4'
+(
+  HUB_LITE_NO_SERVICE=""; BRVG_HUB_LITE_TEST=1
+  # The init script probation_start writes is a recorder here, so "procd" is a log of what was asked of it.
+  guard_init() { printf '#!/bin/sh\necho "$1" >> "%s"\n' "$W/procd.log"; }
+  probation_start 0.18.3 0.18.4 2>/dev/null
+)
+check "self_update via the app's door (BRVG_HUB_LITE_TEST set): the guard is enabled AND started" "enable start" "$(tr '\n' ' ' < "$W/procd.log" 2>/dev/null | sed 's/ $//')"
+
+wd_reset; hub_lite_files() { :; }; OFFER=0.18.4
+check "self_update: no update without a way back (nothing to back up)" "1:0" "$(self_update 2>/dev/null; echo "$?:$(grep -c '^upgrade' "$W/opkg.log")")"
+unset -f opkg hub_lite_files hub_lite_path
+
 [ -n "${KEEP_T:-}" ] && echo "T=$T" || rm -rf "$T"
 
 # --- the PACKAGED scripts are the tested scripts ----------------------------------------------
