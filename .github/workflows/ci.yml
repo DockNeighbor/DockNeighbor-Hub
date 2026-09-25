@@ -53,7 +53,7 @@ jobs:
         # RECEIVER — the script that turns a Shelly's flood report into a local valve close. The
         # blind spot the note above describes had claimed another one. hub-lite-api.sh is new in
         # the same commit and went straight in, rather than waiting to be noticed later.
-        run: shellcheck --severity=error --shell=sh hub-lite/brvg-hub-lite.sh hub-lite/routers.sh hub-lite/hub-lite-mgmt.sh hub-lite/hub-lite-cgi.sh hub-lite/hub-lite-gps-cgi.sh hub-lite/hub-lite-api.sh hub-lite/setup-usb-gps.sh hub-lite/test.sh hub-lite/package/build-ipk.sh hub-lite/package/build-feed.sh hub-lite/package/feed-setup.sh hub-lite/package/strip-comments.sh hub-lite/hub/install.sh daemon/linux/install.sh daemon/macos/postinstall
+        run: shellcheck --severity=error --shell=sh scripts/check-version-not-already-released.sh scripts/check-version-not-already-released.selftest.sh hub-lite/brvg-hub-lite.sh hub-lite/routers.sh hub-lite/hub-lite-mgmt.sh hub-lite/hub-lite-cgi.sh hub-lite/hub-lite-gps-cgi.sh hub-lite/hub-lite-api.sh hub-lite/setup-usb-gps.sh hub-lite/test.sh hub-lite/package/build-ipk.sh hub-lite/package/build-feed.sh hub-lite/package/feed-setup.sh hub-lite/package/strip-comments.sh hub-lite/hub/install.sh daemon/linux/install.sh daemon/macos/postinstall
       - name: Build hub-lite package
         run: sh hub-lite/package/build-ipk.sh
       # The feed index is the signed artifact: prove the index describes the package just built,
@@ -130,3 +130,31 @@ jobs:
           makensis -WX -V2 windows/installer.nsi
           test -f windows/brvg-hub-windows-setup.exe
           echo "installer built: $(stat -c%s windows/brvg-hub-windows-setup.exe) bytes"
+
+  # ── Is this branch about to publish a version somebody else already published? ──────────────────
+  #
+  # 🔴 A NEAR-MISS ON 2026-09-25, CAUGHT BY HAND AND NOT BY ANYTHING HERE. PR #168 was held for an owner
+  # decision while three other PRs released hub-lite 0.18.3, 0.18.4 and 0.18.5 underneath it. Each time
+  # the branch and main ended up declaring the SAME version string, so `git merge` took it with no
+  # conflict, this workflow went green, 867 hub-lite checks passed, and the branch sat one `git tag` away
+  # from publishing different code under a version already installed on routers.
+  #
+  # The release step would have been the first thing to notice — by failing, or by not failing. This job
+  # is the thing that should notice instead, and it runs on the PR, where the fix is a one-line bump.
+  #
+  # ⚠️ `fetch-depth: 0` AND `fetch-tags: true` ARE THE JOB. The check compares against published TAGS, so
+  # a shallow checkout cannot answer the question at all — it exits 2 (unverifiable) rather than passing,
+  # which is the only honest option but is also a red build. Do not "optimise" this checkout.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      # 📌 THE SELF-TEST RUNS FIRST, the same order every gate in sc4-internal uses: a gate that cannot
+      # fail is worse than no gate, and this one's whole value is its red state.
+      - name: Self-test the version gate
+        run: sh scripts/check-version-not-already-released.selftest.sh
+      - name: Check no declared version is already published
+        run: sh scripts/check-version-not-already-released.sh .
