@@ -128,7 +128,7 @@ case "$method:$action" in
     # about to exit. Excluded for the verbs that are about to take the uplink or the binary away —
     # a follow-up send would only fail. See HUB_LITE_FOLLOWUP in brvg-hub-lite.sh.
     _fu=1
-    case "$cmd" in reboot|reboot_modem|self_update|rollback_agent) _fu=0 ;; esac
+    case "$cmd" in reboot|reboot_modem|self_update|rollback_agent|rollback_hub_lite) _fu=0 ;; esac
     [ "$_fu" = "1" ] && : > "${BRVG_HUB_LITE_FOLLOWUP:-/tmp/brvg-hub-lite.followup}"
     reply 200 "{\"status\":\"ok\",\"ran\":\"$cmd\",\"door\":\"lan\",\"followup\":$_fu}"
     ;;

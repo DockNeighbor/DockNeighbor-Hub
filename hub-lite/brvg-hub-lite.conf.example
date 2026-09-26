@@ -5,7 +5,7 @@
 VID=""
 DEVICE_ID=""
 
-# PREFERRED: the per-device token minted by POST /api/agent/enroll (admin-only; shown once).
+# PREFERRED: the per-device token minted by POST /api/hub-lite/enroll (admin-only; shown once).
 # Individually revocable — a leaked token exposes only this device's telemetry write path.
 DEVICE_TOKEN=""
 

@@ -101,8 +101,8 @@ GET {WORKER_URL}/api/shelly?vid=…&device=…&event=gps.measurement&k=…&lat=�
 GET {WORKER_URL}/api/shelly?vid=…&device=…&event=modem.measurement&k=…&rssi=…&rsrp=…&carrier=…&sim=…
 ```
 
-Auth, preferred: a **per-device revocable token** (`DEVICE_TOKEN` → `GET /api/agent?...&t=`),
-minted once by an admin via `POST /api/agent/enroll {vid, deviceId}` (Firebase ID token required;
+Auth, preferred: a **per-device revocable token** (`DEVICE_TOKEN` → `GET /api/hub-lite?...&t=`),
+minted once by an admin via `POST /api/hub-lite/enroll {vid, deviceId}` (Firebase ID token required;
 re-enroll rotates, DELETE revokes). Legacy fallback when `DEVICE_TOKEN` is empty: the per-vehicle
 webhook key (`VEHICLE_KEY` → `/api/shelly?...&k=`). Both land in the identical cloud pipeline.
 
@@ -208,7 +208,7 @@ If the app shows no position from the router, the order to check is: does `/dev/
 - **Cadence (0.18.0, owner D6 and the 2026-09-15 ruling of ~100-200 hub->cloud updates a day).** One
   check-in every **15 min** while nobody watches and every **1 min** while the reply carries a watch
   lease (`lease`/`leaseUntil`/`checkinSec`/`live`, flat), sent as a **single**
-  `POST /api/agent/batch?...&anchorsig=<sig>` carrying a `hub.checkin` item, the newest modem sample
+  `POST /api/hub-lite/batch?...&anchorsig=<sig>` carrying a `hub.checkin` item, the newest modem sample
   **on that same item**, the idle LinkTap readings and anything spooled. The reply answers the lease,
   the commands, the `anchor` config delta and `keysSig` — the same fields the `/api/agent` reply
   carried, read the same way. 0.17.0 spent two GETs per idle tick (the check-in, then a separate
@@ -218,7 +218,7 @@ If the app shows no position from the router, the order to check is: does `/dev/
   item can honestly claim to be a keyframe. A worker that predates #327 refuses the endpoint; the
   hub-lite falls back to the 0.17.0 two-GET path and re-probes hourly. The member-key set and the
   management key still ride the check-in (L4). While `live` is 1 a background child holds the live
-  link (`GET /api/agent/live/poll` + `POST /api/agent/live/result`) and runs relayed calls through the
+  link (`GET /api/hub-lite/live/poll` + `POST /api/hub-lite/live/result`) and runs relayed calls through the
   same `/api/hub` door and role gate as the LAN; it closes when the lease does. Nothing is queued.
 - `GPS_INTERVAL` (default 120 s, floor 30) and `MODEM_INTERVAL` (default 600 s, floor 60) are
   **sample** clocks, not send clocks. Managed routers (`routers.sh`) poll on their own clock but
@@ -292,7 +292,7 @@ bench session (2026-08-06) plus standard NMEA/gpsd shapes. Runs in CI (`hub-lite
 `HUB_LITE_ENABLED=1` in `/etc/brvg-hub-lite.conf` turns this hub-lite into the **hub-lite tier** of the hub
 architecture: a LAN-only uhttpd instance serves
 `hub-lite-cgi.sh` at `http://<router>:8722/cgi-bin/report`, the Shellys' webhooks are re-registered
-against it, and the hub-lite drains the spool into ONE `/api/agent/batch` report per check-in (alarms go at once).
+against it, and the hub-lite drains the spool into ONE `/api/hub-lite/batch` report per check-in (alarms go at once).
 
 Why: the metered link pays per TLS handshake, not per byte — one roll-up connection replaces one
 connection per device per event. And once no sensor talks to the internet directly, lockdown's
@@ -344,14 +344,14 @@ still needs is `uhttpd` present (**not stock** on GL.iNet firmware — the `.ipk
 `Depends:`).
 
 **Auth (before 0.15.1, still accepted)** is the router's own management key (`MGMT_KEY` in the config).
-The hub-lite fetches it from `/api/agent/mgmt-key` with the device token it already has, so a box
+The hub-lite fetches it from `/api/hub-lite/mgmt-key` with the device token it already has, so a box
 enrolled before 0.14.0 picks its key up on the next modem tick with nothing to re-install. With no
 key on the box the door is **shut**, not open: a hub-lite that has never reached the worker cannot
 tell a member from a stranger on the marina Wi-Fi.
 
 **Role keys (0.15.1, owner decision D3).** *"crew with control access should be able to open the
 valve. others should not"*. On the modem tick the collector also polls
-`GET /api/agent/member-keys?vid&device&t` (its device token) and stores the vessel's member set in
+`GET /api/hub-lite/member-keys?vid&device&t` (its device token) and stores the vessel's member set in
 `/etc/brvg-hub-lite.keys` (0600). The file is `sig <signature>` followed by one `<sha256 of key> <role>` line
 per member. It holds **digests, never keys**, so the old objection to giving a router every member's
 credential does not apply. The worker sends the set's signature as an ETag; the poll presents it in

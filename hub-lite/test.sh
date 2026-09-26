@@ -89,8 +89,8 @@ check "urlencode: spaces and ampersands" "T-Mobile%20Wholesale" "$(urlencode_spa
 # --- build_report_url (token path wins; legacy k= fallback) ---
 WORKER_URL="https://api.example.com"; VID="v1"; DEVICE_ID="brv_net_1"
 DEVICE_TOKEN="tok64"; VEHICLE_KEY="vkey"
-check "report url: DEVICE_TOKEN → /api/agent with t=" \
-  "https://api.example.com/api/agent?vid=v1&device=brv_net_1&event=gps.measurement&t=tok64&lat=1&lon=2" \
+check "report url: DEVICE_TOKEN → /api/hub-lite with t=" \
+  "https://api.example.com/api/hub-lite?vid=v1&device=brv_net_1&event=gps.measurement&t=tok64&lat=1&lon=2" \
   "$(build_report_url 'gps.measurement' 'lat=1&lon=2')"
 DEVICE_TOKEN=""
 check "report url: no token → legacy /api/shelly with k=" \
@@ -340,6 +340,11 @@ out=$(printf '{"commands":[{"id":"u1","cmd":"self_update"}]}' | parse_commands)
 check "commands: self_update parses" "u1:self_update" "$out"
 out=$(printf '{"commands":[{"id":"u2","cmd":"rollback_agent"}]}' | parse_commands)
 check "commands: rollback_agent parses" "u2:rollback_agent" "$out"
+# 0.18.10: the hub-lite answers to BOTH rollback spellings. The worker still SENDS rollback_agent
+# (sc4-internal docs/ONSITE.md §2), so dropping either one strands a fleet — the old name strands
+# today's worker, the new name strands the worker the owner switches to.
+out=$(printf '{"commands":[{"id":"u2b","cmd":"rollback_hub_lite"}]}' | parse_commands)
+check "commands: rollback_hub_lite parses" "u2b:rollback_hub_lite" "$out"
 # A version smuggled into the verb must NOT survive — the whole anti-RCE property is that the
 # cloud says "update yourself", never "install this".
 out=$(printf '{"commands":[{"id":"u3","cmd":"self_update 9.9.9"}]}' | parse_commands)
@@ -964,7 +969,7 @@ SHIM
 cat > "$T/bin/logread" <<'SHIM'
 #!/bin/sh
 echo "Sat Sep 13 brvg-hub-lite: management key stored"
-echo "Sat Sep 13 brvg-hub-lite: send failed url=https://w/api/agent?vid=v&t=tok_SECRET_0123456789&x=1"
+echo "Sat Sep 13 brvg-hub-lite: send failed url=https://w/api/hub-lite?vid=v&t=tok_SECRET_0123456789&x=1"
 echo "Sat Sep 13 brvg-hub-lite: key is 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 echo "Sat Sep 13 dnsmasq: unrelated"
 SHIM
@@ -1699,7 +1704,7 @@ check "keys: as a signature line plus one digest+role per member" "5" "$(wc -l <
 check "keys: the file holds DIGESTS, never a key" "0" "$(grep -c "$K_CTL" "$T/keys")"
 check "keys: the control member's digest carries the control role" "1" "$(grep -c "^$(dg "$K_CTL") control$" "$T/keys")"
 check "keys: root-only (0600), not the conf's audience" "-rw-------" "$(ls -l "$T/keys" | cut -c1-10)"
-check "keys: asked with the router's own device token on the member-keys route" "1" "$(grep -c 'api/agent/member-keys?vid=v_test&device=brv_net_test&t=tok_SECRET' "$T/mk.log")"
+check "keys: asked with the router's own device token on the member-keys route" "1" "$(grep -c 'api/hub-lite/member-keys?vid=v_test&device=brv_net_test&t=tok_SECRET' "$T/mk.log")"
 check "keys: the first ask has no If-None-Match" "0" "$(grep -c 'If-None-Match' "$T/mk.log")"
 cp "$T/keys" "$T/keys.before"; : > "$T/mk.log"
 MK_CODE=304 MK_BODY="" sync_keys
@@ -2101,9 +2106,9 @@ check "cp reboot" '200 {"ok":true}' "$(status_of "$r") $(body_of "$r")"
 check "report (0.17.0): the second poll inside the check-in cadence sends NO modem report and spools no unmoved fix" "1
 1" "$(cat "$T/rt.n2")"
 check "report: modem.measurement goes AS the router, with the router's own token — nobody watching, STATE only (0.18.2)" "1" \
-  "$(grep -c '^https://api.example.test/api/agent?vid=v_test&device=brv_net_cp1&event=modem.measurement&t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&up=1&mode=LTE&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-[0-9.]*$' "$T/rt.urls")"
+  "$(grep -c '^https://api.example.test/api/hub-lite?vid=v_test&device=brv_net_cp1&event=modem.measurement&t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&up=1&mode=LTE&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-[0-9.]*$' "$T/rt.urls")"
 check "report: while a member watches, the router's whole reading goes, signal included (0.18.2)" "1" \
-  "$(grep -c '^https://api.example.test/api/agent?vid=v_test&device=brv_net_cp1&event=modem.measurement&t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&up=1&mode=LTE&rssi=-71&rsrp=-101&sinr=7.4&rsrq=-12&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-[0-9.]*$' "$T/rt.urls")"
+  "$(grep -c '^https://api.example.test/api/hub-lite?vid=v_test&device=brv_net_cp1&event=modem.measurement&t=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&up=1&mode=LTE&rssi=-71&rsrp=-101&sinr=7.4&rsrq=-12&carrier=Verizon&sim=ok&dataMb=1&wan=lte&ip=100.64.3.9&model=CBA850&fw=7.0.50&av=hub-lite-[0-9.]*$' "$T/rt.urls")"
 check "report: the router's LAN snapshot still holds its signal (only the wire copy is trimmed)" "1" "$(grep -c '^m\.rsrp	-101$' "$RDIR/brv_net_cp1.snap")"
 check "report: a command queued for the ROUTER never runs on the hub-lite" "0" "$(wc -l < "$T/rt.ran" | tr -d ' ')"
 check "report: the hub-lite's own identity and ack list are untouched" "brv_net_hublite hubtok_0123456789abcdef ack=" "$(cat "$T/rt.after")"
@@ -2298,7 +2303,7 @@ hl17() {
   GPS_INTERVAL=120; MODEM_INTERVAL=600; GPS_DEADBAND_M=50; AT_PORT=/nonexistent/at
   rm -f "$ANCHOR_STATE" "$ZONE_STATE" "$C17"/*.streak "$C17"/*.alerted "$C17/spool" "$C17/live"
 }
-# A curl stand-in for /api/agent sends: logs the URL, answers with $C17/reply (a file, so a test can change it).
+# A curl stand-in for /api/hub-lite sends: logs the URL, answers with $C17/reply (a file, so a test can change it).
 agent_curl() { eval "echo \"\${$#}\"" >> "$C17/urls"; cat "$C17/reply" 2>/dev/null; }
 
 # --- the flat v2 `anchor` object: the shared fixture's three cases, plus a zone-only arm ---
@@ -2567,10 +2572,10 @@ check "check-in: 900 s after a batch reply with no lease, and it cost ONE reques
 check "check-in: the batch reply's lease switches the cadence to 60 s, and its anchor is adopted" "leased=60 anchor=1757750400000" "$(sed -n 2p "$C17/ci")"
 check "check-in: back to 900 s when a batch reply stops carrying the lease" "switch-off=900" "$(sed -n 3p "$C17/ci")"
 check "check-in: never on the legacy VEHICLE_KEY path (/api/shelly would alert every 15 min)" "legacy=0 reqs=0" "$(sed -n 4p "$C17/ci")"
-check "check-in: three check-ins, three POSTs to /api/agent/batch and no GET at all" "3 0" \
+check "check-in: three check-ins, three POSTs to /api/hub-lite/batch and no GET at all" "3 0" \
   "$(grep -c '^POST' "$C17/urls.ci") $(grep -c '^GET' "$C17/urls.ci")"
 check "check-in: the watch signature rides the batch URL — agentBatchRoute reads ?anchorsig=, never the item's param" "3" \
-  "$(grep -c '^POST https://api.example.test/api/agent/batch?vid=v_test&device=brv_net_test&t=tok_SECRET_0123456789&anchorsig=[0-9]*$' "$C17/urls.ci")"
+  "$(grep -c '^POST https://api.example.test/api/hub-lite/batch?vid=v_test&device=brv_net_test&t=tok_SECRET_0123456789&anchorsig=[0-9]*$' "$C17/urls.ci")"
 HLV_RE=$(printf '%s' "$HUB_LITE_VERSION" | sed 's/\./\\./g')
 # 0.18.2: both modem-carrying check-ins were composed before any reply said a member was watching,
 # so they carry the sample's STATE (up, dataMb) and not its signal (rssi, sinr).
@@ -2643,7 +2648,7 @@ check "check-in: the check-in, the modem, a valve and a relayed sensor leave in 
   do_checkin $(( 40000 + BATCH_REPROBE_SEC ))
   echo "reprobe=$(grep -c '^POST' "$C17/urls")post/$(grep -c '^GET' "$C17/urls")get refused=$BATCH_REFUSED_AT" >> "$C17/fb"
 )
-check "fallback: a 404 from /api/agent/batch still delivers the check-in, down the 0.17.0 path" "first=1post/2get ok=1" "$(sed -n 1p "$C17/fb")"
+check "fallback: a 404 from /api/hub-lite/batch still delivers the check-in, down the 0.17.0 path" "first=1post/2get ok=1" "$(sed -n 1p "$C17/fb")"
 check "fallback: and that is the check-in GET plus the modem GET, exactly as 0.17.0 sent them" "checkin=1 modem=1" "$(sed -n 2p "$C17/fb")"
 check "fallback: the next tick does not re-ask an endpoint the cloud just refused" "next=0post/2get" "$(sed -n 3p "$C17/fb")"
 check "fallback: after the re-probe window a working batch endpoint is adopted again" "reprobe=1post/0get refused=0" "$(sed -n 4p "$C17/fb")"
@@ -3045,7 +3050,24 @@ check "0.18.4: the guard's rollback enables AND restarts the service" "enable re
 )
 check "0.18.4: the cloud's self_update and rollback_agent verbs run detached, never inline" "self_update rollback_requested" \
   "$(tr '\n' ' ' < "$W/detached.log" 2>/dev/null | sed 's/ $//')"
+
+# 0.18.10: BOTH spellings reach the same detached rollback. Without `|rollback_hub_lite` in the
+# run_commands case, the new verb falls through to the unknown-verb arm and is acknowledged and
+# SILENTLY DROPPED — the rollback simply never happens and the cloud sees a successful ack.
+rm -f "$W/detached.log"
+(
+  run_detached() { echo "$1" >> "$W/detached.log"; }
+  self_update() { echo inline >> "$W/detached.log"; }
+  restore_hub_lite() { echo inline >> "$W/detached.log"; }
+  run_commands "c1:rollback_agent c2:rollback_hub_lite" 2>/dev/null
+)
+check "0.18.10: both rollback spellings run the same detached rollback" "rollback_requested rollback_requested" \
+  "$(tr '\n' ' ' < "$W/detached.log" 2>/dev/null | sed 's/ $//')"
 check "0.18.4: the app's /api/hub/update door uses the same detached runner" "1" "$(grep -c '^    run_detached self_update$' "$HL_DIR/hub-lite-api.sh")"
+# The LAN door must suppress the follow-up report for BOTH spellings: the binary is being replaced,
+# so a follow-up send can only fail.
+check "0.18.10: the lan door suppresses the follow-up for both rollback spellings" "1" \
+  "$(grep -c 'reboot|reboot_modem|self_update|rollback_agent|rollback_hub_lite) _fu=0' "$HL_DIR/hub-lite-mgmt.sh")"
 
 # The station's regression, on the real run_detached: kill the "daemon's" whole process group mid-update; the
 # detached work must still finish. Needs setsid (Linux, and every router); skipped where there is none (macOS).
