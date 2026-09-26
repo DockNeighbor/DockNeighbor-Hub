@@ -1666,6 +1666,12 @@ K_OWN=1111111111111111111111111111111111111111111111111111111111111111
 K_CTL=2222222222222222222222222222222222222222222222222222222222222222
 K_MON=3333333333333333333333333333333333333333333333333333333333333333
 K_CTL2=4444444444444444444444444444444444444444444444444444444444444444
+# 🔴 THERE WAS NO ADMIN KEY IN THIS SUITE, and that is why tightening the settings bar on 2026-09-25
+# broke NOTHING. Every role test here used owner, control or monitor, so "a Limited Admin may change
+# settings" — true for the whole life of the `configure` level — was never once asserted, and its
+# removal could not be observed. A permissions change that breaks no test is not a safe change; it is
+# an untested one.
+K_ADM=5555555555555555555555555555555555555555555555555555555555555555
 dg() { printf '%s' "$1" | sha256sum | cut -c1-64; }
 # $@ = "key role" pairs → the worker's JSON for that set.
 member_json() {
@@ -1685,11 +1691,11 @@ sync_keys() {
     fetch_member_keys 2>/dev/null
   )
 }
-SET1=$(member_json "$K_OWN owner" "$K_CTL control" "$K_MON monitor")
+SET1=$(member_json "$K_OWN owner" "$K_CTL control" "$K_MON monitor" "$K_ADM admin")
 : > "$T/mk.log"; rm -f "$T/keys"
 MK_CODE=200 MK_BODY="$SET1" sync_keys; _rc=$?
 check "keys: the first sync stores the set" "0" "$_rc"
-check "keys: as a signature line plus one digest+role per member" "4" "$(wc -l < "$T/keys" | tr -cd '0-9')"
+check "keys: as a signature line plus one digest+role per member" "5" "$(wc -l < "$T/keys" | tr -cd '0-9')"
 check "keys: the file holds DIGESTS, never a key" "0" "$(grep -c "$K_CTL" "$T/keys")"
 check "keys: the control member's digest carries the control role" "1" "$(grep -c "^$(dg "$K_CTL") control$" "$T/keys")"
 check "keys: root-only (0600), not the conf's audience" "-rw-------" "$(ls -l "$T/keys" | cut -c1-10)"
@@ -1714,7 +1720,7 @@ mapi() { _mk_key="$1"; shift; api "$@" HTTP_AUTHORIZATION="Bearer $_mk_key" BRVG
 rm -f "$T/lt/$DEV" "$T/keys-stale"
 r=$(mapi "$K_MON" GET /status "")
 check "role: a MONITOR key may read status" "200" "$(status_of "$r")"
-check "role: status counts the synced member keys" "1" "$(body_of "$r" | grep -c '"keysSynced":3')"
+check "role: status counts the synced member keys" "1" "$(body_of "$r" | grep -c '"keysSynced":4')"
 r=$(mapi "$K_MON" POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\"durationSecs\":600}")
 check "role: a MONITOR key is REFUSED an open (403)" "403" "$(status_of "$r")"
 check "role: and the valve was not touched" "no" "$([ -f "$T/lt/$DEV" ] && echo yes || echo no)"
@@ -1724,7 +1730,29 @@ r=$(mapi "$K_CTL" POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"open\",\
 check "role: a CONTROL key may OPEN the valve" "200" "$(status_of "$r")"
 check "role: and the run is recorded as the hub's" "normal hub" "$(. "$T/lt/$DEV"; echo "$mode $prov")"
 r=$(mapi "$K_CTL" POST /config '{"name":"Mine"}')
-check "role: a CONTROL key may not change settings (configure is admin+)" "403" "$(status_of "$r")"
+check "role: a CONTROL key may not change settings" "403" "$(status_of "$r")"
+
+# 🔴 THE OWNER'S RULING OF 2026-09-25, and the tests that would have FAILED the day before it:
+# "owner and co-owner only for bridge mode as with all router and hub settings". A Limited Admin keeps
+# every READ and keeps device control; it loses every settings CHANGE.
+r=$(mapi "$K_ADM" POST /config '{"name":"Mine"}')
+check "role: an ADMIN key may NO LONGER change hub settings (owner ruling)" "403" "$(status_of "$r")"
+check "role: and the refusal never rewrote the conf" "1" "$(grep -c '^VID="v_test"' "$T/conf.members")"
+r=$(mapi "$K_ADM" POST /net/lan '{"ip":"10.0.0.1"}')
+check "role: an ADMIN key may NO LONGER change the router's LAN" "403" "$(status_of "$r")"
+r=$(mapi "$K_ADM" POST /net/mode '{"mode":"bridge"}')
+check "role: an ADMIN key may NO LONGER bridge the router (the route that prompted the ruling)" "403" "$(status_of "$r")"
+r=$(mapi "$K_ADM" POST /reboot "")
+check "role: an ADMIN key may NO LONGER reboot the router" "403" "$(status_of "$r")"
+# …and what it KEEPS, so this is a tightening and not a lockout. Reads and control are untouched.
+r=$(mapi "$K_ADM" GET /status "")
+check "role: an ADMIN key still reads status" "200" "$(status_of "$r")"
+r=$(mapi "$K_ADM" POST /linktap/valve "{\"devId\":\"$DEV\",\"action\":\"close\"}")
+check "role: an ADMIN key still OPERATES the valve (control is not a setting)" "200" "$(status_of "$r")"
+# The owner keeps everything, which is the other half of "this is a tightening": if the bar had moved
+# too far, this would be a 403 and the vessel would have nobody who could change a setting at all.
+r=$(mapi "$K_OWN" POST /config '{"name":"Mine"}')
+check "role: an OWNER key still changes settings" "200" "$(status_of "$r")"
 r=$(mapi "$K_CTL" POST /clear "")
 check "role: a CONTROL key may not clear the hub (administer is co-owner+)" "403" "$(status_of "$r")"
 check "role: a refusal never rewrote the conf" "1" "$(grep -c '^VID="v_test"' "$T/conf.members")"

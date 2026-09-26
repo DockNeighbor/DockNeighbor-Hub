@@ -106,7 +106,7 @@ load_lib() {
 # THE ONE AUTH DECISION. Every keyed route names the daemon role it needs (hub_server.rs may_*):
 #   monitor    — read state (status, linktap/state)
 #   control    — act on a device (linktap/valve) and read the log (the daemon's may_control)
-#   configure  — change settings (config, gps)                     (may_configure)
+#   (the settings level was REMOVED 2026-09-25 — every change is administer; owner ruling)
 #   administer — replace the credential or the software (token, clear, update) (may_administer)
 #
 # WHO IS ASKING (owner decision D3, 2026-09-13: "crew with control access should be able to open the
@@ -125,7 +125,17 @@ role_may() {
   case "$2" in
     monitor)    case "$1" in owner|coowner|admin|control|monitor|monitor_quiet) return 0 ;; esac ;;
     control)    case "$1" in owner|coowner|admin|control) return 0 ;; esac ;;
-    configure)  case "$1" in owner|coowner|admin) return 0 ;; esac ;;
+    # 🔴 THE `configure` LEVEL IS GONE (owner ruling 2026-09-25: "owner and co-owner only for bridge
+    # mode as with all router and hub settings"). It meant owner|coowner|admin, which is how a Limited
+    # Admin could change a vessel's Wi-Fi, LAN and uplink — and, once 0.18.8 shipped it, bridge the
+    # router's firewall. All 14 call sites moved to `administer`.
+    #
+    # ⚠️ REMOVED RATHER THAN REDEFINED, ON PURPOSE. Redefining the name to owner|coowner would have been
+    # one line and would have caught every site automatically — but it leaves two names for one level,
+    # and the next person adding a route reaches for the one that reads like "changing settings",
+    # reintroducing the looser meaning the day somebody widens it again. Removed, any missed or future
+    # use of that level name hits `authorize`'s own `*) fail 500 "unknown access level"`: a loud refusal
+    # rather than a quiet permissive hole. Fail closed, and audibly.
     administer) case "$1" in owner|coowner) return 0 ;; esac ;;
   esac
   return 1
@@ -151,7 +161,10 @@ presented_role() {
 
 authorize() {
   case "$1" in
-    monitor|control|configure|administer) : ;;
+    monitor|control|administer) : ;;
+    # An unknown level lands below deliberately since 2026-09-25 (see role_may): a route still asking
+    # for the retired settings level has not been reconsidered against the owner's rule, and 500 says
+    # so rather than guessing which way it should have gone.
     *) fail 500 "unknown access level" ;;
   esac
   # A CALL RELAYED OVER THE LIVE LINK (0.17.0, D6). The worker authenticated the caller and resolved
@@ -170,8 +183,7 @@ authorize() {
     role_may "$ROLE" "$1" && return 0
     case "$1" in
       control)    fail 403 "operating the hub's devices needs control access or above" ;;
-      configure)  fail 403 "changing the hub's settings needs an admin, co-owner or owner" ;;
-      administer) fail 403 "rotating or removing the hub needs a co-owner or the owner" ;;
+        administer) fail 403 "changing this hub's or router's settings, or rotating or removing the hub, needs a co-owner or the owner" ;;
       *)          fail 403 "this key may not read this hub" ;;
     esac
   fi
@@ -195,8 +207,7 @@ authorize() {
   role_may "$ROLE" "$1" && return 0
   case "$1" in
     control)    fail 403 "operating the hub's devices needs control access or above" ;;
-    configure)  fail 403 "changing the hub's settings needs an admin, co-owner or owner" ;;
-    administer) fail 403 "rotating or removing the hub needs a co-owner or the owner" ;;
+    administer) fail 403 "changing this hub's or router's settings, or rotating or removing the hub, needs a co-owner or the owner" ;;
     *)          fail 403 "this key may not read this hub" ;;
   esac
 }
@@ -471,7 +482,7 @@ case "$method:$verb" in
   # web app, and "disabled" would stop the service that serves this very door, leaving no LAN way
   # back. A caller told 422 knows; a caller told 200 would believe it.
   POST:/config)
-    authorize configure
+    authorize administer
     read_body
     load_lib
     json_has enabled "$BODY" && fail 422 "enabled is not supported on a hub-lite"
@@ -534,7 +545,7 @@ case "$method:$verb" in
 
   # ---- gps (the daemon's own route, same body as config.gps) ------------------------------------
   POST:/gps)
-    authorize configure
+    authorize administer
     read_body
     load_lib
     GPS_PASS=""
@@ -637,33 +648,38 @@ case "$method:$verb" in
 
   # ---- DN device API: the router's network (0.18.6) -------------------------------------------
   # The app's NetworkDeviceDriver, route for route, over DockNeighbor OS's dn-net (JSON in, JSON out; its exit 2 is
-  # a 400 with its reason). Reading is monitor, changing is configure (owner, 2026-09-25: reboot included).
+  # a 400 with its reason). Reading is monitor; every CHANGE is administer = owner|coowner (owner
+  # ruling 2026-09-25, reboot and bridge mode included).
   # A monitor gets Wi-Fi WITHOUT its keys. Only on DockNeighbor OS: anywhere else 501, the app keeps the vendor's way.
   GET:/net/wan)               authorize monitor;   net_call wan ;;
   GET:/net/lan)               authorize monitor;   net_call lan-get ;;
-  POST:/net/lan)              authorize configure; read_body; net_call lan-set "$BODY" ;;
+  POST:/net/lan)              authorize administer; read_body; net_call lan-set "$BODY" ;;
   GET:/net/wifi)              authorize monitor
-                              if role_may "$ROLE" configure; then net_call wifi-get; else DN_NET_REDACT=1 net_call wifi-get; fi ;;
-  POST:/net/wifi)             authorize configure; read_body; net_call wifi-set "$BODY" ;;
+                              if role_may "$ROLE" administer; then net_call wifi-get; else DN_NET_REDACT=1 net_call wifi-get; fi ;;
+  POST:/net/wifi)             authorize administer; read_body; net_call wifi-set "$BODY" ;;
   GET:/net/uplink)            authorize monitor;   net_call uplink-get ;;
-  POST:/net/uplink)           authorize configure; read_body; net_call uplink-join "$BODY" ;;
-  DELETE:/net/uplink)         authorize configure; net_call uplink-disconnect ;;
-  # A scan takes the radio off-channel for seconds, so it is a configure action, not a read.
-  GET:/net/uplink/scan)       authorize configure; net_call uplink-scan ;;
+  POST:/net/uplink)           authorize administer; read_body; net_call uplink-join "$BODY" ;;
+  DELETE:/net/uplink)         authorize administer; net_call uplink-disconnect ;;
+  # A scan takes the radio off-channel for seconds, so it is a CHANGE, not a read.
+  GET:/net/uplink/scan)       authorize administer; net_call uplink-scan ;;
   GET:/net/uplink/saved)      authorize monitor;   net_call uplink-saved ;;
-  DELETE:/net/uplink/saved)   authorize configure; read_body; net_call uplink-forget "$BODY" ;;
+  DELETE:/net/uplink/saved)   authorize administer; read_body; net_call uplink-forget "$BODY" ;;
   GET:/net/clients)           authorize monitor;   net_call clients ;;
-  POST:/net/clients/block)    authorize configure; read_body; net_call client-block "$BODY" ;;
+  POST:/net/clients/block)    authorize administer; read_body; net_call client-block "$BODY" ;;
   GET:/net/reservations)      authorize monitor;   net_call reservations ;;
-  POST:/net/reservations)     authorize configure; read_body; net_call reservation-add "$BODY" ;;
-  DELETE:/net/reservations)   authorize configure; read_body; net_call reservation-remove "$BODY" ;;
-  POST:/reboot)               authorize configure; net_call reboot ;;
+  POST:/net/reservations)     authorize administer; read_body; net_call reservation-add "$BODY" ;;
+  DELETE:/net/reservations)   authorize administer; read_body; net_call reservation-remove "$BODY" ;;
+  POST:/reboot)               authorize administer; net_call reboot ;;
   # router | bridge (owner 2026-09-25: "disables the firewall and just bridges everything on the LAN"). Switching
   # moves the router onto the boat network's own addressing; dn-net reverts by itself if it gets no address.
   GET:/net/mode)              authorize monitor;   net_call mode-get ;;
-  POST:/net/mode)             authorize configure; read_body; net_call mode-set "$BODY" ;;
+  POST:/net/mode)             authorize administer; read_body; net_call mode-set "$BODY" ;;
   # Root's password is the router's SSH login, a level above its settings: administer, like changing the firmware.
   # dn-net also requires the CURRENT password, so this key alone never takes the login. Body {current, next}.
+  #
+  # ⚠️ IT ALREADY SAID `administer` AND STAYS THAT WAY. The owner's 2026-09-25 ruling moved SETTINGS up to
+  # this same level, so the two are no longer distinguishable by gate — but the comment above is still the
+  # reason THIS one was never at the lower bar, and it should survive anyone who later reconsiders settings.
   POST:/net/admin-password)   authorize administer; read_body; net_call admin-password "$BODY" ;;
 
   # ---- identity / bootstrap (OPEN, first run only) ----------------------------------------------
@@ -886,7 +902,7 @@ case "$method:$verb" in
     rt_body "$BODY" || fail 422 "invalid JSON body"
     case "$(printf '%s' "${BV_action:-}" | tr 'A-Z' 'a-z' | tr -d '[:space:]')" in
       refresh|read) authorize control ;;
-      *) authorize configure ;;
+      *) authorize administer ;;
     esac
     rt_api
     ;;
