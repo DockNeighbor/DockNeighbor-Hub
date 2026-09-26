@@ -973,10 +973,27 @@ async fn do_clear(rt: &Rt, caller: &Caller) -> Answer {
 /// visible as the reported version changing (and in the hub log). On any failure the running binary
 /// is untouched and the reason is logged.
 async fn do_update(caller: &Caller) -> Answer {
+    // 🔴 LOG THAT WE WERE ASKED, BEFORE ANY GATE. Every path BELOW this point already logs its
+    // outcome — installed, already current, failed — but the two refusals did not, and neither did
+    // the arrival. So a hub that declined an update, or never got one, left an identical trace:
+    // nothing at all.
+    //
+    // That cost a real diagnosis on 2026-09-25. The owner pressed Update, the app reported what it
+    // reported, and the hub's log had no record either way — no arrival, no refusal, no attempt — so
+    // "the request never reached the hub" and "the hub refused it silently" could not be told apart
+    // from the one place that knows. It is the same shape as the valve Close button that answered
+    // `{ok:true}` the moment the gateway accepted: a thing that appears to have happened, with no
+    // evidence on the device.
+    crate::hlog!("hub: update requested by role '{}'", caller.role);
     if !may_administer(&caller.role) {
+        crate::hlog!("hub: update REFUSED - role '{}' is not a co-owner or the owner", caller.role);
         return err(403, "updating the hub needs a co-owner or the owner");
     }
     if crate::self_update::asset_for(std::env::consts::OS, std::env::consts::ARCH).is_none() {
+        crate::hlog!(
+            "hub: update REFUSED - no release asset for {}/{}",
+            std::env::consts::OS, std::env::consts::ARCH
+        );
         return err(501, "remote update is not supported on this platform yet — use the app's installer");
     }
     tokio::spawn(async {
@@ -2359,6 +2376,10 @@ async fn handle_agent_commands(rt: &Rt, client: &reqwest::Client, body: &serde_j
 /// caller-role check — a queued command already cleared the operator-console capability gate
 /// cloud-side, which is a stronger bar than a LAN member key.
 async fn run_commanded_self_update(rt: &Rt, client: &reqwest::Client, id: &str) {
+    // Same reasoning as do_update: say we were asked BEFORE the work, not only after it. Every
+    // outcome below logs, but `perform_update` downloads a release first — so a command that arrived
+    // and then stalled on a slow link was, until now, indistinguishable from one that never arrived.
+    crate::hlog!("hub: cloud self-update command received (id {id})");
     match crate::self_update::perform_update(client).await {
         crate::self_update::UpdateOutcome::Swapped { to_version } => {
             // 🔴 DO NOT ACK HERE. Restart first; the restarted binary re-runs this same still-queued

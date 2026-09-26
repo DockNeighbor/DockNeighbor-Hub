@@ -2726,6 +2726,16 @@ _fr='{"type":"call","id":"c1","uid":"u","role":"control","method":"POST","path":
 check "frame: body unescaped" '{"devId":"a","action":"open"}' "$(printf '%s' "$_fr" | live_frame_str body)"
 check "frame: a key inside the body is never read as the frame's" "monitor" \
   "$(printf '%s' '{"type":"call","id":"c1","uid":"u","role":"monitor","method":"POST","path":"/p","body":"{\"role\":\"owner\"}"}' | live_frame_str role)"
+_lpa=""
+for _rt in "GET /api/hub/net/wan" "GET /api/hub/net/wifi" "POST /api/hub/net/mode" "DELETE /api/hub/net/uplink" "POST /api/hub/reboot" \
+           "GET /api/hub/os/check" "POST /api/hub/os/upgrade" "POST /api/hub/os/packages"; do
+  set -- $_rt; live_path_allowed "$1" "$2" || _lpa="$_lpa [$_rt]"
+done
+check "relay: the DN device API and OS routes may be relayed from shore" "" "$_lpa"
+live_path_allowed POST /api/hub/net/admin-password && _lpa=relayed || _lpa=refused
+check "relay: admin-password is NEVER relayed (the password stays on the boat's network)" "refused" "$_lpa"
+live_path_allowed GET /api/hub/net/admin-password && _lpa=relayed || _lpa=refused
+check "relay: ...by no method" "refused" "$_lpa"
 check "frame: an absent body is absent" "" "$(printf '%s' '{"type":"call","id":"c1","role":"monitor","method":"GET","path":"/api/hub/status"}' | live_frame_str body)"
 check "result body: escaped for JSON" 'a \"q\" \\ b\nc' "$(printf 'a "q" \\ b\nc\n' | json_escape_body)"
 : > "$SHIM_LOG"
@@ -3135,9 +3145,10 @@ EOF_NET
 chmod 755 "$N/dn-net"
 netapi() { api "$@" NET_DIR="$N" BRVG_DN_NET="$N/dn-net"; }
 last() { tail -1 "$N/calls"; }
-printf '# test keys\n%s monitor\n%s control\n' "$(printf '%s' 'mon-key' | sha256sum | cut -c1-64)" "$(printf '%s' 'ctl-key' | sha256sum | cut -c1-64)" > "$N/keys"
+printf '# test keys\n%s monitor\n%s control\n%s admin\n' "$(printf '%s' 'mon-key' | sha256sum | cut -c1-64)" "$(printf '%s' 'ctl-key' | sha256sum | cut -c1-64)" "$(printf '%s' 'adm-key' | sha256sum | cut -c1-64)" > "$N/keys"
 as_monitor() { netapi "$@" HTTP_AUTHORIZATION="Bearer mon-key" BRVG_MEMBER_KEYS="$N/keys"; }
 as_control() { netapi "$@" HTTP_AUTHORIZATION="Bearer ctl-key" BRVG_MEMBER_KEYS="$N/keys"; }
+as_admin() { netapi "$@" HTTP_AUTHORIZATION="Bearer adm-key" BRVG_MEMBER_KEYS="$N/keys"; }
 
 r=$(api GET /net/wan "" BRVG_DN_NET="$N/absent")
 check "net: not DockNeighbor OS is 501, so the app keeps the vendor's way" "501" "$(status_of "$r")"
@@ -3164,6 +3175,20 @@ check "net: every route reaches its dn-net verb" \
   "$(cut -d'|' -f1 "$N/calls" | tr '\n' ' ' | sed 's/ $//')"
 check "net: the uplink role in the body reaches dn-net" "1" "$(grep -c '^uplink-join|.*"role":"lan"' "$N/calls")"
 check "net/mode: the requested mode reaches dn-net" "1" "$(grep -c '^mode-set|.*"mode":"bridge"' "$N/calls")"
+
+# admin-password: administer only (an admin who may configure may not), and the body reaches dn-net untouched.
+: > "$N/calls"; r=$(netapi POST /net/admin-password '{"current":"old one","next":"new one"}')
+check "admin-password: an owner reaches dn-net with the body" "200 1" "$(status_of "$r") $(grep -c '^admin-password|{"current":"old one","next":"new one"}' "$N/calls")"
+: > "$N/calls"
+for _as in as_monitor as_control as_admin; do
+  r=$($_as POST /net/admin-password '{"current":"a","next":"b"}'); [ "$(status_of "$r")" = 403 ] || echo "$_as allowed" >> "$N/allowed-pw"
+done
+check "admin-password: monitor, control and admin are refused (403)" "" "$(cat "$N/allowed-pw" 2>/dev/null)"
+check "admin-password: ...and not one refused call reached dn-net" "0" "$(wc -l < "$N/calls" | tr -d ' ')"
+r=$(as_admin GET /net/wan "")
+check "admin-password: ...though that admin key is good (so the 403 is the level, not the key)" "200 1" "$(status_of "$r") $(grep -c '^wan|' "$N/calls")"
+r=$(netapi POST /net/admin-password '{"current":"wrong","next":"b"}' NET_RC=2)
+check "admin-password: dn-net's wrong-password refusal is a 400" "400" "$(status_of "$r")"
 
 # Who may: reading is monitor, changing is configure (reboot included, owner 2026-09-25); a monitor never sees keys.
 : > "$N/calls"; r=$(netapi GET /net/wifi "")
