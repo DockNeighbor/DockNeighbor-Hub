@@ -832,7 +832,7 @@ pub async fn dispatch(rt: &Rt, caller: &Caller, method: &str, path: &str, body: 
         ("POST", "/api/hub/config") => do_config(rt, caller, body).await,
         ("POST", "/api/hub/token") => do_token(rt, caller, body).await,
         ("POST", "/api/hub/clear") => do_clear(rt, caller).await,
-        ("POST", "/api/hub/update") => do_update(caller).await,
+        ("POST", "/api/hub/update") => do_update(rt, caller).await,
         ("POST", "/api/hub/linktap/valve") => do_valve(rt, caller, body).await,
         ("POST", "/api/hub/gps") => do_gps(rt, caller, body).await,
         ("POST", "/api/hub/gps/discover") => do_gps_discover(caller).await,
@@ -1002,7 +1002,7 @@ async fn do_clear(rt: &Rt, caller: &Caller) -> Answer {
 /// "200 updated" to return to a caller whose hub is about to restart), and the real outcome is
 /// visible as the reported version changing (and in the hub log). On any failure the running binary
 /// is untouched and the reason is logged.
-async fn do_update(caller: &Caller) -> Answer {
+async fn do_update(rt: &Rt, caller: &Caller) -> Answer {
     // 🔴 LOG THAT WE WERE ASKED, BEFORE ANY GATE. Every path BELOW this point already logs its
     // outcome — installed, already current, failed — but the two refusals did not, and neither did
     // the arrival. So a hub that declined an update, or never got one, left an identical trace:
@@ -1026,10 +1026,12 @@ async fn do_update(caller: &Caller) -> Answer {
         );
         return err(501, "remote update is not supported on this platform yet — use the app's installer");
     }
-    tokio::spawn(async {
+    let base_for_probation = rt.base.clone();
+    tokio::spawn(async move {
         let client = http_client();
         match crate::self_update::perform_update(&client).await {
             crate::self_update::UpdateOutcome::Swapped { to_version } => {
+                arm_probation(&base_for_probation, &to_version);
                 // Give the HTTP reply a beat to flush before anything restarts.
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 // Windows: a detached `net stop`/`net start` bounces the service (it does not
@@ -2327,6 +2329,108 @@ async fn gps_observe(rt: &Rt, device: &str, fix: &crate::gps::GpsFix) {
     }
 }
 
+/// Record that a swap just happened, so the restarted binary knows it is on trial.
+///
+/// 🔴 THIS IS WHAT MAKES `restore_previous` REACHABLE. Until now the daemon kept a `.prev` binary
+/// and had a complete, working rollback that NOTHING EVER CALLED — a hub that installed a release
+/// which could not reach the cloud stayed broken until somebody drove to the boat. hub-lite has had
+/// this since 0.18.3; the daemon had the parts and no wiring.
+///
+/// Best-effort by design: a marker we cannot write means no probation, which is exactly today's
+/// behaviour. It must never block or fail the update itself.
+fn arm_probation(base: &std::path::Path, to_version: &str) {
+    let from = env!("CARGO_PKG_VERSION");
+    if from == to_version {
+        return;
+    }
+    let p = crate::update_gate::Probation {
+        from: from.to_string(),
+        to: to_version.to_string(),
+        deadline_ms: now_ms() + crate::update_gate::PROBATION_MS,
+    };
+    let path = crate::update_gate::probation_path(base);
+    match std::fs::write(&path, crate::update_gate::write_marker(&p)) {
+        Ok(()) => crate::hlog!(
+            "hub: {to_version} is on probation for {} minutes - it must report to the cloud or be rolled back",
+            crate::update_gate::PROBATION_MS / 60_000
+        ),
+        Err(e) => crate::hlog!("hub: could not record the update probation ({e}) - {to_version} installs WITHOUT a rollback"),
+    }
+}
+
+/// Add a version to this machine's skip list, so the update check never offers it again.
+fn skip_version(base: &std::path::Path, version: &str) {
+    let path = crate::update_gate::skip_path(base);
+    let list = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Some(next) = crate::update_gate::with_skipped(&list, version) {
+        if let Err(e) = std::fs::write(&path, next) {
+            crate::hlog!("hub: could not skip-list {version} ({e}) - it may be offered again");
+        }
+    }
+}
+
+/// How often the probation watcher looks. Well inside PROBATION_MS so a healthy version is confirmed
+/// promptly and a dead one is caught close to its deadline rather than a whole period late.
+const PROBATION_LOOK_SECS: u64 = 30;
+
+/// Watch a recorded probation and act on it: confirm, keep watching, or ROLL BACK.
+///
+/// `reported_ok` is "this process has reported to the cloud since it started" — `last_cloud_ok_ms`
+/// moving past the moment this process began. A daemon that starts, binds its port and cannot reach
+/// the cloud is exactly what an owner would call broken, and a check that only asked "is the process
+/// up" would call it healthy. That is the same evidence hub-lite's guard uses.
+async fn probation_loop(rt: Shared) {
+    let running = env!("CARGO_PKG_VERSION");
+    let started_ms = now_ms();
+    loop {
+        let path = crate::update_gate::probation_path(&rt.base);
+        let Some(p) = std::fs::read_to_string(&path).ok().and_then(|t| crate::update_gate::parse_marker(&t)) else {
+            // No marker, or one too damaged to act on (parse_marker refuses a half-written file —
+            // rolling back on a garbled marker would be worse than ignoring it).
+            tokio::time::sleep(Duration::from_secs(PROBATION_LOOK_SECS)).await;
+            continue;
+        };
+        let reported_ok = rt.last_cloud_ok_ms.load(Ordering::SeqCst) >= started_ms;
+        match crate::update_gate::probation_step(&p, running, reported_ok, now_ms()) {
+            crate::update_gate::ProbationStep::Confirm => {
+                let _ = std::fs::remove_file(&path);
+                crate::hlog!("hub: {} reported to the cloud - probation over, it is the version now", p.to);
+            }
+            crate::update_gate::ProbationStep::KeepWatching => {}
+            crate::update_gate::ProbationStep::Stale => {
+                let _ = std::fs::remove_file(&path);
+                crate::hlog!("hub: clearing a probation marker for {} while running {running} - nothing to watch", p.to);
+            }
+            crate::update_gate::ProbationStep::RollBack => {
+                // 🔴 SKIP-LIST BEFORE RESTORING. A rollback without this is a LOOP: we go back to the
+                // good version, the update check sees the bad one is still the latest release, and
+                // installs it again on a schedule, for ever.
+                skip_version(&rt.base, &p.to);
+                crate::hlog!(
+                    "hub: {} never reported to the cloud within {} minutes - ROLLING BACK to {}",
+                    p.to, crate::update_gate::PROBATION_MS / 60_000, p.from
+                );
+                match crate::self_update::restore_previous() {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&path);
+                        let _restarting = crate::self_update::finalize_restart();
+                        crate::hlog!("hub: rolled back to {}; restarting into it", p.from);
+                        #[cfg(unix)]
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        // Nothing to go back to, or the swap failed. Clear the marker: retrying every
+                        // 30 s cannot help, and a hub that logs the same failure for ever is noise.
+                        let _ = std::fs::remove_file(&path);
+                        crate::hlog!("hub: could not roll back to {} ({e}) - staying on {running}", p.from);
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(PROBATION_LOOK_SECS)).await;
+    }
+}
+
 /// How often the daemon checks whether a newer release exists. Hours, not minutes: a release lands
 /// a few times a week at most, and this is visibility, not a safety path. Runs once at boot too, so
 /// a freshly started hub reports its update status on its first check-in rather than hours later.
@@ -2341,7 +2445,19 @@ async fn update_check_loop(rt: Shared) {
     let current = env!("CARGO_PKG_VERSION");
     loop {
         if let Some(latest) = crate::update_check::fetch_latest_version(&client).await {
-            let available = crate::update_check::newer_than(&latest, current);
+            let mut available = crate::update_check::newer_than(&latest, current);
+            // 🔴 NEVER RE-OFFER A VERSION THIS MACHINE ROLLED BACK. Without this the rollback is a
+            // loop rather than a cure: back to the good version, see the bad one is still "latest",
+            // install it again, fail again — on a 6-hour schedule, for ever. The list is per machine
+            // because the failure usually is (an arch, a filesystem, a locked-down box), and a
+            // release that is bad everywhere is withdrawn upstream instead.
+            if let Some(v) = available.clone() {
+                let list = std::fs::read_to_string(crate::update_gate::skip_path(&rt.base)).unwrap_or_default();
+                if crate::update_gate::skipped(&list, &v) {
+                    crate::hlog!("hub: {v} is available but was rolled back here before - not offering it");
+                    available = None;
+                }
+            }
             let mut slot = rt.update_available.write().await;
             if *slot != available {
                 match &available {
@@ -2421,6 +2537,7 @@ async fn run_commanded_self_update(rt: &Rt, client: &reqwest::Client, id: &str) 
             // command, finds itself already current, and acks then. That is what makes a swap+restart
             // idempotent — a missed ack costs one extra up-to-date check, never a second install.
             // Ordering copied verbatim from do_update.
+            arm_probation(&rt.base, &to_version);
             tokio::time::sleep(Duration::from_millis(500)).await;
             let _restarting = crate::self_update::finalize_restart();
             crate::hlog!("hub: cloud self-update installed {to_version}; restarting into it");
@@ -3671,6 +3788,7 @@ where
         // The anchor watch's "checks in OK" heartbeat — idle (no posts) unless an anchor watch is armed.
         tokio::spawn(gps_heartbeat_loop(rt.clone()));
         tokio::spawn(update_check_loop(rt.clone()));
+        tokio::spawn(probation_loop(rt.clone()));
         tokio::spawn(key_sync_loop(rt.clone()));
         // The LinkTap poll floor. It re-reads its own configuration each pass, so a gateway
         // configured (or a plan revoked) after boot is picked up without a restart.
@@ -5735,6 +5853,56 @@ mod tests {
         let url = batch::batch_url("https://api.example.com", "v1", "hub_abc123", &seeded_cfg().token, None, 0).unwrap();
         let line = batch::debug_line(&url, &batch::envelope(batch::Kind::Keyframe, None, "b", &[], "x"));
         assert!(!line.contains(&seeded_cfg().token), "{line}");
+    }
+
+    // ── probation + rollback: the wiring that makes restore_previous reachable ──────────────────
+    #[tokio::test]
+    async fn arming_a_probation_records_a_marker_the_restarted_binary_can_read() {
+        let base = temp_base("probation_arm");
+        arm_probation(&base, "99.9.9");
+        let text = std::fs::read_to_string(crate::update_gate::probation_path(&base)).expect("marker written");
+        let p = crate::update_gate::parse_marker(&text).expect("and it parses");
+        assert_eq!(p.from, env!("CARGO_PKG_VERSION"), "we came from the running version");
+        assert_eq!(p.to, "99.9.9");
+        let left = p.deadline_ms - now_ms();
+        assert!(
+            left > crate::update_gate::PROBATION_MS - 5_000 && left <= crate::update_gate::PROBATION_MS,
+            "the deadline is ~PROBATION_MS away, got {left}ms",
+        );
+        // It must live beside the hub's state, not beside the binary — a packaged install's
+        // directory is read-only and a marker that cannot be written turns the rollback off.
+        assert!(crate::update_gate::probation_path(&base).starts_with(&base));
+    }
+
+    #[tokio::test]
+    async fn a_swap_to_the_version_already_running_arms_nothing() {
+        // `perform_update` reports UpToDate for this, but the restarted binary re-runs a still-queued
+        // command and could reach here. A probation of a version against itself is unfalsifiable:
+        // probation_step would read Stale for ever, and the marker would never clear.
+        let base = temp_base("probation_same");
+        arm_probation(&base, env!("CARGO_PKG_VERSION"));
+        assert!(!crate::update_gate::probation_path(&base).exists(), "no marker for a no-op swap");
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_version_is_skip_listed_once_and_never_offered_again() {
+        // 🔴 THE LOOP THIS PREVENTS. Roll back to the good version, the update check sees the bad one
+        // is still the latest release, install it again, fail again — every 6 hours, for ever.
+        let base = temp_base("probation_skip");
+        skip_version(&base, "0.3.58");
+        let path = crate::update_gate::skip_path(&base);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0.3.58\n");
+        // Idempotent: this is consulted on every update check, and rewriting the file each pass
+        // would be a flash write every six hours for the life of the hub.
+        skip_version(&base, "0.3.58");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0.3.58\n", "not appended twice");
+        skip_version(&base, "0.3.59");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0.3.58\n0.3.59\n");
+        // And this is the exact predicate the update check filters on.
+        let list = std::fs::read_to_string(&path).unwrap();
+        assert!(crate::update_gate::skipped(&list, "0.3.58"));
+        assert!(crate::update_gate::skipped(&list, "0.3.59"));
+        assert!(!crate::update_gate::skipped(&list, "0.3.60"), "a later release is still offered");
     }
 
     #[tokio::test]
