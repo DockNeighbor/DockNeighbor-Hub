@@ -7,8 +7,8 @@
 # over HTTPS to the hosted worker on a timer — no inbound path exists behind CGNAT, and none is
 # needed. The command channel (Phase B) is deliberately absent from this skeleton.
 #
-# Auth: prefer the per-DEVICE revocable token (DEVICE_TOKEN → /api/agent, minted by
-# /api/agent/enroll — worker increment 1), falling back to the per-vehicle webhook key
+# Auth: prefer the per-DEVICE revocable token (DEVICE_TOKEN → /api/hub-lite, minted by
+# /api/hub-lite/enroll — worker increment 1), falling back to the per-vehicle webhook key
 # (VEHICLE_KEY → /api/shelly) for configs written before tokens existed. A leaked token exposes
 # one device's telemetry write path and is revoked individually; prefer it everywhere.
 #
@@ -558,7 +558,7 @@ EOF_DEVS
 
   _items=$(spool_to_items < "$_items_src")
   _body=$(build_batch_json "$_seq" "$_kind" "$_items" "$_ok_ids" "$(relay_boot_id)")
-  _url="${WORKER_URL}/api/agent/batch?vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}"
+  _url="${WORKER_URL}/api/hub-lite/batch?vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}"
   # Same command piggyback + ack as send_event: the batch reply carries pending verbs, and the
   # request that delivers acks is the next one out — whichever path (event or batch) goes first.
   [ -n "$PENDING_ACK" ] && _url="${_url}&ack=${PENDING_ACK}"
@@ -579,12 +579,19 @@ EOF_DEVS
     echo "$_seq" > "$RELAY_SEQ_FILE"
     rm -f "$_sending" "$_items_src"
     log "relay: batch seq=$_seq REFUSED by the cloud (HTTP $_code) - dropped; resending cannot help"
-    # A worker that predates Cloud #327 has no /api/agent/batch at all (404). The check-in is not
+    # A worker that predates Cloud #327 has no batch route at all (404). The check-in is not
     # optional, so stop asking for a while and let do_checkin fall back to the 0.17.0 single-event
-    # path — a hub-lite ahead of its worker keeps working, it just costs two requests again.
+    # path — that hub-lite keeps working, it just costs two requests again.
+    #
+    # ⚠️ THE FALLBACK DOES NOT COVER A WORKER OLDER THAN CLOUD #505. Since 0.18.10 every door this
+    # script calls is a /api/hub-lite/* name, so a worker without hubLiteWire.ts 404s the batch AND
+    # the single-event GET the fallback drops to: there is nothing left to fall back to. That is a
+    # deliberate one-way step (sc4-internal docs/ONSITE.md §2, migration order) — the /api/agent*
+    # aliases are permanent so no OLDER hub-lite breaks, but rolling the WORKER back below #505
+    # strands every 0.18.10 router, exactly as it already strands the app's enroll/command calls.
     if [ -n "${CHECKIN_ITEM:-}" ]; then
       BATCH_REFUSED=1
-      log "check-in: the cloud refused /api/agent/batch (HTTP $_code) - using the single-event path for ${BATCH_REPROBE_SEC}s"
+      log "check-in: the cloud refused /api/hub-lite/batch (HTTP $_code) - using the single-event path for ${BATCH_REPROBE_SEC}s"
     fi
     return 0
   fi
@@ -1047,7 +1054,7 @@ check_zone() {
 # Pure: report URL for an event + pre-encoded params (exercised by test.sh). Token path wins.
 build_report_url() {
   if [ -n "${DEVICE_TOKEN:-}" ]; then
-    printf '%s/api/agent?vid=%s&device=%s&event=%s&t=%s&%s' "$WORKER_URL" "$VID" "$DEVICE_ID" "$1" "$DEVICE_TOKEN" "$2"
+    printf '%s/api/hub-lite?vid=%s&device=%s&event=%s&t=%s&%s' "$WORKER_URL" "$VID" "$DEVICE_ID" "$1" "$DEVICE_TOKEN" "$2"
   else
     printf '%s/api/shelly?vid=%s&device=%s&event=%s&k=%s&%s' "$WORKER_URL" "$VID" "$DEVICE_ID" "$1" "$VEHICLE_KEY" "$2"
   fi
@@ -1100,7 +1107,7 @@ fetch_mgmt_key() {
   [ -n "${MGMT_KEY:-}" ] && return 0
   [ -n "${DEVICE_TOKEN:-}" ] || return 1        # the legacy VEHICLE_KEY path cannot ask for one
   _k=$(curl -fsS --max-time 10 \
-    "${WORKER_URL}/api/agent/mgmt-key?vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}" 2>/dev/null \
+    "${WORKER_URL}/api/hub-lite/mgmt-key?vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}" 2>/dev/null \
     | sed -n 's/.*"key":"\([0-9a-f]*\)".*/\1/p')
   case "$_k" in
     ????????????????????????????????????????????????????????????????) : ;;   # exactly 64 hex
@@ -1143,7 +1150,7 @@ fetch_member_keys() {
   # keeps working on its own.
   command -v sha256sum >/dev/null 2>&1 || return 1
   _mk_have=$(sed -n '1s/^sig \([0-9a-f]\{64\}\)$/\1/p' "$MEMBER_KEYS_FILE" 2>/dev/null)
-  _mk_url="${WORKER_URL}/api/agent/member-keys?vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}"
+  _mk_url="${WORKER_URL}/api/hub-lite/member-keys?vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}"
   _mk_body="/tmp/brvg-hub-lite.member-keys.$$"
   if [ -n "$_mk_have" ]; then
     _mk_code=$(curl -sS --max-time 10 -o "$_mk_body" -w '%{http_code}' -H "If-None-Match: \"$_mk_have\"" "$_mk_url" 2>/dev/null)
@@ -1266,7 +1273,10 @@ run_commands() {
       # Both REPLACE this running service, so neither may run inside it (see run_detached).
       self_update)  log "command: self_update"; run_detached self_update ;;
       # The version being rolled back is skip-listed, and any probation ends here.
-      rollback_agent) log "command: rollback_agent"; run_detached rollback_requested ;;
+      # BOTH spellings, and they must stay both (sc4-internal docs/ONSITE.md §2). The worker still
+      # DELIVERS `rollback_agent`; it may only switch once no field hub-lite predates this release,
+      # because an unknown verb is acknowledged and silently dropped a few lines below.
+      rollback_agent|rollback_hub_lite) log "command: $_cmd"; run_detached rollback_requested ;;
       reboot)       log "command: reboot"; (sleep 5; reboot) >/dev/null 2>&1 & ;;
       reboot_modem) log "command: reboot_modem"; at_cmd 'AT+CFUN=1,1' 5 >/dev/null 2>&1 ;;
       reset_data)   log "command: reset_data"; at_cmd 'AT+QGDCNT=0' 3 >/dev/null 2>&1; FOLLOWUP_REPORT=1 ;;
@@ -3537,16 +3547,16 @@ update_check() {
 RT_FILE="${BRVG_HUB_LITE_ROUTERS:-/usr/libexec/brvg-hub-lite/routers}"; [ -r "$RT_FILE" ] && sh -n "$RT_FILE" 2>/dev/null && . "$RT_FILE"
 
 # --- The check-in and the live link (0.17.0; owner D6, telemetry design §A7.11c / §A8) -------------
-# ONE dedicated check-in, `GET /api/agent?event=hub.checkin`, every 15 min while nobody watches and
+# ONE dedicated check-in, `GET /api/hub-lite?event=hub.checkin`, every 15 min while nobody watches and
 # every 1 min while the reply carries a watch lease. The worker (DockNeighbor-Cloud liveLink.ts)
 # intercepts the event — never an alert, never a reading, only the router's last-seen — and answers
 # with the flat keys `lease` (0/1), `leaseUntil` (epoch SECONDS), `checkinSec` and `live` (0/1: this
 # router may hold the vessel's link), beside the usual `anchor` and `commands`.
 #
 # 🔴 NOTHING IS QUEUED TO FIRE LATER, on either side. While `live` is 1 a background child holds a
-# long poll (GET /api/agent/live/poll, the worker answers within 25 s) and runs any relayed call it is
+# long poll (GET /api/hub-lite/live/poll, the worker answers within 25 s) and runs any relayed call it is
 # handed through the SAME /api/hub door the LAN uses, with the role the worker vouched for, then posts
-# the answer (POST /api/agent/live/result). When the lease is gone the poll is refused and the child
+# the answer (POST /api/hub-lite/live/result). When the lease is gone the poll is refused and the child
 # exits; the check-in returns to 15 min.
 CHECKIN_IDLE_SEC=900
 CHECKIN_LEASED_SEC=60
@@ -3652,7 +3662,7 @@ compose_checkin_item() {
 }
 
 # The 0.17.0 path, kept verbatim for the fallback (rule 5): the check-in as its own GET, then the
-# modem sample as a second GET, then the spool. Used when the cloud has refused /api/agent/batch —
+# modem sample as a second GET, then the spool. Used when the cloud has refused /api/hub-lite/batch —
 # an older worker that predates Cloud #327 — so a hub-lite ahead of its worker keeps working. $1 now.
 checkin_legacy() {
   if send_event "hub.checkin" "av=$HUB_LITE_VERSION&anchorsig=$(anchor_sig)"; then
@@ -3665,7 +3675,7 @@ checkin_legacy() {
   drain_relay
 }
 
-# One check-in: ONE POST /api/agent/batch carrying the hub.checkin item (with the newest modem
+# One check-in: ONE POST /api/hub-lite/batch carrying the hub.checkin item (with the newest modem
 # sample on it — L1), the idle valves' readings and anything else spooled. The reply answers the
 # lease (D6), the watch, the commands and the member-key signature (L4) — the same fields the
 # /api/agent reply carried, read the same way. Echoes nothing; sets CHECKIN_OK. $1 now.
@@ -3833,7 +3843,7 @@ live_link_loop() {
     _ll_until=$(cat "$LIVE_UNTIL_FILE" 2>/dev/null | tr -cd '0-9')
     [ -n "$_ll_until" ] && [ "$(date +%s)" -lt "$_ll_until" ] || return 0
     _ll_f="${TMPDIR:-/tmp}/brvg-live-poll.$$"
-    _ll_code=$(curl -sS --max-time 40 -o "$_ll_f" -w '%{http_code}' "${WORKER_URL}/api/agent/live/poll?${_ll_q}" 2>/dev/null)
+    _ll_code=$(curl -sS --max-time 40 -o "$_ll_f" -w '%{http_code}' "${WORKER_URL}/api/hub-lite/live/poll?${_ll_q}" 2>/dev/null)
     case "$(live_poll_verdict "$_ll_code")" in
       call)
         _ll_fail=0
@@ -3841,7 +3851,7 @@ live_link_loop() {
         if [ -n "$_ll_res" ]; then
           printf '%s' "$_ll_res" > "$_ll_f.res"
           curl -sS --max-time 20 -o /dev/null -X POST -H 'Content-Type: application/json' \
-            --data-binary "@$_ll_f.res" "${WORKER_URL}/api/agent/live/result?${_ll_q}" 2>/dev/null || true
+            --data-binary "@$_ll_f.res" "${WORKER_URL}/api/hub-lite/live/result?${_ll_q}" 2>/dev/null || true
           rm -f "$_ll_f.res"
         fi ;;
       again) _ll_fail=0 ;;
@@ -3963,7 +3973,7 @@ main() {
       _next_watch=$(( $(date +%s) + MODEM_INTERVAL ))
     fi
     # 5. THE CHECK-IN (D6): 15 min unwatched, 1 min while a lease is live — and since 0.18.0 ONE POST
-    #    /api/agent/batch, not a check-in GET plus a modem GET. The modem sample, the idle valves, the
+    #    /api/hub-lite/batch, not a check-in GET plus a modem GET. The modem sample, the idle valves, the
     #    spool (🔴 not gated on HUB_LITE_ENABLED — LinkTap telemetry, cycle ends, flood-close records
     #    and the plan gate all travel through the drain), the keys and the link ride it.
     if [ "$(date +%s)" -ge "$_next_checkin" ]; then

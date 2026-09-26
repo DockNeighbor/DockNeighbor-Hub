@@ -104,7 +104,7 @@ if [ "$urgent" = "1" ] && [ -f "$CONF" ]; then
     _body='{"v":1,"kind":"delta","items":'${_items:-[]}',"ok":[]}'
     if [ -n "$_items" ] && curl -fsS --max-time 10 -X POST \
         -H 'Content-Type: application/json' -d "$_body" \
-        "${WORKER_URL:-https://api.dockneighbor.com}/api/agent/batch?vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}" \
+        "${WORKER_URL:-https://api.dockneighbor.com}/api/hub-lite/batch?vid=${VID}&device=${DEVICE_ID}&t=${DEVICE_TOKEN}" \
         >/dev/null 2>&1; then
       exit 0   # delivered — do NOT also spool, or the next drain double-reports the alarm
     fi
