@@ -279,6 +279,33 @@ pub fn next_look_ms(s: &CloseSchedule, w: &CloseWatch, now_ms: i64) -> i64 {
 /// needle for the same reasons.
 pub const CLOSE_UNCONFIRMED_EVENT: &str = "linktap.valve.close_unconfirmed";
 
+/// 🔴 THE VALVE SHUT IN THE END — the correction to a close the owner was already told had failed.
+/// Owner ruling 2026-09-25: *"Yes: 'Valve closed'"*.
+///
+/// It exists because the schedule has two numbers. He hears at `alert_at_ms` and the hub keeps trying
+/// to `give_up_ms`, so there is a 25-minute window in which a valve CAN still shut — and without this
+/// the last thing he was told would stay "water may still be running" while the water was, in fact,
+/// off. Being left believing the worse of two true things is its own failure, and one the split
+/// introduced.
+///
+/// ⚠️ ONLY WHEN HE WAS ACTUALLY TOLD. Emitted on a confirmed close whose watch had already alerted
+/// (`CloseWatch.alerted`); a close confirmed BEFORE the alert point sends nothing at all, because
+/// there is nothing to correct. That is the whole gate — without it this would fire on every healthy
+/// close in the fleet.
+///
+/// ⚠️ CROSS-REPO CONTRACT, same three implementations as CLOSE_UNCONFIRMED_EVENT: this daemon,
+/// hub-lite (`LT_CLOSE_LATE_EVENT`) and the worker
+/// (`HUB_VALVE_CLOSE_CONFIRMED_LATE_EVENT`, DockNeighbor-Cloud hubValveState.ts, which holds the
+/// owner's approved title and body). Renaming it on one side silently deletes the notice.
+///
+/// 🔴 AND THE NAME HAS ONE LETTER OF MARGIN. `notifyCategories`' security rule claims `closed`
+/// (`/motion|vibration|smoke|opened|closed|btn|button/`) — `close_confirmed_late` does NOT contain it,
+/// so the name falls to the water rule like its sibling. It also carries no flood/leak/alarm (which
+/// would close every valve), does not end `_off`/`.off` (an ALL-CLEAR, which would resolve an alarm
+/// episode this has nothing to do with), and does not end `.change`/`.measurement` (never pushed).
+/// Do not "tidy" this to `closed_late`.
+pub const CLOSE_CONFIRMED_LATE_EVENT: &str = "linktap.valve.close_confirmed_late";
+
 /// PURE: the params of the alert a given-up close raises. `cause` is what distinguishes a failed
 /// flood shutoff from a failed manual press; `attempts` and `secs` are how hard the hub tried, which
 /// is the first thing anyone debugging a bench failure will ask.
