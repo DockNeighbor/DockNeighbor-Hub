@@ -308,6 +308,16 @@ pub struct Rt {
     /// Live mirror of `hub_config::nonce_ping_secs`, so the relay can pick up a cadence change while
     /// a socket is open instead of at the next reconnect (which can be hours). Written by do_config.
     pub nonce_ping_secs: std::sync::atomic::AtomicU64,
+    /// Bumped every time a relay socket is established (hub_relay.rs serve_once).
+    ///
+    /// 🔴 THIS EXISTS TO CLOSE A RACE, and without it `relayUp` would be worse than nothing. The
+    /// worker answers "I hold no socket for you" as the reply is WRITTEN; by the time we read it the
+    /// relay task may already have noticed and reconnected on its own. Acting on that stale 0 would
+    /// tear down a healthy, brand-new socket — turning a diagnostic into an outage generator. So the
+    /// check-in records this counter before it posts and only drops the socket if it has not moved.
+    pub relay_gen: std::sync::atomic::AtomicU64,
+    /// Ask the relay task to drop its socket and reconnect (see relay_gen).
+    pub relay_drop: tokio::sync::Notify,
     /// Epoch ms of the last REAL local event (an alarm, a valve transition, a command, a refresh, a
     /// lease start). Diagnostics only now — nothing paces itself off it. A skipped forward never
     /// touches it (H3).
@@ -468,6 +478,8 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         web: tokio::sync::RwLock::new(web),
         web_ui_disabled: std::sync::atomic::AtomicBool::new(web_ui_disabled),
         nonce_ping_secs: std::sync::atomic::AtomicU64::new(nonce_ping_secs),
+        relay_gen: std::sync::atomic::AtomicU64::new(0),
+        relay_drop: tokio::sync::Notify::new(),
         keys: tokio::sync::RwLock::new(keys),
         key_sync: tokio::sync::Mutex::new(crate::key_sync::KeySync::boot(
             (!key_sig.is_empty()).then_some(key_sig),
@@ -2102,7 +2114,9 @@ async fn post_batch(
     ack: Option<&str>,
 ) -> PostOutcome {
     let sig = rt.telemetry.lock().await.anchorsig();
-    let url = match batch::batch_url(&rt.worker_base, &cfg.vid, &cfg.hub_id, &cfg.token, ack, sig) {
+    // Opt in to `relayUp` (Cloud #551): only a hub has a relay socket, and this whole file is the hub.
+    let relay_gen_before = rt.relay_gen.load(Ordering::SeqCst);
+    let url = match batch::batch_url(&rt.worker_base, &cfg.vid, &cfg.hub_id, &cfg.token, ack, sig, true) {
         Ok(u) => u,
         Err(e) => return PostOutcome::Refused(format!("bad worker url: {e}")),
     };
@@ -2122,7 +2136,18 @@ async fn post_batch(
             let code = res.status().as_u16();
             if (200..300).contains(&code) {
                 rt.last_cloud_ok_ms.store(now_ms(), Ordering::SeqCst);
-                PostOutcome::Delivered(res.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null))
+                let reply = res.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
+                // `relayUp: 0` — the worker holds no socket for this vessel, whatever our end thinks.
+                // Absent means an older worker or a reply that predates the opt-in; absent is never
+                // "no socket" (batch::relay_up).
+                let relay_gen_now = rt.relay_gen.load(Ordering::SeqCst);
+                if batch::should_drop_relay(&reply, relay_gen_before, relay_gen_now) {
+                    crate::hlog!("hub: the cloud holds no relay socket for us - dropping ours and reconnecting");
+                    rt.relay_drop.notify_waiters();
+                } else if batch::relay_up(&reply) == Some(false) {
+                    crate::hlog!("hub: the cloud reported no relay socket, but we have reconnected since asking - ignoring");
+                }
+                PostOutcome::Delivered(reply)
             } else if code >= 500 || code == 408 || code == 429 {
                 PostOutcome::Transient(format!("cloud answered HTTP {code}"))
             } else {
@@ -5732,9 +5757,60 @@ mod tests {
     #[tokio::test]
     async fn the_debug_switch_is_off_by_default_and_never_logs_the_token() {
         assert!(!HubConfig::default().debug_log_batches);
-        let url = batch::batch_url("https://api.example.com", "v1", "hub_abc123", &seeded_cfg().token, None, 0).unwrap();
+        let url = batch::batch_url("https://api.example.com", "v1", "hub_abc123", &seeded_cfg().token, None, 0, false).unwrap();
         let line = batch::debug_line(&url, &batch::envelope(batch::Kind::Keyframe, None, "b", &[], "x"));
         assert!(!line.contains(&seeded_cfg().token), "{line}");
+    }
+
+    // ── item D: the worker tells us it holds no socket (Cloud #551 `relayUp`) ───────────────────
+    /// Wait briefly for a relay-drop signal. Returns whether it came.
+    async fn drop_signalled(rt: &Shared, ms: u64) -> bool {
+        let rt2 = rt.clone();
+        let waiter = tokio::spawn(async move { rt2.relay_drop.notified().await });
+        // Let the waiter register before anything can notify: notify_waiters wakes only CURRENT
+        // waiters, so a race here would make this test lie in the passing direction.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let armed = tokio::spawn({
+            let rt3 = rt.clone();
+            async move {
+                let cfg = hub_config::read_config_in(&rt3.base);
+                checkin_once(&rt3, &http_client(), &cfg).await.ok();
+            }
+        });
+        let got = tokio::time::timeout(Duration::from_millis(ms), waiter).await.is_ok();
+        let _ = armed.await;
+        got
+    }
+
+    #[tokio::test]
+    async fn the_hub_drops_its_socket_when_the_cloud_says_it_holds_none() {
+        // 🔴 THE HALF-OPEN RELAY, ended from the end that can see it. Our side believes this socket
+        // is fine — that IS the failure — so only the worker's word can break the deadlock.
+        let (worker, _posts) = stub_batch_worker(serde_json::json!({ "status": "ok", "relayUp": 0 })).await;
+        let base = temp_base("relayup_zero");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, worker);
+        assert!(drop_signalled(&rt, 1_000).await, "relayUp: 0 must drop the socket");
+    }
+
+    #[tokio::test]
+    async fn a_healthy_socket_is_left_alone() {
+        let (worker, _posts) = stub_batch_worker(serde_json::json!({ "status": "ok", "relayUp": 1 })).await;
+        let base = temp_base("relayup_one");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, worker);
+        assert!(!drop_signalled(&rt, 300).await, "relayUp: 1 must not touch the socket");
+    }
+
+    #[tokio::test]
+    async fn an_older_worker_that_sends_no_relay_field_never_drops_the_socket() {
+        // ABSENT IS NOT "NO SOCKET". Read the other way, every pre-#551 worker would tell this hub to
+        // drop a healthy socket on every check-in — a self-inflicted outage on the whole fleet.
+        let (worker, _posts) = stub_batch_worker(serde_json::json!({ "status": "ok" })).await;
+        let base = temp_base("relayup_absent");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, worker);
+        assert!(!drop_signalled(&rt, 300).await, "a missing relayUp must change nothing");
     }
 
     #[tokio::test]
