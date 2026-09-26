@@ -3332,7 +3332,7 @@ lt_checkin_spool() {
   lt_configured || return 0
   [ -d "$LT_STATE_DIR" ] || return 0
   _lci_last=$(cat "$LT_STATE_DIR/idle.at" 2>/dev/null | tr -cd '0-9')
-  [ -n "$_lci_last" ] && [ $(( $1 - _lci_last )) -lt $(( CHECKIN_IDLE_SEC - 30 )) ] && return 0
+  [ -n "$_lci_last" ] && [ $(( $1 - _lci_last )) -lt $(( IDLE_REPORT_SEC - 30 )) ] && return 0
   for _lci in $(printf '%s' "$LINKTAP_DEV_IDS" | tr ',' ' '); do
     _lci=$(lt_norm_id "$_lci")
     [ -n "$_lci" ] && [ -s "$LT_STATE_DIR/meas.$_lci" ] || continue
@@ -3557,9 +3557,27 @@ RT_FILE="${BRVG_HUB_LITE_ROUTERS:-/usr/libexec/brvg-hub-lite/routers}"; [ -r "$R
 # long poll (GET /api/hub-lite/live/poll, the worker answers within 25 s) and runs any relayed call it is
 # handed through the SAME /api/hub door the LAN uses, with the role the worker vouched for, then posts
 # the answer (POST /api/hub-lite/live/result). When the lease is gone the poll is refused and the child
-# exits; the check-in returns to 15 min.
-CHECKIN_IDLE_SEC=900
+# exits; the check-in returns to its unwatched period.
+# THE IDLE CHECK-IN IS ONE HOUR (owner, 2026-09-26). It was 900 while the App's connectivityStatus
+# LATE_CHECKIN_MS already said 65 min — so a router that DIED still read "Reported by the router N
+# ago" for up to 65 minutes instead of being flagged at ~20. The App tier was written for this
+# cadence and shipped ahead of it; this is the hub side catching up, and the two are now gated
+# together by sc4-internal scripts/check-checkin-cadence-drift.mjs.
+#
+# An ARMED watch shortens it, because then the check-in is the thing carrying the boat's position:
+# an anchor watch every 5 min, a security zone every 15. A live lease still wins at 60 s.
+CHECKIN_IDLE_SEC=3600
+CHECKIN_ZONE_SEC=900
+CHECKIN_ANCHOR_SEC=300
 CHECKIN_LEASED_SEC=60
+# 🔴 NOT THE CHECK-IN PERIOD, AND IT MUST NOT FOLLOW IT. Two rate limits used to be written as
+# `CHECKIN_IDLE_SEC - 30` purely because that was 15 minutes. Taking the check-in to an hour would
+# have dragged BOTH to an hour with it, silently:
+#   * the member-key refresh (keys_on_checkin) — a crew key the owner REVOKED would have kept
+#     working on the router for up to an hour instead of 15 minutes;
+#   * the idle LinkTap valve readings (lt_checkin_spool) — the app would draw hour-old valve state.
+# Neither has anything to do with how often the boat says hello, so both keep the old 15 minutes.
+IDLE_REPORT_SEC=900
 LIVE_LEASE=0; LIVE_UNTIL=0; LIVE_OK=0; CHECKIN_OK=1
 LAST_REPLY=""
 # The child's lease clock (epoch s). The main loop rewrites it on every leased check-in; the child
@@ -3593,19 +3611,35 @@ apply_live_fields() {
   [ "$LIVE_LEASE" = "1" ] || { LIVE_UNTIL=0; LIVE_OK=0; }
   if [ "$_alw" != "$LIVE_LEASE" ]; then
     if [ "$LIVE_LEASE" = "1" ]; then log "check-in: a member is watching - checking in every ${CHECKIN_LEASED_SEC}s"
-    else log "check-in: nobody watching - checking in every ${CHECKIN_IDLE_SEC}s"; fi
+    else log "check-in: nobody watching - checking in every $(checkin_interval 0 0 0 1 "$(watch_armed)")s"; fi
   fi
 }
 
-# PURE: seconds to the next check-in. $1 lease $2 leaseUntil $3 now $4 last check-in succeeded (0/1).
-# 60 while a lease is live, 900 otherwise (D6). A FAILED check-in is retried within 2 minutes rather
-# than a whole period later: a boat whose WAN just came back should pick up an arm or a lease soon,
-# and a failing request reaches no cloud at all.
+# PURE: seconds to the next check-in.
+#   $1 lease  $2 leaseUntil  $3 now  $4 last check-in succeeded (0/1)  $5 armed: "anchor"|"zone"|""
+#
+# Shortest wins, and they are already in that order: a live lease 60 (D6), an armed anchor watch 300,
+# an armed security zone 900, otherwise 3600. A FAILED check-in is retried within 2 minutes rather
+# than a whole period later — and that matters far more at an hour than it did at 15 minutes: a boat
+# whose WAN just came back should pick up an arm or a lease soon, and a failing request reaches no
+# cloud at all.
 checkin_interval() {
   _cii=$CHECKIN_IDLE_SEC
+  case "${5:-}" in
+    anchor) _cii=$CHECKIN_ANCHOR_SEC ;;
+    zone)   _cii=$CHECKIN_ZONE_SEC ;;
+  esac
   [ "$1" = "1" ] && [ "${2:-0}" -gt "$3" ] 2>/dev/null && _cii=$CHECKIN_LEASED_SEC
   [ "${4:-1}" = "1" ] || { [ "$_cii" -gt 120 ] && _cii=120; }
   echo "$_cii"
+}
+
+# Which watch is armed, for checkin_interval. The anchor watch is the tighter of the two, so it wins
+# when both are on. Impure by nature (it reads the two state files apply_watch maintains).
+watch_armed() {
+  [ -s "$ANCHOR_STATE" ] && { echo anchor; return 0; }
+  [ -s "$ZONE_STATE" ] && { echo zone; return 0; }
+  echo ""
 }
 
 # PURE: the signature of the member-key set a reply announces, when the cloud sends one (a flat
@@ -3626,7 +3660,7 @@ keys_on_checkin() {
     [ "$_koc" = "$(sed -n '1s/^sig \([0-9a-f]\{64\}\)$/\1/p' "$MEMBER_KEYS_FILE" 2>/dev/null)" ] && return 0
     fetch_member_keys; KEYS_ASKED_AT=$1; return 0
   fi
-  [ $(( $1 - KEYS_ASKED_AT )) -ge $(( CHECKIN_IDLE_SEC - 30 )) ] || return 0
+  [ $(( $1 - KEYS_ASKED_AT )) -ge $(( IDLE_REPORT_SEC - 30 )) ] || return 0
   fetch_member_keys
   KEYS_ASKED_AT=$1
 }
@@ -3701,7 +3735,7 @@ do_checkin() {
   [ "$_dc_batched" = "1" ] || checkin_legacy "$1"
   live_link_manage "$(date +%s)"
   # Managed routers (routers.sh) report on the same cadence: their poll is a sample clock too.
-  [ -n "${RT_DIR:-}" ] && [ -d "$RT_DIR" ] && checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" 1 > "$RT_DIR/cadence" 2>/dev/null
+  [ -n "${RT_DIR:-}" ] && [ -d "$RT_DIR" ] && checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" 1 "$(watch_armed)" > "$RT_DIR/cadence" 2>/dev/null
   return 0
 }
 
@@ -3902,7 +3936,7 @@ main() {
     sleep 30
   done
   load_config
-  log "starting (platform=$(detect_platform), check-in every ${CHECKIN_IDLE_SEC}s unwatched / ${CHECKIN_LEASED_SEC}s watched; gps sampled every ${GPS_INTERVAL}s, modem every ${MODEM_INTERVAL}s)"
+  log "starting (platform=$(detect_platform), check-in every ${CHECKIN_IDLE_SEC}s unwatched / ${CHECKIN_ANCHOR_SEC}s anchored / ${CHECKIN_ZONE_SEC}s zoned / ${CHECKIN_LEASED_SEC}s watched; gps sampled every ${GPS_INTERVAL}s, modem every ${MODEM_INTERVAL}s)"
   # Small random start offset so a fleet doesn't tick in lockstep after a regional power event.
   sleep $(( $$ % 20 ))
   # An urgent webhook (alarm) pokes the drain immediately — aggregation must never delay one that
@@ -3978,7 +4012,7 @@ main() {
     #    and the plan gate all travel through the drain), the keys and the link ride it.
     if [ "$(date +%s)" -ge "$_next_checkin" ]; then
       do_checkin "$(date +%s)"
-      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK") ))
+      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK" "$(watch_armed)") ))
     elif relay_needs_retry; then
       # A failed batch or an undelivered alarm is retried on a short cadence rather than waiting out
       # the check-in (the daemon's shelly_retry_loop). A no-op while the spool is empty.
@@ -4019,7 +4053,7 @@ main() {
       do_checkin "$(date +%s)"
       _next_gps=$(( $(date +%s) + $(gps_sample_secs "$(date +%s)") ))
       _next_modem=${MODEM_NEXT_AT:-$(( $(date +%s) + MODEM_INTERVAL ))}
-      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK") ))
+      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK" "$(watch_armed)") ))
     fi
     command -v rt_tick >/dev/null 2>&1 && rt_tick   # managed routers: due reads run in the background (routers.sh)
     _lt_due=""

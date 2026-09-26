@@ -1953,7 +1953,12 @@ async fn checkin_loop(rt: Shared) {
         }
         rt.last_checkin_ms.store(now_ms(), Ordering::SeqCst);
         match checkin_once(&rt, &client, &cfg).await {
-            Ok(()) => next_due = tokio::time::Instant::now() + Duration::from_secs(cadence::CHECKIN_SECS),
+            Ok(()) => {
+                // The period follows the vessel's ARMED WATCH, re-read after every keyframe: arming
+                // an anchor watch must tighten the next one, not the one after the next.
+                let secs = cadence::checkin_interval_secs(rt.telemetry.lock().await.watch.as_ref());
+                next_due = tokio::time::Instant::now() + Duration::from_secs(secs);
+            }
             Err(e) => {
                 crate::hlog!("hub: check-in failed: {e}");
                 next_due = tokio::time::Instant::now() + Duration::from_secs(cadence::CHECKIN_RETRY_SECS);

@@ -2509,10 +2509,39 @@ NOLEASE_REPLY='{"status":"ok","event":"hub.checkin","lease":0,"leaseUntil":0,"ch
 check "live fields: a leased reply" "1 4102444800 60 1" "$(printf '%s' "$LEASE_REPLY" | parse_live_fields)"
 check "live fields: nobody watching" "0 0 900 0" "$(printf '%s' "$NOLEASE_REPLY" | parse_live_fields)"
 check "live fields: a reply without them (switch off) says nothing" "" "$(printf '{"status":"ok","leases":1}' | parse_live_fields)"
-check "cadence: 15 min unwatched" "900" "$(checkin_interval 0 0 1000 1)"
+check "cadence: 60 min unwatched" "3600" "$(checkin_interval 0 0 1000 1)"
 check "cadence: 1 min while a lease is live" "60" "$(checkin_interval 1 2000 1000 1)"
-check "cadence: a lease that has run out is unwatched" "900" "$(checkin_interval 1 999 1000 1)"
+check "cadence: a lease that has run out is unwatched" "3600" "$(checkin_interval 1 999 1000 1)"
 check "cadence: a failed check-in retries within 2 min" "120" "$(checkin_interval 0 0 1000 0)"
+
+# 0.18.10 (owner 2026-09-26): an ARMED watch shortens the hour, because then the check-in is what
+# carries the boat's position. Shortest wins, and a lease still beats both.
+check "cadence: an armed anchor watch is 5 min" "300" "$(checkin_interval 0 0 1000 1 anchor)"
+check "cadence: an armed security zone is 15 min" "900" "$(checkin_interval 0 0 1000 1 zone)"
+check "cadence: a live lease beats an armed anchor watch" "60" "$(checkin_interval 1 2000 1000 1 anchor)"
+check "cadence: a failed check-in still retries within 2 min while armed" "120" "$(checkin_interval 0 0 1000 0 anchor)"
+# An unknown arm must fall back to idle, never to 0 — a 0 would busy-loop the check-in.
+check "cadence: an unrecognised arm falls back to the idle hour" "3600" "$(checkin_interval 0 0 1000 1 nonsense)"
+
+# watch_armed picks the tighter watch when both are on.
+_wa=$(mktemp -d)
+ANCHOR_STATE="$_wa/a" ZONE_STATE="$_wa/z"
+check "watch_armed: nothing armed" "" "$(watch_armed)"
+printf 'z' > "$_wa/z"; check "watch_armed: zone only" "zone" "$(watch_armed)"
+printf 'a' > "$_wa/a"; check "watch_armed: anchor wins over zone" "anchor" "$(watch_armed)"
+rm -f "$_wa/z"; check "watch_armed: anchor only" "anchor" "$(watch_armed)"
+rm -rf "$_wa"; unset ANCHOR_STATE ZONE_STATE
+
+# 🔴 THE COUPLING THAT WOULD HAVE SHIPPED SILENTLY. Both rate limits were written as
+# `CHECKIN_IDLE_SEC - 30` only because that happened to be 15 minutes. Tying them to the check-in
+# would have let a REVOKED crew key keep working for an hour, and made the app draw hour-old valve
+# state. They read IDLE_REPORT_SEC now, and it must stay 15 min while the check-in is an hour.
+check "cadence: the idle check-in is an hour" "3600" "$CHECKIN_IDLE_SEC"
+check "cadence: the report period stayed 15 min and did NOT follow the check-in" "900" "$IDLE_REPORT_SEC"
+check "cadence: the member-key refresh is rate-limited by the report period, not the check-in" "1" \
+  "$(grep -c 'KEYS_ASKED_AT )) -ge $(( IDLE_REPORT_SEC - 30 ))' "$HL_DIR/brvg-hub-lite.sh")"
+check "cadence: the idle valve report is rate-limited by the report period, not the check-in" "1" \
+  "$(grep -c '_lci_last )) -lt $(( IDLE_REPORT_SEC - 30 ))' "$HL_DIR/brvg-hub-lite.sh")"
 
 # --- 0.18.0: the check-in IS the batch (one POST /api/agent/batch per tick, not two GETs) --------
 # A curl stand-in that can answer BOTH shapes, so one stub covers the batch path and the fallback:
@@ -2568,9 +2597,9 @@ B_LEASE='{"status":"ok","processed":1,"failed":0,"touched":0,"skipped":0,"lease"
   DEVICE_TOKEN=""; : > "$C17/urls"; do_checkin 10180
   echo "legacy=$(grep -c 'hub.checkin' "$C17/urls") reqs=$(wc -l < "$C17/urls" | tr -d ' ')" >> "$C17/ci"
 )
-check "check-in: 900 s after a batch reply with no lease, and it cost ONE request (0.17.0 spent two)" "idle=900 reqs=1" "$(sed -n 1p "$C17/ci")"
+check "check-in: 3600 s after a batch reply with no lease, and it cost ONE request (0.17.0 spent two)" "idle=3600 reqs=1" "$(sed -n 1p "$C17/ci")"
 check "check-in: the batch reply's lease switches the cadence to 60 s, and its anchor is adopted" "leased=60 anchor=1757750400000" "$(sed -n 2p "$C17/ci")"
-check "check-in: back to 900 s when a batch reply stops carrying the lease" "switch-off=900" "$(sed -n 3p "$C17/ci")"
+check "check-in: back to 3600 s when a batch reply stops carrying the lease" "switch-off=3600" "$(sed -n 3p "$C17/ci")"
 check "check-in: never on the legacy VEHICLE_KEY path (/api/shelly would alert every 15 min)" "legacy=0 reqs=0" "$(sed -n 4p "$C17/ci")"
 check "check-in: three check-ins, three POSTs to /api/hub-lite/batch and no GET at all" "3 0" \
   "$(grep -c '^POST' "$C17/urls.ci") $(grep -c '^GET' "$C17/urls.ci")"
