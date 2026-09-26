@@ -24,8 +24,11 @@
 // response, and reqwest errors are stringified with `without_url()` because check-in/sync URLs
 // carry that token in `t=`.
 //
-// The WebSocket to the worker (remote-control relay + live key pushes) is a later increment; the
-// sync loop's cadence is the revocation latency until it lands.
+// ⚠️ BOTH HALVES OF THIS ARE NOW DONE, and this comment described them as pending until 2026-09-26.
+// The WebSocket to the worker exists (hub_relay: remote-control relay AND live key pushes), so
+// revocation no longer waits on a poll — and the poll it referred to is itself gone: key_sync ties
+// the fetch to the reply's `keysSig` instead of a fixed cadence. Revocation latency is now "the next
+// push, or the next payload reply", not a sync-loop interval.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -302,6 +305,9 @@ pub struct Rt {
     pub web: tokio::sync::RwLock<Option<crate::web_bundle::WebBundle>>,
     /// Mirror of `hub_config::web_ui_disabled`, read on every `/` request without touching the file.
     pub web_ui_disabled: std::sync::atomic::AtomicBool,
+    /// Live mirror of `hub_config::nonce_ping_secs`, so the relay can pick up a cadence change while
+    /// a socket is open instead of at the next reconnect (which can be hours). Written by do_config.
+    pub nonce_ping_secs: std::sync::atomic::AtomicU64,
     /// Epoch ms of the last REAL local event (an alarm, a valve transition, a command, a refresh, a
     /// lease start). Diagnostics only now — nothing paces itself off it. A skipped forward never
     /// touches it (H3).
@@ -451,7 +457,9 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
     // The signature persisted WITH that set, so a restart does not re-fetch what it already holds.
     // Absent (every hub.json written before 0.3.50) simply means the boot sync learns it.
     let key_sig = hub_config::read_config_in(&base).member_keys_sig;
-    let web_ui_disabled = hub_config::read_config_in(&base).web_ui_disabled;
+    let boot_cfg = hub_config::read_config_in(&base);
+    let web_ui_disabled = boot_cfg.web_ui_disabled;
+    let nonce_ping_secs = u64::from(boot_cfg.nonce_ping_secs);
     // A turned-off local web app is not loaded at all: nothing served, nothing announced (the relay
     // hello and the status body both read `web`).
     let web = if web_ui_disabled { None } else { crate::web_bundle::load_current(&base) };
@@ -459,6 +467,7 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         base,
         web: tokio::sync::RwLock::new(web),
         web_ui_disabled: std::sync::atomic::AtomicBool::new(web_ui_disabled),
+        nonce_ping_secs: std::sync::atomic::AtomicU64::new(nonce_ping_secs),
         keys: tokio::sync::RwLock::new(keys),
         key_sync: tokio::sync::Mutex::new(crate::key_sync::KeySync::boot(
             (!key_sig.is_empty()).then_some(key_sig),
@@ -758,6 +767,9 @@ fn capabilities_of(lt: &hub_config::LinkTapConfig) -> Vec<String> {
 struct ConfigReq {
     name: Option<String>,
     heartbeat_secs: Option<u32>,
+    /// Owner setting 2026-09-25: the relay's nonce heartbeat, seconds. See hub_relay.
+    #[serde(default)]
+    nonce_ping_secs: Option<u32>,
     enabled: Option<bool>,
     /// The vehicle's Shelly webhook secret, handed over by the app so the hub can authenticate
     /// local flood reports with the internet down (hub_config::shelly_secret). Sent here rather
@@ -856,6 +868,18 @@ async fn do_config(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
             return err(422, &format!("heartbeatSecs must be at least {HEARTBEAT_FLOOR_SECS}"));
         }
     }
+    // ⚠️ REFUSED, NOT CLAMPED, on this path. `nonce_ping_every` clamps whatever arrives from a synced
+    // vessel config, where there is nobody to tell — but a person typing a number into the app should
+    // learn it was out of range rather than silently get a different one.
+    if let Some(n) = req.nonce_ping_secs {
+        let n = u64::from(n);
+        if n != 0 && !(crate::hub_relay::NONCE_PING_MIN_SECS..=crate::hub_relay::NONCE_PING_MAX_SECS).contains(&n) {
+            return err(422, &format!(
+                "noncePingSecs must be 0 (use the default {}) or between {} and {}",
+                crate::hub_relay::NONCE_PING_DEFAULT_SECS,
+                crate::hub_relay::NONCE_PING_MIN_SECS, crate::hub_relay::NONCE_PING_MAX_SECS));
+        }
+    }
     let name = match req.name {
         Some(n) => {
             let t = n.trim().to_string();
@@ -874,6 +898,12 @@ async fn do_config(rt: &Rt, caller: &Caller, body: &[u8]) -> Answer {
         }
         if let Some(h) = req.heartbeat_secs {
             cfg.heartbeat_secs = h;
+        }
+        if let Some(n) = req.nonce_ping_secs {
+            cfg.nonce_ping_secs = n;
+            // Published live so an OPEN relay socket picks it up on its next nonce tick, rather than
+            // at the next reconnect — which can be hours, and would look like the setting did nothing.
+            rt.nonce_ping_secs.store(u64::from(n), std::sync::atomic::Ordering::Relaxed);
         }
         if let Some(e) = req.enabled {
             cfg.enabled = e;
