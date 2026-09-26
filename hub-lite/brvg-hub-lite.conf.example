@@ -17,7 +17,8 @@ VEHICLE_KEY=""
 WORKER_URL="https://api.dockneighbor.com"
 
 # SAMPLE clocks (seconds), not send clocks. Floors: GPS 30, modem 60. What reaches the cloud is the
-# check-in (15 min, 1 min while a member watches) plus changes: see hub-lite/README.md "Behavior".
+# check-in (60 min idle, 15 with a security zone armed, 5 with an anchor watch, 1 while a member
+# watches) plus changes: see hub-lite/README.md "Behavior".
 GPS_INTERVAL=120
 MODEM_INTERVAL=600
 

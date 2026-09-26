@@ -14,8 +14,25 @@
 
 use crate::geofence;
 
-/// The consolidated keyframe cadence while idle.
-pub const CHECKIN_SECS: u64 = 15 * 60;
+/// The consolidated keyframe cadence while idle and NOTHING is armed.
+///
+/// ONE HOUR since 0.3.57 (owner, 2026-09-26). It was 15 min while the App's connectivityStatus
+/// LATE_CHECKIN_MS already read 65 min, so a device that DIED still showed as reporting for up to
+/// an hour. The App tier shipped ahead of this one; sc4-internal's cadence drift gate now holds the
+/// two together.
+pub const CHECKIN_SECS: u64 = 60 * 60;
+/// An armed SECURITY ZONE keeps the old quarter-hour: the keyframe is what carries the position,
+/// and a zone alone buys no heartbeat (owner ruling 2026-09-15).
+pub const CHECKIN_ZONE_SECS: u64 = 15 * 60;
+/// An armed ANCHOR WATCH. Tighter than the zone even though the watch already sends its own 60 s
+/// heartbeat: the heartbeat proves liveness only, and the keyframe is what carries device state.
+pub const CHECKIN_ANCHOR_SECS: u64 = 5 * 60;
+/// 🔴 THE OLDEST FIX A KEYFRAME MAY CARRY — NOT a multiple of the check-in period, deliberately.
+/// This was written `2 * CHECKIN_SECS`, meaning "two check-ins" back when that was 30 minutes.
+/// Taking the idle check-in to an hour would have dragged it to TWO HOURS with it, and a two-hour-
+/// old position would have gone up looking fresh. It is a staleness rule about positions, not about
+/// how often the boat says hello, so it is its own number.
+pub const MAX_KEYFRAME_FIX_AGE_MS: i64 = 30 * 60 * 1000;
 /// The first keyframe after start waits this long, so the first router, valve and GPS reads are in it.
 pub const FIRST_CHECKIN_SECS: u64 = 45;
 /// After a failed keyframe, try again this soon (not the full 15 minutes).
@@ -373,14 +390,58 @@ pub fn valve_measurement_due(last_sent: Option<&ValveSent>, params: &[(String, S
 /// read as fresh). A security zone alone is the idle cadence (owner ruling 2026-09-15), so it keeps the
 /// keep-alive fix.
 pub fn keyframe_carries_fix(g: &geofence::Geofence, leased: bool, fix_age_ms: i64) -> bool {
-    if fix_age_ms > 2 * CHECKIN_SECS as i64 * 1000 {
+    if fix_age_ms > MAX_KEYFRAME_FIX_AGE_MS {
         return false;
     }
     leased || !g.anchor_armed() || g.underway()
 }
 
+/// PURE: seconds until the next keyframe, from the vessel's armed watch. Shortest wins, and they are
+/// already in that order: an anchor watch 5 min, a security zone 15, otherwise the idle hour. A
+/// stood-down watch (`sig: 0`, both rings `None`) is idle, like no watch at all.
+pub fn checkin_interval_secs(watch: Option<&geofence::Watch>) -> u64 {
+    match watch {
+        Some(w) if w.anchor.is_some() => CHECKIN_ANCHOR_SECS,
+        Some(w) if w.zone.is_some() => CHECKIN_ZONE_SECS,
+        _ => CHECKIN_SECS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // ── 0.3.57: the idle keyframe is an hour, and an armed watch shortens it ──────────────────────
+    fn watch_of(anchor: bool, zone: bool) -> geofence::Watch {
+        geofence::Watch {
+            sig: if anchor || zone { 7 } else { 0 },
+            anchor: anchor.then(|| geofence::Circle { lat: 41.0, lon: -81.0, radius_m: 30.0, warn_m: 0.0 }),
+            zone: zone.then(|| geofence::Zone { lat: 41.0, lon: -81.0, radius_m: 100.0, streak: 3 }),
+            hb_secs: 60,
+            sample_secs: 30,
+        }
+    }
+
+    #[test]
+    fn checkin_interval_follows_the_armed_watch() {
+        assert_eq!(checkin_interval_secs(None), 60 * 60, "nothing armed is the idle hour");
+        assert_eq!(checkin_interval_secs(Some(&watch_of(false, false))), 60 * 60, "a stood-down watch is idle");
+        assert_eq!(checkin_interval_secs(Some(&watch_of(false, true))), 15 * 60, "a security zone keeps the quarter-hour");
+        assert_eq!(checkin_interval_secs(Some(&watch_of(true, false))), 5 * 60, "an anchor watch is 5 min");
+        assert_eq!(checkin_interval_secs(Some(&watch_of(true, true))), 5 * 60, "the anchor watch is the tighter of the two");
+    }
+
+    /// 🔴 THE COUPLING THAT WOULD HAVE SHIPPED SILENTLY. The oldest fix a keyframe may carry was
+    /// written `2 * CHECKIN_SECS`. Moving the idle check-in to an hour would have taken it to two
+    /// hours, and a two-hour-old position would have gone up looking fresh.
+    #[test]
+    fn the_stale_fix_rule_did_not_follow_the_check_in_period() {
+        assert_eq!(MAX_KEYFRAME_FIX_AGE_MS, 30 * 60 * 1000, "still half an hour");
+        assert!(
+            MAX_KEYFRAME_FIX_AGE_MS < CHECKIN_SECS as i64 * 1000,
+            "the idle check-in is now LONGER than the stale-fix rule, so the rule must be its own \
+             number and must never be re-expressed as a multiple of CHECKIN_SECS",
+        );
+    }
+
     use super::*;
     use crate::geofence::{Geofence, Sample};
 
@@ -391,14 +452,19 @@ mod tests {
     #[test]
     fn an_armed_hour_inside_the_circle_checks_in_about_twelve_times() {
         // Owner ruling 2026-09-15: heartbeat every 5 min while inside. Every delivered post counts, so
-        // the 4 keyframes in the hour replace the heartbeats they coincide with.
+        // a keyframe replaces the heartbeat it coincides with.
+        //
+        // 0.3.57: an armed anchor watch keyframes every CHECKIN_ANCHOR_SECS — the SAME 5 minutes as
+        // the heartbeat, so the keyframe now does the heartbeat's job and the bare heartbeats all
+        // but vanish. The owner's invariant is unchanged (about 12 check-ins an armed hour); what
+        // changed is that those 12 posts now carry device state instead of only proving liveness.
         let sig = 1757750400000;
         let run = |with_keyframes: bool| {
             let mut c = HeartbeatClock::default();
             let (mut last_ok, mut beats, mut keyframes) = (-1_000_000_000i64, 0, 0);
             for t in 0..3600i64 {
                 let now = t * 1000;
-                if with_keyframes && t % CHECKIN_SECS as i64 == 0 {
+                if with_keyframes && t % CHECKIN_ANCHOR_SECS as i64 == 0 {
                     keyframes += 1;
                     last_ok = now;
                 }
@@ -413,9 +479,12 @@ mod tests {
         let (beats, _) = run(false);
         assert_eq!(beats, 12, "one heartbeat every 5 minutes, the first at once for the new arm");
         let (beats, keyframes) = run(true);
-        assert_eq!(keyframes, 4);
-        assert!((8..=9).contains(&beats), "keyframes count as check-ins, got {beats}");
-        assert!((12..=13).contains(&(beats + keyframes)), "about 12 check-ins an armed hour");
+        assert_eq!(keyframes, 12, "an armed anchor watch keyframes every 5 minutes");
+        // ONE, not zero: a newly armed watch heartbeats at once so the cloud does not wait 5 minutes
+        // for it, and that first beat lands on the same second as the first keyframe. Every later
+        // heartbeat coincides with a keyframe and so is never sent on its own.
+        assert_eq!(beats, 1, "only the new arm's immediate heartbeat is sent on its own");
+        assert!((12..=13).contains(&(beats + keyframes)), "about 12 check-ins an armed hour, unchanged");
         assert_eq!(anchor_heartbeat_secs(true), 60, "a drag in progress beats every 60 s");
     }
 
@@ -740,9 +809,11 @@ mod tests {
             }
         }
         eprintln!("idle docked boat: {sends} sends in 24 h ({keyframes} keyframes)");
-        assert_eq!(keyframes, 96, "one keyframe every 15 minutes");
-        assert!(sends <= 105, "idle traffic must be about 100/day (ruling 100–200), got {sends}");
-        assert!(sends >= 96);
+        // 0.3.57: one keyframe an hour, not four. THIS IS THE SAVING, so it is asserted as a number
+        // and not left to be inferred — an idle boat drops from 96 keyframes a day to 24.
+        assert_eq!(keyframes, 24, "one keyframe an hour");
+        assert!(sends <= 32, "an idle docked boat must be about 30 sends/day now, got {sends}");
+        assert!(sends >= 24, "and never fewer than its keyframes");
     }
 
     #[test]

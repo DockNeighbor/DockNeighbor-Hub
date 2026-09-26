@@ -206,7 +206,9 @@ If the app shows no position from the router, the order to check is: does `/dev/
 ## Behavior
 
 - **Cadence (0.18.0, owner D6 and the 2026-09-15 ruling of ~100-200 hub->cloud updates a day).** One
-  check-in every **15 min** while nobody watches and every **1 min** while the reply carries a watch
+  check-in every **60 min** while nobody watches and nothing is armed — **15 min** with a security
+  zone armed, **5 min** with an anchor watch, since then the check-in is what carries the position —
+  and every **1 min** while the reply carries a watch
   lease (`lease`/`leaseUntil`/`checkinSec`/`live`, flat), sent as a **single**
   `POST /api/agent/batch?...&anchorsig=<sig>` carrying a `hub.checkin` item, the newest modem sample
   **on that same item**, the idle LinkTap readings and anything spooled. The reply answers the lease,
