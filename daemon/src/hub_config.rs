@@ -69,6 +69,12 @@ pub struct HubConfig {
     pub name: String,
     pub enabled: bool,
     pub heartbeat_secs: u32,
+    /// How often the relay sends its NONCE heartbeat, in seconds. 0 = unset ⇒
+    /// `hub_relay::NONCE_PING_DEFAULT_SECS` (900). Owner ruling 2026-09-25, per vessel: "don't need
+    /// that every 2 minutes, should be every 15 more by a setting". Clamped by
+    /// `hub_relay::nonce_ping_every`; the route refuses out-of-range input outright.
+    #[serde(default)]
+    pub nonce_ping_secs: u32,
     /// Per-hub bearer token (agentToken custody). Never returned to the UI in full.
     pub token: String,
     /// Port the management API listens on (hub_server.rs).
@@ -244,6 +250,7 @@ impl Default for HubConfig {
             name: String::new(),
             enabled: false,
             heartbeat_secs: 0,
+            nonce_ping_secs: 0,
             token: String::new(),
             http_port: DEFAULT_HTTP_PORT,
             member_keys: Vec::new(),
@@ -537,7 +544,7 @@ mod tests {
     fn config_round_trips_and_absent_fields_default() {
         let cfg = HubConfig {
             hub_id: "hub_1".into(), vid: "v1".into(), name: "Central".into(),
-            enabled: true, heartbeat_secs: 60, token: "tok".into(),
+            enabled: true, heartbeat_secs: 60, nonce_ping_secs: 0, token: "tok".into(),
             http_port: 9000,
             member_keys: vec![MemberKey { key: "k1".into(), uid: "u1".into(), role: "coowner".into() }],
             member_keys_sig: "a".repeat(64),
@@ -601,7 +608,7 @@ mod tests {
     fn seeded(base: &Path) -> HubConfig {
         let cfg = HubConfig {
             hub_id: "hub_real".into(), vid: "v_real".into(), name: "Central".into(),
-            enabled: true, heartbeat_secs: 60, token: "the-token-that-must-survive".into(),
+            enabled: true, heartbeat_secs: 60, nonce_ping_secs: 0, token: "the-token-that-must-survive".into(),
             ..HubConfig::default()
         };
         write_config_in(base, &cfg).unwrap();

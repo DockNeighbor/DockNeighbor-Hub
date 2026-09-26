@@ -8,8 +8,13 @@
 //
 // Two kinds of frame come down:
 //   * `keys` — the vehicle's member-key set, pushed by the worker. The hub applies it immediately,
-//     so a member who was just added (or a hub that just reconnected) does not wait out the
-//     five-minute HTTP poll. The poll stays as the backstop when the socket is down.
+//     so a member who was just added (or a hub that just reconnected) is let in at once.
+//     ⚠️ THERE IS NO FIVE-MINUTE POLL ANY MORE, and this comment said there was until 2026-09-26.
+//     `key_sync` replaced the unconditional 300 s fetch (288 a day, ~22 worker reads each, for a set
+//     that changes a few times a year): the set now rides the payload reply's `keysSig`, and a fetch
+//     happens only on boot, on a signature mismatch, when the LAN door meets a key it does not know,
+//     or on a 24 h safety refresh. So this push is not a shortcut past a poll — for most hubs on most
+//     days it is the ONLY thing that moves a key set before the daily refresh.
 //   * `call` — one relayed management call, carrying the uid and role the WORKER authenticated.
 //     It goes through the same `dispatch` as a LAN call, so both doors obey identical rules; the
 //     hub re-applies its own role gates rather than trusting that the worker checked.
@@ -396,10 +401,57 @@ const SILENCE_LIMIT: Duration = Duration::from_secs(35);
 ///
 /// Three missed echoes, not one, for the same reason as SILENCE_LIMIT: a single lost frame on a
 /// marina's Wi-Fi is not a dead socket, and reconnecting on every hiccup would be its own outage.
-pub const NONCE_PING_EVERY: Duration = Duration::from_secs(120);
+/// 🔴 CHANGED 2026-09-25 BY THE OWNER, 120 s -> 900 s, AND MADE A PER-VESSEL SETTING. His words:
+/// *"don't need that every 2 minutes, should be every 15 more by a setting"*, on seeing cellular
+/// traffic rise. This is now only the DEFAULT; `nonce_ping_secs` on the hub's config overrides it and
+/// the vessel's synced settings carry it.
+///
+/// ⚠️ WHAT HE WAS TOLD, AND WHAT IT COSTS. Three missed echoes is kept, so detection of a HALF-OPEN
+/// socket goes from ≈6 minutes to ≈45 minutes at the default.
+///
+/// The narrow thing that degrades: a socket the CF edge still answers while the Durable Object behind
+/// it is gone. The 10 s app-ping (PING_EVERY) is unaffected and still catches an ordinary edge RESET
+/// in 10–35 s; only the case the edge can FAKE needs a nonce, because only the object can echo one.
+///
+/// 🔴 AND WHAT DOES **NOT** DEGRADE, which is why 45 minutes is liveable: the relay is the INBOUND
+/// path. Alarms still leave the boat — the hub POSTs those — and the flood shutoff is hub-local, so a
+/// half-open relay never delays closing a valve on a flood. What is delayed is the app reaching the
+/// boat: "no hub took that command" for up to 45 minutes after a half-open, on a failure mode that is
+/// rare since the nonce ping existed at all.
+pub const NONCE_PING_DEFAULT_SECS: u64 = 900;
+/// Floor. Below this the nonce is doing the 10 s app-ping's job at the app-ping's cost, on the link
+/// the owner is trying to quieten — and a nonce ping WAKES the Durable Object, where the app-ping
+/// does not.
+pub const NONCE_PING_MIN_SECS: u64 = 60;
+/// Ceiling. At 3 misses this is already 3 hours to detect a half-open socket; beyond it the check is
+/// not a check. Chosen so the setting cannot be turned into "off" without saying so.
+pub const NONCE_PING_MAX_SECS: u64 = 3600;
 pub const NONCE_MISSES_ALLOWED: u32 = 3;
-/// The silence the nonce heartbeat allows: NONCE_MISSES_ALLOWED intervals.
-pub const NONCE_SILENCE_LIMIT: Duration = Duration::from_secs(NONCE_PING_EVERY.as_secs() * NONCE_MISSES_ALLOWED as u64);
+
+/// PURE: the configured nonce cadence, clamped, with 0/absent meaning "the default".
+///
+/// ⚠️ IT CLAMPS RATHER THAN REFUSING, because this value also arrives from a vessel's SYNCED config,
+/// where there is nobody to hand a 422 to. The route (`do_config`) validates and refuses out-of-range
+/// input so a person typing it gets told; this is the belt for everything that arrives another way.
+/// 0 is "unset" — a vessel that has never chosen gets the default, not a zero-second ping storm.
+pub fn nonce_ping_every(configured_secs: u64) -> Duration {
+    let secs = match configured_secs {
+        0 => NONCE_PING_DEFAULT_SECS,
+        n if n < NONCE_PING_MIN_SECS => NONCE_PING_MIN_SECS,
+        n if n > NONCE_PING_MAX_SECS => NONCE_PING_MAX_SECS,
+        n => n,
+    };
+    Duration::from_secs(secs)
+}
+
+/// PURE: the silence that cadence allows — the 3-miss rule, kept from the 120 s design.
+///
+/// Derived rather than configured: the owner set the CADENCE, and a separately settable tolerance
+/// would let the two drift into a combination nobody chose (a 15-minute ping with a 1-minute
+/// tolerance reconnects on every cycle).
+pub fn nonce_silence_limit(every: Duration) -> Duration {
+    Duration::from_secs(every.as_secs() * NONCE_MISSES_ALLOWED as u64)
+}
 
 /// PURE: has the peer gone silent long enough to call the socket dead?
 ///
@@ -444,7 +496,12 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
 
     // The nonce heartbeat (D15) — a second, slower timer beside the 10 s one. `nonce_echoed` is the
     // back-compat switch: until this worker has echoed once, the nonce limit is not enforced.
-    let mut nonce_ping = tokio::time::interval(NONCE_PING_EVERY);
+    // 🔴 FROM THE VESSEL'S SETTING, AND RE-READ WHILE CONNECTED. The owner made the cadence
+    // per-vessel on 2026-09-25, and a setting that only took effect on the next reconnect would look
+    // broken to whoever just changed it — a relay socket can live for hours. `rt.nonce_ping_secs` is
+    // the live value (do_config writes it); the tick arm below notices a change and rebuilds the timer.
+    let mut nonce_secs = rt.nonce_ping_secs.load(std::sync::atomic::Ordering::Relaxed);
+    let mut nonce_ping = tokio::time::interval(nonce_ping_every(nonce_secs));
     nonce_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     nonce_ping.tick().await;
     let mut nonce_seq: u64 = 0;
@@ -517,10 +574,27 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
                 within(WRITE_TIMEOUT, "ping write", write.send(Message::Text(app_ping_frame()))).await?;
             }
             _ = nonce_ping.tick() => {
+                // Pick up a cadence change made since this socket opened (owner setting, 2026-09-25).
+                // Rebuilt only when it actually moved: recreating an interval every tick would reset
+                // its phase and quietly make the ping fire early forever.
+                let live = rt.nonce_ping_secs.load(std::sync::atomic::Ordering::Relaxed);
+                if live != nonce_secs {
+                    crate::hlog!(
+                        "hub: relay nonce heartbeat {}s -> {}s (vessel setting)",
+                        nonce_ping_every(nonce_secs).as_secs(), nonce_ping_every(live).as_secs()
+                    );
+                    nonce_secs = live;
+                    nonce_ping = tokio::time::interval(nonce_ping_every(nonce_secs));
+                    nonce_ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    nonce_ping.tick().await;
+                }
                 // ⚠️ CHECK BEFORE SENDING, for the same reason as above. This is the check the plain
                 // ping can no longer make: the runtime auto-answers `{"type":"ping"}` without the
                 // object, so only a matching nonce echo says the object is still there.
-                if nonce_is_silent(nonce_echoed, last_nonce_echo.elapsed(), NONCE_SILENCE_LIMIT) {
+                // The tolerance follows the cadence (the 3-miss rule), so it is derived here rather
+                // than captured once — otherwise a cadence change mid-connection would be policed by
+                // the OLD limit, which is the combination nobody chose.
+                if nonce_is_silent(nonce_echoed, last_nonce_echo.elapsed(), nonce_silence_limit(nonce_ping_every(nonce_secs))) {
                     return Err(format!(
                         "the relay object stopped echoing nonce pings for {}s - treating the socket as dead and reconnecting",
                         last_nonce_echo.elapsed().as_secs()
@@ -637,15 +711,46 @@ mod tests {
         assert_eq!(parse_worker_message(r#"{"type":"pong"}"#), Some(WorkerMessage::Pong { n: None }), "the auto-response's pong");
 
         // The rule the select! arm applies, and the back-compat switch inside it.
-        let limit = NONCE_SILENCE_LIMIT;
+        let limit = nonce_silence_limit(nonce_ping_every(0));
         assert!(!nonce_is_silent(false, Duration::from_secs(86_400), limit), "a worker that never echoed is never held to it");
         assert!(!nonce_is_silent(true, limit, limit), "exactly at the limit is still alive");
         assert!(nonce_is_silent(true, limit + Duration::from_secs(1), limit));
-        // The cadence pair, stated: three missed echoes, ~3 minutes to notice a half-open socket.
-        assert_eq!(NONCE_PING_EVERY, Duration::from_secs(120));
+        // The cadence pair, stated: three missed echoes, ~45 minutes at the owner's default.
+        assert_eq!(NONCE_PING_DEFAULT_SECS, 900);
         assert_eq!(NONCE_MISSES_ALLOWED, 3);
-        assert_eq!(NONCE_SILENCE_LIMIT, NONCE_PING_EVERY * NONCE_MISSES_ALLOWED, "the limit IS the misses, not a second number");
-        assert!(NONCE_SILENCE_LIMIT > NONCE_PING_EVERY, "one lost frame is not a dead socket");
+        assert_eq!(limit, Duration::from_secs(2700), "15 min x 3 misses");
+        assert!(limit > nonce_ping_every(0), "one lost frame is not a dead socket");
+    }
+
+    #[test]
+    fn the_nonce_cadence_is_the_owners_setting_clamped() {
+        // 🔴 OWNER RULING 2026-09-25: "don't need that every 2 minutes, should be every 15 more by a
+        // setting". 0 means unset, NOT a zero-second ping storm — a vessel that has never chosen gets
+        // the default, and that is the value most hubs will run.
+        assert_eq!(nonce_ping_every(0), Duration::from_secs(900));
+        assert_eq!(nonce_ping_every(900), Duration::from_secs(900));
+        // A chosen value inside the range is honoured exactly.
+        assert_eq!(nonce_ping_every(300), Duration::from_secs(300));
+        assert_eq!(nonce_ping_every(3600), Duration::from_secs(3600));
+        // ⚠️ CLAMPED, NOT REFUSED, because this also arrives from a SYNCED vessel config where there
+        // is nobody to hand a 422 to. The route refuses out-of-range input so a person is told.
+        assert_eq!(nonce_ping_every(1), Duration::from_secs(NONCE_PING_MIN_SECS), "below the floor");
+        assert_eq!(nonce_ping_every(86_400), Duration::from_secs(NONCE_PING_MAX_SECS), "above the ceiling");
+        // The bounds themselves, stated once: a nonce ping WAKES the Durable Object, so the floor is
+        // about cost as much as sense; the ceiling is where 3 misses stops being a check at all.
+        assert_eq!((NONCE_PING_MIN_SECS, NONCE_PING_MAX_SECS), (60, 3600));
+        assert!(NONCE_PING_MIN_SECS < NONCE_PING_DEFAULT_SECS && NONCE_PING_DEFAULT_SECS < NONCE_PING_MAX_SECS);
+    }
+
+    #[test]
+    fn the_tolerance_follows_the_cadence_rather_than_being_its_own_number() {
+        // If these could be set apart, a 15-minute ping with a 1-minute tolerance would reconnect on
+        // every single cycle — a combination nobody would choose but nothing would forbid.
+        for secs in [60u64, 120, 900, 3600] {
+            let every = nonce_ping_every(secs);
+            assert_eq!(nonce_silence_limit(every), every * NONCE_MISSES_ALLOWED);
+            assert!(nonce_silence_limit(every) > every, "{secs}s: one lost frame must not be fatal");
+        }
     }
 
     #[test]
