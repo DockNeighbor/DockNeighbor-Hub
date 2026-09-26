@@ -8,8 +8,13 @@
 //
 // Two kinds of frame come down:
 //   * `keys` — the vehicle's member-key set, pushed by the worker. The hub applies it immediately,
-//     so a member who was just added (or a hub that just reconnected) does not wait out the
-//     five-minute HTTP poll. The poll stays as the backstop when the socket is down.
+//     so a member who was just added (or a hub that just reconnected) is let in at once.
+//     ⚠️ THERE IS NO FIVE-MINUTE POLL ANY MORE, and this comment said there was until 2026-09-26.
+//     `key_sync` replaced the unconditional 300 s fetch (288 a day, ~22 worker reads each, for a set
+//     that changes a few times a year): the set now rides the payload reply's `keysSig`, and a fetch
+//     happens only on boot, on a signature mismatch, when the LAN door meets a key it does not know,
+//     or on a 24 h safety refresh. So this push is not a shortcut past a poll — for most hubs on most
+//     days it is the ONLY thing that moves a key set before the daily refresh.
 //   * `call` — one relayed management call, carrying the uid and role the WORKER authenticated.
 //     It goes through the same `dispatch` as a LAN call, so both doors obey identical rules; the
 //     hub re-applies its own role gates rather than trusting that the worker checked.

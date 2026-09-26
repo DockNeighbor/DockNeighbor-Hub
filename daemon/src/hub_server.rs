@@ -24,8 +24,11 @@
 // response, and reqwest errors are stringified with `without_url()` because check-in/sync URLs
 // carry that token in `t=`.
 //
-// The WebSocket to the worker (remote-control relay + live key pushes) is a later increment; the
-// sync loop's cadence is the revocation latency until it lands.
+// ⚠️ BOTH HALVES OF THIS ARE NOW DONE, and this comment described them as pending until 2026-09-26.
+// The WebSocket to the worker exists (hub_relay: remote-control relay AND live key pushes), so
+// revocation no longer waits on a poll — and the poll it referred to is itself gone: key_sync ties
+// the fetch to the reply's `keysSig` instead of a fixed cadence. Revocation latency is now "the next
+// push, or the next payload reply", not a sync-loop interval.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
