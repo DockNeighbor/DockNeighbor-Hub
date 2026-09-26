@@ -2854,6 +2854,21 @@ async fn drive_closes(
                         "linktap: {id} - the valve reports CLOSED ({} close confirmed after {} attempt(s))",
                         w.cause.as_str(), w.attempts
                     );
+                    // 🔴 AND IF HE WAS ALREADY TOLD IT HAD FAILED, CORRECT IT. Owner ruling
+                    // 2026-09-25. Only when `alerted` — a close confirmed before the alert point is
+                    // the ordinary healthy case and says nothing to anybody.
+                    if w.alerted {
+                        crate::hlog!(
+                            "linktap: {id} - ...which corrects the alert sent at {}s; telling the owner",
+                            sched.alert_at_ms / 1000
+                        );
+                        report_event(rt, &crate::linktap_runtime::Report {
+                            token: None,
+                            device: format!("lt_{id}"),
+                            event: crate::close_watch::CLOSE_CONFIRMED_LATE_EVENT.into(),
+                            params: crate::close_watch::unconfirmed_params(&w, now),
+                        }).await;
+                    }
                 }
             }
             CloseStep::Wait => {
@@ -6697,6 +6712,18 @@ mod tests {
     }
 
     /// Every `linktap.valve.close_unconfirmed` the hub delivered, with its params.
+    /// How many "the valve shut in the end" notices went out. Counted rather than collected: the
+    /// question this answers is almost always "was it exactly one, or none".
+    fn late_close_notices(posts: &BatchPosts) -> usize {
+        let mut n = 0;
+        for (_, body) in posts.lock().unwrap().iter() {
+            for it in body["items"].as_array().cloned().unwrap_or_default() {
+                if it["event"] == crate::close_watch::CLOSE_CONFIRMED_LATE_EVENT { n += 1; }
+            }
+        }
+        n
+    }
+
     fn unconfirmed_alerts(posts: &BatchPosts) -> Vec<HashMap<String, String>> {
         let mut out = Vec::new();
         for (_, body) in posts.lock().unwrap().iter() {
@@ -6771,6 +6798,54 @@ mod tests {
         assert!(rt.valve_closes.lock().await.is_empty(), "a confirmed close is finished");
         assert_eq!(stops.load(Ordering::SeqCst), 1, "a valve that shut must not be told again");
         assert!(unconfirmed_alerts(&posts).is_empty(), "nothing failed, so nobody is woken");
+        // 🔴 AND NO "Valve closed" EITHER. That notice exists only to CORRECT a failure notice, so a
+        // close confirmed before the alert point must send nothing. Without the `alerted` gate this
+        // would fire on every healthy close in the fleet — which is the whole reason it is asserted
+        // on the HEALTHY test rather than only on the failing one.
+        assert_eq!(late_close_notices(&posts), 0, "a close that never alerted has nothing to correct");
+    }
+
+    #[tokio::test]
+    async fn a_valve_that_shuts_after_the_owner_was_told_it_had_not_sends_the_correction() {
+        use std::sync::atomic::Ordering;
+        // 🔴 THE WINDOW THE OWNER'S SPLIT CREATED (2026-09-25): told at the alert point, still trying
+        // to the deadline — so a valve CAN shut in between, and until this the last thing he was told
+        // would stay "water may still be running" while the water was off.
+        let (rt, stops, watering, posts) = closing_rt("close_late").await;
+        watering.store(true, Ordering::SeqCst);
+
+        linktap_flood_stop_all(&rt).await;
+        // ⚠️ STOP INSIDE THE WINDOW, NOT AT ITS END. This drove 400 ms — FAST_CLOSE's `give_up_ms`
+        // exactly — so the watch gave up on the same tick the valve was meant to shut late, and the
+        // correction had nothing left to correct with. The test failed for a timing reason that looked
+        // like a missing feature. 250 ms is past `alert_at_ms` (200) with room before give-up (400).
+        run_closes(&rt, 250).await;
+        drain_reports(&rt).await;
+        assert_eq!(unconfirmed_alerts(&posts).len(), 1, "he is told first, or there is nothing to correct");
+        assert_eq!(late_close_notices(&posts), 0, "…and not corrected while the valve is still open");
+        // 🔴 THE PRECONDITION THIS TEST QUIETLY DEPENDS ON, now asserted. Everything below is about a
+        // valve that shuts WHILE THE HUB IS STILL TRYING; if the watch has already ended, the rest
+        // passes or fails for reasons that have nothing to do with the correction. Assert the
+        // relationship — inside the window — rather than trusting two constants to stay apart.
+        assert!(
+            !rt.valve_closes.lock().await.is_empty(),
+            "the hub must still be retrying here (told at {} ms, gives up at {} ms) — otherwise this \
+             test is not exercising the window the owner's split created",
+            FAST_CLOSE.alert_at_ms, FAST_CLOSE.give_up_ms,
+        );
+
+        // Now it shuts, of its own accord, after he has been told it did not.
+        watering.store(false, Ordering::SeqCst);
+        run_closes(&rt, 100).await;
+        drain_reports(&rt).await;
+        assert_eq!(late_close_notices(&posts), 1, "the correction goes out");
+        assert!(rt.valve_closes.lock().await.is_empty(), "and the sequence is over");
+
+        // Exactly once: the watch is gone, so a later pass has nothing to act on.
+        run_closes(&rt, 100).await;
+        drain_reports(&rt).await;
+        assert_eq!(late_close_notices(&posts), 1, "not sent twice");
+        let _ = stops;
     }
 
     #[tokio::test]

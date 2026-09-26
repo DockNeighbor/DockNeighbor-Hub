@@ -26,7 +26,7 @@
 # told to update and WHEN (staged rollout). The previous hub-lite is kept and automatically restored
 # if the new one cannot even report its own version.
 
-HUB_LITE_VERSION="0.18.9"
+HUB_LITE_VERSION="0.18.10"
 # Self-update under a watchdog (0.18.3): see self_update. Every path overridable for hub-lite/test.sh.
 HUB_LITE_BACKUP="${BRVG_HUB_LITE_BACKUP:-/etc/brvg-hub-lite.prev.tgz}"   # every file of the running hub-lite
 HUB_LITE_LEGACY_BACKUP="/etc/brvg-hub-lite.prev"                      # the single-script backup before 0.18.3
@@ -2549,6 +2549,17 @@ LT_CLOSE_GIVE_UP="${LT_CLOSE_GIVE_UP:-1800}"
 # as never-pushed telemetry). See the daemon's constant for the full reasoning.
 LT_CLOSE_UNCONFIRMED_EVENT="linktap.valve.close_unconfirmed"
 
+# 🔴 THE VALVE SHUT IN THE END — the correction to a close the owner was already told had failed.
+# Owner ruling 2026-09-25 ("Yes: 'Valve closed'"). Emitted ONLY on a confirmed close whose record
+# already had CL_ALERTED=1: a close confirmed before the alert point is the ordinary healthy case and
+# tells nobody anything. Without that gate this would fire on every healthy close in the fleet.
+#
+# ⚠️ Same cross-repo contract as the event above (daemon close_watch::CLOSE_CONFIRMED_LATE_EVENT, the
+# worker's HUB_VALVE_CLOSE_CONFIRMED_LATE_EVENT which holds the approved wording), and the same
+# one-letter margin: it does NOT contain `closed`, which the worker's security rule claims. Do not
+# tidy this to `closed_late`.
+LT_CLOSE_LATE_EVENT="linktap.valve.close_confirmed_late"
+
 # PURE: the run mark a close of this cause leaves, so the end classifies as what the hub DID.
 lt_close_end_reason() { case "$1" in flood) echo flood_shutoff ;; *) echo "$1" ;; esac; }
 
@@ -2756,6 +2767,12 @@ lt_drive_closes() {
       confirmed)
         rm -f "$_dc_f"
         log "linktap: ${_dc_d} - the valve reports CLOSED (${_dc_cause} close confirmed after ${_dc_tries} attempt(s))"
+        # 🔴 AND IF HE WAS ALREADY TOLD IT HAD FAILED, CORRECT IT (owner 2026-09-25). Only when the
+        # record says we spoke; an ordinary confirmed close stays silent.
+        if [ "${_dc_alerted:-0}" = "1" ]; then
+          log "linktap: ${_dc_d} - ...which corrects the alert sent at ${LT_CLOSE_ALERT_AT}s; telling the owner"
+          lt_spool "lt_${_dc_d}" "$LT_CLOSE_LATE_EVENT" "cause=${_dc_cause}&attempts=${_dc_tries}&secs=$(( _dc_now - _dc_first ))"
+        fi
         ;;
       wait)
         _dc_look=$(lt_close_next_look "$_dc_first" "$_dc_last" "$_dc_tries" "$_dc_now" "$_dc_alerted")

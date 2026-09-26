@@ -1411,6 +1411,30 @@ drive 30 30; drive 0 30
 check "close: a valve that shuts mid-retry ends the sequence there" "no $_mid" \
   "$([ -f "$T/lt2/close.$DEV" ] && echo yes || echo no) $(cmd7s)"
 check "close: …with no alert, because it closed" "0" "$(grep -c "$LT_CLOSE_UNCONFIRMED_EVENT" "$T/spool2")"
+# …and no "Valve closed" either: that notice exists only to CORRECT an alert, and none was sent.
+check "close: …and no late \"Valve closed\", because there was nothing to correct" "0" \
+  "$(grep -c "$LT_CLOSE_LATE_EVENT" "$T/spool2")"
+
+# 🔴 THE VALVE SHUT AFTER HE WAS TOLD IT HAD NOT — the owner's 2026-09-25 "Yes: 'Valve closed'".
+# The gate is CL_ALERTED: this fires only when the failure notice actually went out. Without that gate
+# it would fire on every healthy close in the fleet, which is why the case above is asserted too.
+rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
+lt_write_state "$T/lt2/$DEV" watering $(( $(date +%s) - 60 )) "" normal 86400 10 hub 0 0
+printf '{"is_watering":1,"volume":20}' > "$SHIM_CMD3"
+tick '{"is_watering":1,"volume":20}'
+drive 30            # alert-at defaults to 0, so the owner is told on this pass
+check "late: the failure notice went out first" "1" "$(grep -c "$LT_CLOSE_UNCONFIRMED_EVENT" "$T/spool2")"
+check "late: and the record remembers we spoke" "1" "$(. "$T/lt2/close.$DEV"; echo "${CL_ALERTED:-0}")"
+printf '{"is_watering":0,"volume":20}' > "$SHIM_CMD3"
+drive 30
+check "late: the valve shutting afterwards sends \"Valve closed\"" "1" \
+  "$(grep -c "$LT_CLOSE_LATE_EVENT" "$T/spool2")"
+check "late: it names the cause, like the failure it corrects" "1" \
+  "$(grep -c "$LT_CLOSE_LATE_EVENT.*cause=volume_cap" "$T/spool2")"
+check "late: and the sequence is over" "no" "$([ -f "$T/lt2/close.$DEV" ] && echo yes || echo no)"
+# Exactly once — a second pass has no record left to act on.
+drive 30
+check "late: not sent twice" "1" "$(grep -c "$LT_CLOSE_LATE_EVENT" "$T/spool2")"
 
 # ⚠️ THE GUARD IS THE SLOT, NOT THE CALLER'S MANNERS — and the ONE exception is a flood.
 rm -f "$T/lt2/close.$DEV"; : > "$T/spool2"
