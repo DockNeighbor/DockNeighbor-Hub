@@ -6780,10 +6780,24 @@ mod tests {
         watering.store(true, Ordering::SeqCst);
 
         linktap_flood_stop_all(&rt).await;
-        run_closes(&rt, 400).await;
+        // ⚠️ STOP INSIDE THE WINDOW, NOT AT ITS END. This drove 400 ms — FAST_CLOSE's `give_up_ms`
+        // exactly — so the watch gave up on the same tick the valve was meant to shut late, and the
+        // correction had nothing left to correct with. The test failed for a timing reason that looked
+        // like a missing feature. 250 ms is past `alert_at_ms` (200) with room before give-up (400).
+        run_closes(&rt, 250).await;
         drain_reports(&rt).await;
         assert_eq!(unconfirmed_alerts(&posts).len(), 1, "he is told first, or there is nothing to correct");
         assert_eq!(late_close_notices(&posts), 0, "…and not corrected while the valve is still open");
+        // 🔴 THE PRECONDITION THIS TEST QUIETLY DEPENDS ON, now asserted. Everything below is about a
+        // valve that shuts WHILE THE HUB IS STILL TRYING; if the watch has already ended, the rest
+        // passes or fails for reasons that have nothing to do with the correction. Assert the
+        // relationship — inside the window — rather than trusting two constants to stay apart.
+        assert!(
+            !rt.valve_closes.lock().await.is_empty(),
+            "the hub must still be retrying here (told at {} ms, gives up at {} ms) — otherwise this \
+             test is not exercising the window the owner's split created",
+            FAST_CLOSE.alert_at_ms, FAST_CLOSE.give_up_ms,
+        );
 
         // Now it shuts, of its own accord, after he has been told it did not.
         watering.store(false, Ordering::SeqCst);
