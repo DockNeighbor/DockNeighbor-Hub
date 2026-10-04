@@ -287,6 +287,21 @@ pub struct Rt {
     pub store: tokio::sync::Mutex<()>,
     pub started: Instant,
     pub worker_base: String,
+    /// ONE HTTP client for the hot paths, built once.
+    ///
+    /// 🔴 EVERY SHELLY FORWARD USED TO BUILD ITS OWN. `send_shelly_once` called `http_client()`
+    /// inline, so each reading got an empty connection pool, an empty TLS session cache and a
+    /// freshly parsed root store — a full TLS handshake per forward, and `drain_shelly` serialises
+    /// them behind one lock, so they could not even overlap.
+    ///
+    /// Measured on the station bench (SenseCAP M2, 580 MHz MIPS 24KEc, doc 22 Part 1): a cold
+    /// handshake is ~280 ms against ~35 ms resumed, and the per-forward client capped the box at
+    /// roughly 3 forwards/s — about 100 devices, where a shared client reaches ~250. It is not a
+    /// MIPS problem: every hub pays the same handshake in CPU, latency and cellular bytes on a link
+    /// the customer is billed for.
+    ///
+    /// `reqwest::Client` is an Arc inside, so cloning is free and sharing is the intended use.
+    pub http: reqwest::Client,
     /// Bumped on every valve observation, and watched by local apps.
     ///
     /// 🔴 WHY A NOTIFIER AND NOT A FASTER POLL. Owner ruling 2026-08-31: *"The hub and the app,
@@ -489,6 +504,7 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         store: tokio::sync::Mutex::new(()),
         started: Instant::now(),
         worker_base,
+        http: http_client(),
         linktap: tokio::sync::Mutex::new(None),
         valve_closes: tokio::sync::Mutex::new(HashMap::new()),
         valve_rev: tokio::sync::watch::channel(0u64).0,
@@ -3583,7 +3599,7 @@ async fn send_shelly_once(rt: &Rt, call: &ShellyCall) -> ForwardOutcome {
     }
     // The secret goes on LAST and is never logged — the url is not printed anywhere below.
     u.query_pairs_mut().append_pair("k", &cfg.shelly_secret);
-    match http_client().get(u).send().await {
+    match rt.http.get(u).send().await {
         Err(e) => ForwardOutcome::Retry(format!("failed to send: {}", e.without_url())),
         Ok(res) => classify_forward(res.status().as_u16(), &call.device),
     }
@@ -5695,6 +5711,65 @@ mod tests {
 
     /// A stub worker that records every `/api/agent/batch` post (query + body) and answers `reply`.
     type BatchPosts = Arc<std::sync::Mutex<Vec<(HashMap<String, String>, serde_json::Value)>>>;
+
+    /// A raw HTTP/1.1 stub that COUNTS TCP CONNECTIONS, with keep-alive. Returns (base, accepts).
+    ///
+    /// Not axum: the thing under test is whether the hub reuses a connection, and an HTTP framework
+    /// hides exactly that. This accepts by hand and answers every request on the same socket, so the
+    /// accept count IS the number of TLS/TCP setups a real cloud would have paid for.
+    async fn counting_http_stub() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = accepts.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                seen.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    // Answer every request on THIS socket until the peer goes away.
+                    while let Ok(n) = sock.read(&mut buf).await {
+                        if n == 0 { return; }
+                        if sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.is_err() { return; }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), accepts)
+    }
+
+    #[tokio::test]
+    async fn shelly_forwards_reuse_one_connection() {
+        // 🔴 EVERY FORWARD USED TO BUILD ITS OWN reqwest::Client — empty pool, empty TLS session
+        // cache, root store parsed again — and drain_shelly serialises them, so they could not even
+        // overlap. Measured on the station bench (doc 22 Part 1): ~280 ms cold vs ~35 ms resumed,
+        // capping the M2 near 3 forwards/s. This is the assertion that keeps the client shared.
+        let (base, accepts) = counting_http_stub().await;
+        let mut cfg = seeded_cfg();
+        cfg.shelly_secret = "s3cr3t".into();
+        let b = temp_base("shelly_pool");
+        hub_config::write_config_in(&b, &cfg).unwrap();
+        let rt = new_rt(b, base);
+        for i in 0..5 {
+            rt.pending_shelly.lock().await.push_back(QueuedShelly {
+                call: ShellyCall {
+                    vid: "v1".into(),
+                    event: "temp.measurement".into(),
+                    device: format!("sh_{i}"),
+                    k: "s3cr3t".into(),
+                    extras: vec![("temp".into(), "21.5".into())],
+                },
+                queued_ms: now_ms(),
+                attempts: 0,
+            });
+        }
+        drain_shelly(&rt).await;
+        assert!(rt.pending_shelly.lock().await.is_empty(), "all five forwarded");
+        let n = accepts.load(Ordering::SeqCst);
+        assert_eq!(n, 1, "five forwards must share ONE connection, not open {n}");
+    }
 
     async fn stub_batch_worker(reply: serde_json::Value) -> (String, BatchPosts) {
         let posts: BatchPosts = Arc::new(std::sync::Mutex::new(Vec::new()));
