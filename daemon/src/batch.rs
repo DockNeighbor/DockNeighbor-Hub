@@ -141,7 +141,19 @@ pub fn split(items: Vec<Item>) -> Vec<Vec<Item>> {
 }
 
 /// PURE: the batch URL. The only place the hub token meets a batch URL.
-pub fn batch_url(worker_base: &str, vid: &str, hub_id: &str, token: &str, ack: Option<&str>, anchorsig: u64) -> Result<String, String> {
+///
+/// `relay` opts in to the `relayUp` reply field (DockNeighbor-Cloud #551, deployed 2026-09-26).
+/// Sending `relay=1` is what makes the worker answer whether it actually holds a socket for this
+/// vessel; omit it and the reply is byte-identical to what every older hub receives.
+pub fn batch_url(
+    worker_base: &str,
+    vid: &str,
+    hub_id: &str,
+    token: &str,
+    ack: Option<&str>,
+    anchorsig: u64,
+    relay: bool,
+) -> Result<String, String> {
     let base = worker_base.trim_end_matches('/');
     let mut u = url::Url::parse(&format!("{base}/api/agent/batch")).map_err(|e| e.to_string())?;
     u.query_pairs_mut().append_pair("vid", vid).append_pair("device", hub_id).append_pair("t", token);
@@ -149,7 +161,42 @@ pub fn batch_url(worker_base: &str, vid: &str, hub_id: &str, token: &str, ack: O
         u.query_pairs_mut().append_pair("ack", a);
     }
     u.query_pairs_mut().append_pair("anchorsig", &anchorsig.to_string());
+    if relay {
+        u.query_pairs_mut().append_pair("relay", "1");
+    }
     Ok(u.to_string())
+}
+
+/// PURE: `relayUp` off a batch reply — does the WORKER believe it holds a live relay socket for us?
+///
+/// 🔴 THE ONLY END THAT CAN ANSWER THIS HONESTLY. A hibernating Durable Object's control PINGs are
+/// answered by the Cloudflare EDGE, so this hub can log `relay connected` for hours against a socket
+/// the worker does not have — the outage of 2026-08-31 and again 2026-09-09. Our own nonce ping
+/// (hub_relay.rs) catches it from this end, but only on the nonce's clock; this is the worker saying
+/// it outright on a request we were making anyway.
+///
+/// `None` when the field is absent: an older worker, or a reply to a request that did not opt in.
+/// Absent is NOT "no socket" — inferring a teardown from a missing field would make every
+/// pre-#551 worker drop this hub's socket on every check-in.
+/// PURE: should this reply make the hub drop its relay socket and reconnect?
+///
+/// Both halves matter, and each has cost an outage somewhere in this system's history:
+///   * `relayUp: 0` — the worker holds no socket for us. Absent means an older worker or a
+///     non-opted-in request and must change nothing (see `relay_up`).
+///   * THE GENERATION IS UNCHANGED — we have not reconnected between asking and reading. The
+///     worker answered as it wrote the reply; if the relay task has since opened a new socket,
+///     that 0 is about a socket that no longer exists, and acting on it would tear down a healthy
+///     one. Assert the relationship, not the value.
+pub fn should_drop_relay(reply: &Value, gen_before: u64, gen_now: u64) -> bool {
+    relay_up(reply) == Some(false) && gen_before == gen_now
+}
+
+pub fn relay_up(reply: &Value) -> Option<bool> {
+    match reply.get("relayUp")? {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => n.as_i64().map(|v| v != 0),
+        _ => None,
+    }
 }
 
 /// The `hub.status` item: `{name, ver, platform, update?, anchorsig}`.
@@ -638,7 +685,7 @@ mod tests {
 
     #[test]
     fn the_debug_line_never_prints_the_hub_token_or_a_secret_param() {
-        let url = batch_url("https://api.example.com", "v1", "hub_1", "hubtok-SECRET", Some("c1"), 7).unwrap();
+        let url = batch_url("https://api.example.com", "v1", "hub_1", "hubtok-SECRET", Some("c1"), 7, false).unwrap();
         let mut body = envelope(Kind::Keyframe, None, "b", &[router_item("r", &[("up".into(), "1".into())], 5)], "0.3.53");
         body["items"][0]["params"]["apiToken"] = json!("agt-SECRET");
         body["items"][0]["params"]["password"] = json!("pw-SECRET");
@@ -651,12 +698,62 @@ mod tests {
 
     #[test]
     fn the_batch_url_carries_the_hub_identity_ack_and_anchorsig() {
-        let u = url::Url::parse(&batch_url("https://api.example.com/", "v1", "hub_1", "tok", Some("c1,c2"), 1234).unwrap()).unwrap();
+        let u = url::Url::parse(&batch_url("https://api.example.com/", "v1", "hub_1", "tok", Some("c1,c2"), 1234, false).unwrap()).unwrap();
         assert_eq!(u.path(), "/api/agent/batch");
         let q: std::collections::HashMap<String, String> = u.query_pairs().into_owned().collect();
         assert_eq!((q["vid"].as_str(), q["device"].as_str(), q["t"].as_str()), ("v1", "hub_1", "tok"));
         assert_eq!((q["ack"].as_str(), q["anchorsig"].as_str()), ("c1,c2", "1234"));
-        let u = batch_url("https://api.example.com", "v1", "hub_1", "tok", Some(""), 0).unwrap();
+        let u = batch_url("https://api.example.com", "v1", "hub_1", "tok", Some(""), 0, false).unwrap();
         assert!(!u.contains("ack="));
     }
+    // ── item D: the `relay=1` opt-in and the `relayUp` answer ────────────────────────────────────
+    #[test]
+    fn the_relay_opt_in_is_sent_only_when_asked_for() {
+        // Off: byte-identical to the URL every older hub sends. This is what lets the worker keep
+        // answering old hubs unchanged, so it must be provable, not assumed.
+        let off = batch_url("https://api.example.com", "v1", "hub_1", "tok", None, 3, false).unwrap();
+        assert!(!off.contains("relay="), "no opt-in unless asked: {off}");
+        let on = batch_url("https://api.example.com", "v1", "hub_1", "tok", None, 3, true).unwrap();
+        let u = url::Url::parse(&on).unwrap();
+        let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+        assert_eq!(q.get("relay").map(String::as_str), Some("1"));
+        // and it must not have disturbed anything else
+        assert_eq!(q.get("anchorsig").map(String::as_str), Some("3"));
+        assert_eq!(q.get("device").map(String::as_str), Some("hub_1"));
+    }
+
+    #[test]
+    fn a_stale_relay_up_zero_does_not_drop_a_socket_we_reconnected_after_asking() {
+        use serde_json::json;
+        let zero = json!({"relayUp": 0});
+        // The ordinary case: same socket throughout, the worker says it has none. Drop it.
+        assert!(should_drop_relay(&zero, 7, 7));
+        // 🔴 THE RACE. The relay task reconnected between our asking and our reading, so the
+        // worker's 0 describes a socket that no longer exists. Dropping the new, healthy one
+        // because of it would make this feature an outage generator rather than a cure.
+        assert!(!should_drop_relay(&zero, 7, 8), "a generation change means it is not our socket");
+        assert!(!should_drop_relay(&zero, 7, 9), "however many reconnects happened");
+        // And the other two answers are never a drop, whatever the generation did.
+        assert!(!should_drop_relay(&json!({"relayUp": 1}), 7, 7));
+        assert!(!should_drop_relay(&json!({"status": "ok"}), 7, 7), "absent is not 'no socket'");
+        assert!(!should_drop_relay(&json!({"status": "ok"}), 7, 8));
+    }
+
+    #[test]
+    fn relay_up_reads_both_shapes_and_treats_absent_as_unknown() {
+        use serde_json::json;
+        assert_eq!(relay_up(&json!({"relayUp": 0})), Some(false));
+        assert_eq!(relay_up(&json!({"relayUp": 1})), Some(true));
+        // The worker sends a flat integer today; tolerate a bool rather than silently reading it as
+        // absent if that ever changes.
+        assert_eq!(relay_up(&json!({"relayUp": false})), Some(false));
+        assert_eq!(relay_up(&json!({"relayUp": true})), Some(true));
+        // 🔴 ABSENT IS NOT "NO SOCKET". An older worker, or a reply to a request that did not opt in,
+        // carries no field — and reading that as false would make every pre-#551 worker tell this
+        // hub to drop a perfectly good socket on every single check-in.
+        assert_eq!(relay_up(&json!({"status": "ok"})), None);
+        assert_eq!(relay_up(&json!({"relayUp": "0"})), None, "a string is not the contract");
+        assert_eq!(relay_up(&serde_json::Value::Null), None);
+    }
+
 }

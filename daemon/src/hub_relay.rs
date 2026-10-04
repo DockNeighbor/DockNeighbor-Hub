@@ -480,6 +480,9 @@ pub fn nonce_is_silent(echoed: bool, since_last_echo: Duration, limit: Duration)
 async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
     let url = relay_socket_url(&rt.worker_base, cfg)?;
     let socket = connect(&url, CONNECT_TIMEOUT).await?;
+    // A new socket: bump the generation BEFORE anything can read it, so a check-in that overlapped
+    // this connect sees the change and discards its stale `relayUp: 0` (hub_server.rs post_batch).
+    rt.relay_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     crate::hlog!("hub: relay connected");
     // Split so the ping timer can write while the read half is parked on `next()`. Without this the
     // two borrows collide and the whole liveness check is impossible to express.
@@ -511,6 +514,14 @@ async fn serve_once(rt: &Shared, cfg: &HubConfig) -> Result<(), String> {
 
     loop {
         tokio::select! {
+            // The worker told a check-in it holds no socket for us (Cloud #551 `relayUp: 0`). Our
+            // end believes this socket is fine — that is exactly the half-open case — so end it and
+            // let `run` reconnect. Ok(()) so it is treated as a clean close, not a failure: nothing
+            // is wrong with this hub, and a failure would push out the backoff.
+            _ = rt.relay_drop.notified() => {
+                crate::hlog!("hub: dropping the relay socket at the cloud's word; reconnecting");
+                return Ok(());
+            }
             frame = read.next() => {
                 let Some(frame) = frame else { return Ok(()) }; // the stream ended cleanly
                 let frame = frame.map_err(|e| e.to_string())?;
