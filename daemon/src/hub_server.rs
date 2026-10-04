@@ -330,6 +330,8 @@ pub struct Rt {
     /// relay task may already have noticed and reconnected on its own. Acting on that stale 0 would
     /// tear down a healthy, brand-new socket — turning a diagnostic into an outage generator. So the
     /// check-in records this counter before it posts and only drops the socket if it has not moved.
+    /// The worker has advertised `heardAgo: 1` on a batch reply (batch::heard_ago_supported).
+    pub heard_ago_ok: std::sync::atomic::AtomicBool,
     pub relay_gen: std::sync::atomic::AtomicU64,
     /// Ask the relay task to drop its socket and reconnect (see relay_gen).
     pub relay_drop: tokio::sync::Notify,
@@ -447,7 +449,14 @@ pub struct Telemetry {
     /// Per `lt_<dev>`: what the cloud last received for the valve.
     pub valve_sent: HashMap<String, cadence::ValveSent>,
     /// Per Shelly id: the last telemetry event name and every reading param seen, merged.
-    pub shelly_latest: HashMap<String, (String, Vec<(String, String)>)>,
+    /// device -> its last complete reading, resent on every keyframe.
+    ///
+    /// 🔴 `heard_ms` IS THE WHOLE POINT OF THE THIRD FIELD. This map is never evicted, and the
+    /// keyframe pushes every entry unconditionally, so without an age the cloud stamped each
+    /// resent reading "heard now" — and a sensor that died weeks ago read ALIVE for as long as its
+    /// hub kept running. The cloud has carried the receiving half since agentBatch.ts
+    /// (`heardAgoS`, `heardAtOf`, a 7-day clamp); nothing ever sent it.
+    pub shelly_latest: HashMap<String, ShellyCached>,
     /// Per `<shelly id>|<param>`.
     pub reading_gates: HashMap<String, cadence::ReadingGate>,
 }
@@ -493,6 +502,7 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         web: tokio::sync::RwLock::new(web),
         web_ui_disabled: std::sync::atomic::AtomicBool::new(web_ui_disabled),
         nonce_ping_secs: std::sync::atomic::AtomicU64::new(nonce_ping_secs),
+        heard_ago_ok: std::sync::atomic::AtomicBool::new(false),
         relay_gen: std::sync::atomic::AtomicU64::new(0),
         relay_drop: tokio::sync::Notify::new(),
         keys: tokio::sync::RwLock::new(keys),
@@ -1997,6 +2007,15 @@ async fn checkin_loop(rt: Shared) {
     }
 }
 
+/// One device's last complete reading, with WHEN the device was last heard from.
+#[derive(Clone, Debug)]
+pub struct ShellyCached {
+    pub event: String,
+    pub params: Vec<(String, String)>,
+    /// Hub clock, ms. Sent as an AGE (`batch::heard_ago_s`), never as a timestamp.
+    pub heard_ms: i64,
+}
+
 /// What a keyframe item, once delivered, makes "last sent".
 #[derive(Clone, Debug)]
 enum SentMark {
@@ -2041,16 +2060,25 @@ async fn build_keyframe(rt: &Rt, cfg: &HubConfig, update: Option<&str>) -> Vec<(
             out.push((batch::gps_fix_item(dev, fix, sig), vec![SentMark::Gps { device: dev.clone(), lat: fix.lat, lon: fix.lon }]));
         }
     }
-    type ShellyLatest<'a> = (&'a String, &'a (String, Vec<(String, String)>));
-    let mut shellys: Vec<ShellyLatest> = t.shelly_latest.iter().collect();
+    let mut shellys: Vec<(&String, &ShellyCached)> = t.shelly_latest.iter().collect();
     shellys.sort_by(|a, b| a.0.cmp(b.0));
-    for (dev, (event, params)) in shellys {
-        let marks = params
+    // Only once the worker has said it understands the param — an older one would store it as a
+    // READING and show the owner a `heardAgoS` field on their thermometer.
+    let send_age = rt.heard_ago_ok.load(Ordering::SeqCst);
+    for (dev, c) in shellys {
+        let marks = c
+            .params
             .iter()
             .filter(|(k, _)| matches!(k.as_str(), "v" | "tC" | "rh"))
             .filter_map(|(k, v)| v.parse::<f64>().ok().map(|value| SentMark::Reading { key: format!("{dev}|{k}"), value }))
             .collect();
-        out.push((batch::Item { device: dev.clone(), event: event.clone(), params: params.clone() }, marks));
+        let mut params = c.params.clone();
+        // 🔴 THE AGE IS WHAT MAKES A RESENT READING HONEST. Without it the cloud stamps this
+        // "heard now" and a dead sensor never looks dead.
+        if send_age && c.heard_ms > 0 {
+            params.push((batch::HEARD_AGO_PARAM.to_string(), batch::heard_ago_s(now, c.heard_ms).to_string()));
+        }
+        out.push((batch::Item { device: dev.clone(), event: c.event.clone(), params }, marks));
     }
     out
 }
@@ -2158,6 +2186,9 @@ async fn post_batch(
                 // `relayUp: 0` — the worker holds no socket for this vessel, whatever our end thinks.
                 // Absent means an older worker or a reply that predates the opt-in; absent is never
                 // "no socket" (batch::relay_up).
+                if batch::heard_ago_supported(&reply) && !rt.heard_ago_ok.swap(true, Ordering::SeqCst) {
+                    crate::hlog!("hub: the cloud understands heardAgoS - resent readings now carry their age");
+                }
                 let relay_gen_now = rt.relay_gen.load(Ordering::SeqCst);
                 if batch::should_drop_relay(&reply, relay_gen_before, relay_gen_now) {
                     crate::hlog!("hub: the cloud holds no relay socket for us - dropping ours and reconnecting");
@@ -3513,12 +3544,17 @@ async fn forward_shelly_to_cloud(rt: &Rt, call: &ShellyCall) {
 async fn shelly_reading_due(rt: &Rt, call: &ShellyCall) -> bool {
     let is_leased = leased(rt);
     let mut t = rt.telemetry.lock().await;
-    let entry = t.shelly_latest.entry(call.device.clone()).or_insert_with(|| (call.event.clone(), Vec::new()));
-    entry.0 = call.event.clone();
+    let entry = t
+        .shelly_latest
+        .entry(call.device.clone())
+        .or_insert_with(|| ShellyCached { event: call.event.clone(), params: Vec::new(), heard_ms: 0 });
+    // Heard NOW: this is the device reporting, which is the only thing that moves the age.
+    entry.heard_ms = now_ms();
+    entry.event = call.event.clone();
     for (k, v) in &call.extras {
-        match entry.1.iter_mut().find(|(ek, _)| ek == k) {
+        match entry.params.iter_mut().find(|(ek, _)| ek == k) {
             Some(slot) => slot.1 = v.clone(),
-            None => entry.1.push((k.clone(), v.clone())),
+            None => entry.params.push((k.clone(), v.clone())),
         }
     }
     let (kind, key) = cadence::reading_kind(&call.event);
@@ -6056,6 +6092,62 @@ mod tests {
         assert!(!crate::update_gate::skipped(&list, "0.3.60"), "a later release is still offered");
     }
 
+    // ── heardAgoS: a resent reading carries its AGE ─────────────────────────────────────────────
+    /// Find a device's item in the most recent post, and its heardAgoS if it carried one.
+    fn item_age(posts: &BatchPosts, device: &str) -> (bool, Option<i64>) {
+        let p = posts.lock().unwrap();
+        let (_, body) = p.last().expect("a post");
+        for it in body["items"].as_array().unwrap() {
+            if it["device"] == device {
+                let a = it["params"]["heardAgoS"].as_str().and_then(|v| v.parse::<i64>().ok());
+                return (true, a);
+            }
+        }
+        (false, None)
+    }
+
+    #[tokio::test]
+    async fn a_resent_reading_carries_its_age_so_a_dead_sensor_stops_looking_alive() {
+        // 🔴 THE BUG THIS CLOSES. `shelly_latest` is never evicted and the keyframe resends every
+        // entry, so without an age the cloud stamps each one "heard now" — a sensor that died weeks
+        // ago reads ALIVE for as long as its hub keeps running. The cloud has carried the receiving
+        // half (agentBatch.ts heardAtOf) since before this; nothing ever sent the age.
+        let (worker, posts) = stub_batch_worker(serde_json::json!({ "status": "ok", "heardAgo": 1 })).await;
+        let base = temp_base("heard_ago");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, worker);
+        // A sensor heard from two hours ago, and one heard from just now.
+        {
+            let mut t = rt.telemetry.lock().await;
+            t.shelly_latest.insert("sh_old".into(), ShellyCached {
+                event: "temp.measurement".into(),
+                params: vec![("tC".into(), "4.0".into())],
+                heard_ms: now_ms() - 2 * 3600 * 1000,
+            });
+            t.shelly_latest.insert("sh_now".into(), ShellyCached {
+                event: "temp.measurement".into(),
+                params: vec![("tC".into(), "21.0".into())],
+                heard_ms: now_ms(),
+            });
+        }
+        let cfg = hub_config::read_config_in(&rt.base);
+
+        // FIRST check-in: the hub has not yet seen the capability, so it sends no ages. That is the
+        // gate working — the capability arrives ON this reply.
+        checkin_once(&rt, &http_client(), &cfg).await.unwrap();
+        assert_eq!(item_age(&posts, "sh_old"), (true, None), "no age before the worker asked for one");
+        assert!(rt.heard_ago_ok.load(Ordering::SeqCst), "and the reply turned it on");
+
+        // SECOND check-in: now the ages ride along.
+        checkin_once(&rt, &http_client(), &cfg).await.unwrap();
+        let (present, age) = item_age(&posts, "sh_old");
+        assert!(present, "the dead sensor is still resent — that part was never the bug");
+        let age = age.expect("and now it carries its age");
+        assert!((7150..=7250).contains(&age), "about two hours, got {age}s");
+        let (_, fresh) = item_age(&posts, "sh_now");
+        assert!(fresh.expect("the live one too") <= 5, "a sensor heard just now reads ~0");
+    }
+
     #[tokio::test]
     async fn the_keyframe_check_in_is_one_batch_with_the_hub_status_and_acts_on_the_reply() {
         // H1: the retired `hub.measurement` GET is now a `hub.status` item on the consolidated keyframe,
@@ -7339,7 +7431,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(hits.lock().unwrap().is_empty(), "a held reading must not reach the cloud");
-        assert_eq!(rt.telemetry.lock().await.shelly_latest["sh_salon"].1, vec![("tC".to_string(), "21.4".to_string())]);
+        assert_eq!(rt.telemetry.lock().await.shelly_latest["sh_salon"].params, vec![("tC".to_string(), "21.4".to_string())]);
         // …while a member is watching, readings go as they arrive — through the same door as before.
         dispatch(&rt, &Caller { uid: "u".into(), role: "monitor".into() }, "POST", "/api/hub/watch", b"").await;
         let r = c.get(format!("{origin}/api/hub/shelly?vid=v1&event=temperature.change&device=sh_salon&k=s3cr3t&tC=21.5"))
