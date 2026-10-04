@@ -167,6 +167,30 @@ pub fn batch_url(
     Ok(u.to_string())
 }
 
+/// The param the hub attaches to a RESENT cached reading: whole seconds since the DEVICE was last
+/// heard from. Mirrors DockNeighbor-Cloud `agentBatch.ts` HEARD_AGO_PARAM / HEARD_AGO_MAX_S.
+pub const HEARD_AGO_PARAM: &str = "heardAgoS";
+/// Clamp. A week-old "last heard" is already past every alarm window, and an unbounded number
+/// invites a drifted clock to write nonsense into `deviceSeen`.
+pub const HEARD_AGO_MAX_S: i64 = 7 * 24 * 3600;
+
+/// PURE: the age to send for a reading last heard at `heard_ms`, clamped to a week.
+///
+/// 🔴 AN AGE, NOT A TIMESTAMP, ON PURPOSE. The cloud turns it into "heard at" on ITS clock, so a hub
+/// whose clock has drifted — a boat that booted without NTP, which is most of them — cannot poison
+/// `deviceSeen` with a time from the future or the last century.
+pub fn heard_ago_s(now_ms: i64, heard_ms: i64) -> i64 {
+    ((now_ms - heard_ms).max(0) / 1000).min(HEARD_AGO_MAX_S)
+}
+
+/// PURE: does this reply say the worker understands `heardAgoS`? (`heardAgo: 1`.)
+///
+/// Gated because an older worker would store the param as if it were a READING — a `heardAgoS`
+/// field on a temperature sensor, shown to the owner.
+pub fn heard_ago_supported(reply: &Value) -> bool {
+    reply.get("heardAgo").and_then(|v| v.as_i64()).is_some_and(|v| v >= 1)
+}
+
 /// PURE: `relayUp` off a batch reply — does the WORKER believe it holds a live relay socket for us?
 ///
 /// 🔴 THE ONLY END THAT CAN ANSWER THIS HONESTLY. A hibernating Durable Object's control PINGs are
@@ -737,6 +761,34 @@ mod tests {
         assert!(!should_drop_relay(&json!({"relayUp": 1}), 7, 7));
         assert!(!should_drop_relay(&json!({"status": "ok"}), 7, 7), "absent is not 'no socket'");
         assert!(!should_drop_relay(&json!({"status": "ok"}), 7, 8));
+    }
+
+    #[test]
+    fn the_age_is_clamped_and_never_negative() {
+        // Ordinary case: whole seconds.
+        assert_eq!(heard_ago_s(100_000, 40_000), 60);
+        assert_eq!(heard_ago_s(100_000, 100_000), 0);
+        // 🔴 A HUB CLOCK THAT WENT BACKWARDS MUST NOT SEND A NEGATIVE AGE. Boats boot without NTP
+        // and jump when it lands; the cloud would turn a negative into a "heard at" in the FUTURE,
+        // and a device heard in the future is never stale.
+        assert_eq!(heard_ago_s(100_000, 500_000), 0, "clock skew reads as 'just now', never negative");
+        // Clamped at a week: past every alarm window, and an unbounded number is a drifted clock
+        // writing nonsense into deviceSeen.
+        assert_eq!(heard_ago_s(400 * 24 * 3600 * 1000, 0), HEARD_AGO_MAX_S);
+        assert_eq!(HEARD_AGO_MAX_S, 604_800, "7 days, matching the worker's clamp");
+    }
+
+    #[test]
+    fn the_age_is_sent_only_to_a_worker_that_asked_for_it() {
+        use serde_json::json;
+        assert!(heard_ago_supported(&json!({"heardAgo": 1})));
+        assert!(heard_ago_supported(&json!({"heardAgo": 2})), "a later capability still counts");
+        // 🔴 AN OLDER WORKER MUST NEVER SEE IT. It would store `heardAgoS` as a READING — the owner
+        // would get a "heardAgoS" field on their thermometer.
+        assert!(!heard_ago_supported(&json!({"status": "ok"})), "absent means no");
+        assert!(!heard_ago_supported(&json!({"heardAgo": 0})));
+        assert!(!heard_ago_supported(&json!({"heardAgo": "1"})), "a string is not the contract");
+        assert_eq!(HEARD_AGO_PARAM, "heardAgoS");
     }
 
     #[test]
