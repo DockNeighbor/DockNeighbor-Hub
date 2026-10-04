@@ -235,9 +235,76 @@ pub fn parse_marker(text: &str) -> Option<Probation> {
     Some(Probation { from, to, deadline_ms })
 }
 
+// ── the files the wiring keeps (paths only; the decisions above stay pure) ───────────────────────
+
+/// Where the probation marker lives. Beside the hub's other state, not beside the binary: the
+/// binary's directory may be read-only (a macOS .app, a packaged install), and a marker that could
+/// not be written would silently turn the rollback off.
+pub fn probation_path(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("update.probation")
+}
+
+/// Versions this machine has rolled back. Feeds `UpdateConditions::offer_was_rolled_back`, so the
+/// gate never re-offers a version that already failed here.
+///
+/// 🔴 WITHOUT THIS A ROLLBACK IS A LOOP, not a fix. The hub rolls back to the good version, the
+/// update check sees the bad one is still "latest", and installs it again — for ever, on a schedule.
+/// hub-lite learned this the same way and keeps the same list (HUB_LITE_SKIP).
+pub fn skip_path(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("update.skip")
+}
+
+/// PURE: is `version` in a skip list? One version per line; blanks and `#` comments ignored.
+pub fn skipped(list: &str, version: &str) -> bool {
+    list.lines().map(str::trim).any(|l| !l.is_empty() && !l.starts_with('#') && l == version)
+}
+
+/// PURE: the skip list with `version` added, if it is not already there. Returns None when it is —
+/// so the caller can skip the write rather than rewriting a file on every pass.
+pub fn with_skipped(list: &str, version: &str) -> Option<String> {
+    if skipped(list, version) {
+        return None;
+    }
+    let mut out = list.trim_end().to_string();
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(version);
+    out.push('\n');
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the skip list: what stops a rollback becoming a loop ────────────────────────────────────
+    #[test]
+    fn the_skip_list_reads_and_grows_without_duplicating() {
+        assert!(!skipped("", "0.3.58"));
+        assert!(skipped("0.3.58\n", "0.3.58"));
+        assert!(skipped("# rolled back here\n0.3.58\n0.3.59\n", "0.3.59"));
+        assert!(!skipped("# 0.3.58\n", "0.3.58"), "a comment naming it is not an entry");
+        assert!(!skipped("0.3.580\n", "0.3.58"), "a prefix is not a match");
+        // Growing it
+        assert_eq!(with_skipped("", "0.3.58").as_deref(), Some("0.3.58\n"));
+        assert_eq!(with_skipped("0.3.57\n", "0.3.58").as_deref(), Some("0.3.57\n0.3.58\n"));
+        // 🔴 ALREADY THERE ⇒ NO REWRITE. This runs on every update check; rewriting the file each
+        // pass would be a needless flash write every six hours for the life of the hub.
+        assert_eq!(with_skipped("0.3.58\n", "0.3.58"), None);
+        // A file without a trailing newline must not join two versions into one line.
+        assert_eq!(with_skipped("0.3.57", "0.3.58").as_deref(), Some("0.3.57\n0.3.58\n"));
+    }
+
+    #[test]
+    fn the_probation_and_skip_files_sit_beside_the_hub_state_not_the_binary() {
+        // The binary's directory may be read-only (a packaged install, a macOS .app). A marker that
+        // could not be written would silently turn the rollback off.
+        let base = std::path::Path::new("/var/lib/brvg-hub");
+        assert_eq!(probation_path(base), base.join("update.probation"));
+        assert_eq!(skip_path(base), base.join("update.skip"));
+    }
+
 
     const T0: i64 = 1_790_000_000_000;
 
