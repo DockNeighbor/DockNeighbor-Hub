@@ -164,6 +164,9 @@ pub fn batch_url(
     if relay {
         u.query_pairs_mut().append_pair("relay", "1");
     }
+    // Opt in to the owner's automatic-update switch (Cloud #584). Always asked for: the hub needs
+    // the answer before it may install anything, and an older worker simply omits the field.
+    u.query_pairs_mut().append_pair("autoupd", "1");
     Ok(u.to_string())
 }
 
@@ -202,6 +205,20 @@ pub fn heard_ago_supported(reply: &Value) -> bool {
 /// `None` when the field is absent: an older worker, or a reply to a request that did not opt in.
 /// Absent is NOT "no socket" — inferring a teardown from a missing field would make every
 /// pre-#551 worker drop this hub's socket on every check-in.
+/// PURE: the owner's automatic-update switch off a batch reply (`autoUpdate`, Cloud #584).
+///
+/// `None` when the field is absent — an older worker, or no reply yet. **Absent is NOT "off" and not
+/// "on"**: it is *unknown*, and `update_gate::may_update_known` refuses on unknown. Reading silence
+/// as consent would update a boat whose owner opted out; reading it as refusal would make the
+/// feature quietly never work.
+pub fn auto_update(reply: &Value) -> Option<bool> {
+    match reply.get("autoUpdate")? {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => n.as_i64().map(|v| v != 0),
+        _ => None,
+    }
+}
+
 /// PURE: should this reply make the hub drop its relay socket and reconnect?
 ///
 /// Both halves matter, and each has cost an outage somewhere in this system's history:

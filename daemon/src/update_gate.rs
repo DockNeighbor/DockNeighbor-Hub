@@ -41,6 +41,11 @@ pub enum Blocked {
     VersionRolledBack,
     /// The hub cannot tell its own local time, so it cannot know whether the window is open.
     LocalTimeUnknown,
+    /// 🔴 THE OWNER'S SWITCH HAS NOT REACHED THIS HUB YET. The cloud carries it on the batch reply
+    /// (`autoUpdate`, Cloud #584), and a hub that has not had a reply since boot — or is talking to
+    /// a worker that predates the field — does not know whether this vessel opted out. Treating
+    /// silence as consent would auto-update a boat whose owner had turned it off.
+    PolicyUnknown,
 }
 
 impl Blocked {
@@ -54,6 +59,7 @@ impl Blocked {
             Blocked::CycleRunning => "a watering cycle is running",
             Blocked::VersionRolledBack => "this version was rolled back here before",
             Blocked::LocalTimeUnknown => "the hub does not know its local time",
+            Blocked::PolicyUnknown => "the vessel's automatic-update setting has not reached this hub yet",
         }
     }
 }
@@ -125,6 +131,13 @@ pub struct UpdateConditions {
 /// ORDER IS DELIBERATE — the cheapest and most owner-visible reasons first, so the hub log says
 /// "automatic updates are off" rather than "outside the quiet window" for a vessel that opted out.
 /// After that, the physical-safety rules, which are the ones that must never be skipped.
+pub fn may_update_known(p: Option<&UpdatePolicy>, c: &UpdateConditions) -> Result<(), Blocked> {
+    match p {
+        None => Err(Blocked::PolicyUnknown),
+        Some(p) => may_update(p, c),
+    }
+}
+
 pub fn may_update(p: &UpdatePolicy, c: &UpdateConditions) -> Result<(), Blocked> {
     if !p.enabled {
         return Err(Blocked::OwnerDisabled);
@@ -277,6 +290,42 @@ pub fn with_skipped(list: &str, version: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── silence is not consent ──────────────────────────────────────────────────────────────────
+    #[test]
+    fn a_hub_that_has_not_been_told_does_not_update() {
+        // 🔴 BOTH WRONG READINGS ARE REAL FAILURES. Treating "never told" as ON auto-updates a boat
+        // whose owner opted out; treating it as OFF makes the feature quietly never work on any
+        // vessel. It is UNKNOWN, and unknown blocks — the same rule as LocalTimeUnknown.
+        let open = UpdateConditions { local_hour: Some(3), ..UpdateConditions::default() };
+        assert_eq!(may_update_known(None, &open), Err(Blocked::PolicyUnknown));
+        // Told ON, in the window, nothing happening: the one case that installs.
+        assert_eq!(may_update_known(Some(&UpdatePolicy::default()), &open), Ok(()));
+        // Told OFF is a refusal that names the owner, not the clock.
+        let off = UpdatePolicy { enabled: false, ..UpdatePolicy::default() };
+        assert_eq!(may_update_known(Some(&off), &open), Err(Blocked::OwnerDisabled));
+        assert!(Blocked::PolicyUnknown.as_str().contains("has not reached this hub"));
+    }
+
+    #[test]
+    fn the_physical_rules_outrank_the_owners_switch_being_on() {
+        // In the window, told ON — and still refused, one reason at a time. These are the rules that
+        // stop a boat restarting mid-alarm, so they must not be reachable only by luck of ordering.
+        let base = UpdateConditions { local_hour: Some(3), ..UpdateConditions::default() };
+        let p = UpdatePolicy::default();
+        for (c, want) in [
+            (UpdateConditions { alarm_active: true, ..base }, Blocked::AlarmActive),
+            (UpdateConditions { valve_closing: true, ..base }, Blocked::ValveClosing),
+            (UpdateConditions { cycle_running: true, ..base }, Blocked::CycleRunning),
+            (UpdateConditions { armed: true, ..base }, Blocked::WatchArmed),
+            (UpdateConditions { local_hour: Some(13), ..base }, Blocked::NotQuietYet),
+            (UpdateConditions { local_hour: None, ..base }, Blocked::LocalTimeUnknown),
+        ] {
+            assert_eq!(may_update_known(Some(&p), &c), Err(want), "{c:?}");
+        }
+    }
+
+
 
     // ── the skip list: what stops a rollback becoming a loop ────────────────────────────────────
     #[test]
