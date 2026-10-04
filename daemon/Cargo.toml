@@ -56,7 +56,7 @@ axum = "0.8.4"
 url = "2"
 # rustls everywhere TLS is needed — no native TLS stack, matching the app's choice and for the
 # same reason: one vetted TLS story across every artifact we ship.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 # `alloc` is for `future::join_all` — the router poll reads every due router CONCURRENTLY, so one
 # router hanging on its 30 s deadline cannot delay, or lock-step the failure of, the others (D6).
@@ -83,6 +83,13 @@ bytes = "1"
 # rather than whatever is newest: proven beats current for a component the Windows half of which
 # nobody here can compile.
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+# `blocking` ONLY where something uses it. The tray polls the daemon from a background thread with
+# `reqwest::blocking` (src/bin/tray.rs), and that whole file is `cfg(any(windows, macos))` — on Linux
+# its `main` is a stub. The feature was nonetheless enabled unconditionally, so every Linux build
+# compiled reqwest's blocking client, and its second runtime, for no caller at all. That is dead
+# weight in the shipped linux-x64/arm64 binaries today, and it matters far more for the station's
+# lite profile (R59) on a 128 MB MIPS router with no swap.
+reqwest = { version = "0.12", default-features = false, features = ["blocking"] }
 tray-icon = "0.24"
 tao = "0.35"
 notify-rust = "4.18"
