@@ -525,8 +525,24 @@ pub fn is_flood_shutoff(event: &str) -> bool {
 /// hiccup produces an offline and then an online seconds apart, and the first version of this (in
 /// the cloud, off the LinkTap webhook) pushed on every single blip, so the owner got a stream of
 /// "gateway disconnected" notices about a gateway that was fine. The owner set the window at
-/// "30 min plus" — the same number the cloud's `linktapConnectivity.ts::GATEWAY_OFFLINE_GRACE_MS`
-/// carries, deliberately, so the two debounces cannot disagree about what counts as an outage.
+/// "30 min plus". This USED to say it was the same number as the cloud's
+/// `linktapConnectivity.ts::GATEWAY_OFFLINE_GRACE_MS`, "so the two debounces cannot disagree".
+///
+/// ⚠️ THAT IS NO LONGER TRUE, AND THE TWO ARE NOT COMPARABLE ANYWAY (corrected 2026-10-02). Neither
+/// that file nor that constant exists in DockNeighbor-Cloud. The cloud now judges the gateway as
+/// "just another device" (owner, 2026-08-19) in `connectivitySweep.ts`: `DEFAULT_OFFLINE_MINS` 120,
+/// a floor of 120, user-tunable per vessel from Settings → Notifications and capped at 7 days.
+///
+/// They are deliberately NOT the same number, because they do not measure the same thing:
+///   * HERE, 30 min of no HTTP answer from the gateway on the LAN. The hub is the only observer of
+///     that, and it is the real "your gateway is unreachable".
+///   * THERE, 120 min of the gateway's `sensorState` document not being updated — which is a
+///     function of whether the HUB is reporting at all, not of the gateway. A hub that is powered
+///     off produces that alert with a perfectly healthy gateway.
+///
+/// So do not "reconcile" them and do not gate them as equal: an equality check here would assert a
+/// relationship that does not exist. If the cloud's gateway debounce ever becomes a fixed number
+/// that this one is meant to match, THEN it earns a drift check (sc4-internal scripts/).
 ///
 /// Putting it on the hub rather than the cloud is what makes it work at all now: the hub is the
 /// only observer, and an outage report that has to survive a WAN round trip to be debounced is one
@@ -879,8 +895,13 @@ mod tests {
 
     #[test]
     fn the_grace_window_is_the_owners_thirty_minutes() {
-        // Provenance, pinned: owner "30 min plus", the same number the cloud's
-        // linktapConnectivity.ts carries. Changing it here silently diverges the two debounces.
+        // Provenance, pinned: the owner's "30 min plus".
+        //
+        // ⚠️ NOT "the same number the cloud carries" — this comment used to say that, and it was
+        // wrong on both counts: the cloud file it named is gone, and the cloud judges the gateway on
+        // the user-tunable 120-minute DEVICE threshold (connectivitySweep.ts), which measures
+        // whether the HUB is reporting rather than whether the gateway answers. See the constant's
+        // own doc comment. This test pins the OWNER'S number, not a cross-tier equality.
         assert_eq!(GATEWAY_OFFLINE_GRACE_SECS, 1_800);
     }
 
