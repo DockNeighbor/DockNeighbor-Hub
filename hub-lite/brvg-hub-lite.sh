@@ -839,7 +839,18 @@ collect_gps() {
       # the point: a router with no GPS antenna port answers the AT read forever with "no fix",
       # so the dongle has to be tried even when the modem is present and healthy.
       _fix=""
-      if [ "$(detect_platform)" = "glinet" ]; then
+      # 🔴 THE PREDICATE IS THE AT PORT, NOT THE VENDOR (DN-OS session, 2026-10-05). This read
+      # `detect_platform() = glinet`, which is true only where /etc/glversion or /etc/gl-metadata
+      # exists — i.e. on GL.iNet's OWN firmware. A GL-X750 FLASHED TO DOCKNEIGHBOR OS has neither
+      # (they belong to the vendor image; handoff/read-glinet.sh reads glversion before the flash,
+      # not after), so on the platform we are standardising on, `auto` silently skipped the EC25's
+      # GNSS and fell straight through to a USB dongle — and a boat with no dongle had no position
+      # at all, which is precisely the silence that cost us a day on MVP.
+      #
+      # The honest precondition for an AT read is an AT port. `at_cmd` already guards on exactly
+      # this (`[ -c "$AT_PORT" ] || return 1`), as does collect_modem, so this now matches the rest
+      # of the file and works for any modem on any vendor's image.
+      if [ -c "$AT_PORT" ]; then
         _fix=$(gps_from_at)
       fi
       if [ -z "$_fix" ]; then _fix=$(gps_from_nmea "$(read_nmea_raw)"); fi

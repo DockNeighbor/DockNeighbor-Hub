@@ -1596,6 +1596,34 @@ check "cradlepoint: unset port is HTTPS on 443 (daemon default)" "https://192.16
 check "cradlepoint: 443 is https" "https://h" "$(cradlepoint_base h 443)"
 check "cradlepoint: 80 is http" "http://h" "$(cradlepoint_base h 80)"
 check "cradlepoint: any other port is http with the port" "http://h:8080" "$(cradlepoint_base h 8080)"
+# 🔴 GPS_SOURCE=auto MUST TRY THE MODEM WHEREVER THERE IS AN AT PORT (DN-OS session finding,
+# 2026-10-05). This was gated on detect_platform() = "glinet", true only on GL.iNet's OWN firmware
+# (/etc/glversion, /etc/gl-metadata) — so a GL-X750 flashed to DockNeighbor OS, which has neither,
+# silently skipped its EC25's GNSS and fell through to a USB dongle it may not have. /dev/null is a
+# character device, so it stands in for a present AT port without needing root to mknod.
+( GPS_SOURCE=auto; AT_PORT=/dev/null
+  gps_from_at()   { echo "FROM_AT"; }
+  gps_from_nmea() { echo "FROM_NMEA"; }
+  read_nmea_raw() { echo ""; }
+  gps_from_gpsd() { echo "FROM_GPSD"; }
+  check "gps auto: an AT port present means the modem is tried first" "FROM_AT" "$(collect_gps)" )
+
+( GPS_SOURCE=auto; AT_PORT=/definitely/not/a/device
+  gps_from_at()   { echo "FROM_AT"; }
+  gps_from_nmea() { echo "FROM_NMEA"; }
+  read_nmea_raw() { echo ""; }
+  gps_from_gpsd() { echo "FROM_GPSD"; }
+  check "gps auto: no AT port falls through to the dongle" "FROM_NMEA" "$(collect_gps)" )
+
+# And the vendor is NOT the predicate any more: a box with an AT port and no GL.iNet marker still
+# tries the modem. PLATFORM is forced to generic to stand in for DockNeighbor OS.
+( GPS_SOURCE=auto; AT_PORT=/dev/null; PLATFORM=generic
+  gps_from_at()   { echo "FROM_AT"; }
+  gps_from_nmea() { echo "FROM_NMEA"; }
+  read_nmea_raw() { echo ""; }
+  gps_from_gpsd() { echo "FROM_GPSD"; }
+  check "gps auto: DockNeighbor OS (not glinet) still tries the modem" "FROM_AT" "$(collect_gps)" )
+
 ( CRADLEPOINT_HOST=192.168.0.1; CRADLEPOINT_PORT=""; curl() { echo "$*" > "$T/cp"; }; read_gps_cradlepoint )
 check "cradlepoint: the https poll passes -k (NCOS self-signs on the LAN)" "1" "$(grep -c -- '-k .*https://192.168.0.1/api/status/gps' "$T/cp")"
 vn() { if version_newer "$1" "$2"; then echo yes; else echo no; fi; }
