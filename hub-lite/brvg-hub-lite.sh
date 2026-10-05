@@ -3528,8 +3528,12 @@ linktap_tick() {
 # The daemon asks GitHub for its latest tag; a hub-lite asks the feed it would actually update from,
 # so "update available" can never name a version self_update cannot install. The index is a few
 # hundred bytes; `opkg update` would also refresh every OpenWrt feed on a metered link, so it is not
-# used for looking. Every 6 hours, like the daemon.
-UPDATE_CHECK_SECS=21600
+# used for looking. WEEKLY, like the daemon (owner ruling, Jonathan 2026-10-05) — it was every 6 h.
+# The index itself is cheap here; what this saves on a router is the TLS handshake, which is 85-90%
+# of hub-lite's traffic because every request is its own curl (sc4-internal docs/METERED-MODE-SPEC).
+# As on the daemon, a week is not the delivery latency for an urgent release: `self_update` is a
+# command the cloud can queue, and this poll is only the routine unattended path.
+UPDATE_CHECK_SECS=604800
 
 # PURE: is dotted version $1 strictly newer than $2? Numeric per component; a missing component is 0.
 version_newer() {
