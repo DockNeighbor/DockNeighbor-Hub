@@ -190,6 +190,19 @@ pub struct Snapshot {
     pub gps_supported: Option<GpsSupport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<FixOut>,
+    /// 🔴 DID THIS POLL ASK THIS ROUTER FOR A POSITION, AND WHAT CAME BACK?
+    /// `Some(true)` a usable fix; `Some(false)` the router ANSWERED and had none; `None` we did not
+    /// ask or could not tell — GPS off in its config, no `gps_dev_id`, the router said it has none,
+    /// or the read itself failed. ABSENT IS NOT ZERO: `0` is a positive assertion that the router is
+    /// reachable and has no lock, which is the state that was silent until now (MVP, 2026-10-04 —
+    /// the Cradlepoint stayed up and healthy while its GNSS stopped, and nothing anywhere said so).
+    /// Reset to `None` at the top of every poll so a stale `1` can never be carried into a failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gps_fix_ok: Option<bool>,
+    /// Epoch ms of the last poll that got a usable position out of this router's GNSS. Carried
+    /// across polls (the whole snapshot is), so "no lock" can be reported with an age.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apn: Option<ApnConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -631,16 +644,32 @@ pub fn identity_params(snap: Option<&Snapshot>) -> Vec<(String, String)> {
 }
 
 pub fn report_params(snap: &Snapshot, wan_kb_delta: Option<u64>) -> Option<Vec<(String, String)>> {
-    if let Some(m) = &snap.modem {
-        return Some(modem_params(m, snap.wan.as_ref(), snap.probe.as_ref(), wan_kb_delta));
+    let mut p = if let Some(m) = &snap.modem {
+        modem_params(m, snap.wan.as_ref(), snap.probe.as_ref(), wan_kb_delta)
+    } else if let (Some(d), Some(w)) = (&snap.dish, &snap.wan) {
+        dish_params(d, w, snap.probe.as_ref())
+    } else if let Some(w) = &snap.wan {
+        wan_params(w, snap.probe.as_ref())
+    } else {
+        return None;
+    };
+    push_gps_health(&mut p, snap);
+    Some(p)
+}
+
+/// "ROUTER UP, NO GPS FIX" — the signal that was missing (Cloud #586, App #964).
+///
+/// `gpsFix` is STATE, so it is stored and an unchanged value writes nothing: an outage costs exactly
+/// two row-writes, the 1→0 and the 0→1. `gpsFixAgeS` is LIVE-ONLY (batch::MODEM_LIVE_ONLY) because
+/// it changes on every poll by construction — as STATE it would make every GPS router's reading
+/// differ every keyframe and defeat the cloud's unchanged-reading suppression, which is the same
+/// trap documented beside `atMs`.
+fn push_gps_health(p: &mut Vec<(String, String)>, snap: &Snapshot) {
+    let Some(ok) = snap.gps_fix_ok else { return }; // not asked / could not tell ⇒ ABSENT, never 0
+    p.push(("gpsFix".to_string(), if ok { "1" } else { "0" }.to_string()));
+    if let Some(at) = snap.fix_at_ms {
+        p.push(("gpsFixAgeS".to_string(), ((snap.at_ms - at).max(0) / 1000).to_string()));
     }
-    if let (Some(d), Some(w)) = (&snap.dish, &snap.wan) {
-        return Some(dish_params(d, w, snap.probe.as_ref()));
-    }
-    if let Some(w) = &snap.wan {
-        return Some(wan_params(w, snap.probe.as_ref()));
-    }
-    None
 }
 
 /// PURE: the plan-burn delta between two lifetime counters, in KB. None when there is no earlier
@@ -1062,6 +1091,21 @@ fn unsupported(vendor: &str, what: &str) -> String {
     format!("{what} is not supported on a {vendor} through the hub — use the device's own app or admin pages")
 }
 
+/// PURE: the "last usable fix" stamp after a poll — `now` when this poll got one, otherwise the
+/// previous stamp UNCHANGED.
+///
+/// 🔴 A POLL WITH NO FIX MUST NOT RESTAMP. `gpsFixAgeS` is the answer to "how long has this router
+/// been without a lock", so restamping on a lockless poll would pin the age near zero for ever and
+/// the signal would read "fix was just here" throughout an outage — the exact silence the field was
+/// added to end.
+pub fn fix_stamp(prev_at_ms: Option<i64>, got_fix: bool, now_ms: i64) -> Option<i64> {
+    if got_fix {
+        Some(now_ms)
+    } else {
+        prev_at_ms
+    }
+}
+
 /// PURE: does the poll ask this router for a position? Only when the owner turned its GPS on AND the
 /// router has not said it has none. `unknown` keeps asking — today's behaviour.
 pub fn gps_polling(cfg: &RouterConfig, prev: Option<&Snapshot>) -> bool {
@@ -1093,6 +1137,9 @@ async fn poll_with(drv: Result<Driver<'_>, String>, cfg: &RouterConfig, prev: Op
     let now = crate::hub_server::now_ms();
     let mut snap = prev.cloned().unwrap_or_default();
     snap.at_ms = now;
+    // Every poll starts not knowing. Only the successful read below may assert `1` or `0`, so an
+    // errored or short-circuited poll reports ABSENT rather than the previous poll's answer.
+    snap.gps_fix_ok = None;
     let drv = match drv {
         Ok(d) => d,
         Err(why) => {
@@ -1135,12 +1182,17 @@ async fn poll_with(drv: Result<Driver<'_>, String>, cfg: &RouterConfig, prev: Op
     // A router that has said it has no GPS is not asked for a position again (owner ruling
     // 2026-09-17). The stored gps_enabled is left as it is — the app and the owner decide that;
     // `gps_polling` is what the poll does about it.
-    let gps = drv.gps(gps_polling(cfg, prev)).await;
+    let asked = gps_polling(cfg, prev);
+    let gps = drv.gps(asked).await;
     snap.gps_enabled = gps.enabled;
     if let Some(s) = gps.supported {
         snap.gps_supported = Some(s);
     }
     snap.fix = gps.fix.as_ref().map(FixOut::from);
+    // Only a poll that ASKED may answer. `gps_dev_id` empty means the owner has no GPS record for
+    // this router, so there is nothing for the cloud to be told about either.
+    snap.gps_fix_ok = (asked && !cfg.gps_dev_id.is_empty()).then_some(snap.fix.is_some());
+    snap.fix_at_ms = fix_stamp(snap.fix_at_ms, snap.fix.is_some(), now);
     snap.error = None;
     snap.ok_at_ms = Some(now);
     snap
@@ -1728,6 +1780,57 @@ mod gps_capability_tests {
         assert_eq!(crate::starlink::gps_support_of_refusal(&crate::starlink::grpc_error(7, "Failed to get location: Disabled due to policy")), GpsSupport::No);
         assert_eq!(crate::starlink::gps_support_of_refusal(&crate::starlink::grpc_error(14, "")), GpsSupport::Unknown);
         assert_eq!(crate::starlink::gps_support_of_refusal("the dish refused the connection at that address"), GpsSupport::Unknown);
+    }
+
+    /// "Router up, no GPS fix" (Cloud #586). 🔴 ABSENT IS NOT ZERO — the distinction is the whole
+    /// point, so it is asserted in all three directions.
+    #[test]
+    fn gps_fix_health_says_absent_asked_and_answered_apart() {
+        let base = |ok: Option<bool>, fix_at: Option<i64>| Snapshot {
+            at_ms: 100_000,
+            wan: Some(WanStatus { up: true, ..Default::default() }),
+            gps_fix_ok: ok,
+            fix_at_ms: fix_at,
+            ..Default::default()
+        };
+        let get = |s: &Snapshot, k: &str| {
+            report_params(s, None).unwrap().into_iter().find(|(n, _)| n == k).map(|(_, v)| v)
+        };
+
+        // NOT ASKED ⇒ the field is absent entirely. A `0` here would tell the cloud the router is
+        // reachable and lockless, which is a different and false claim.
+        let unasked = base(None, Some(40_000));
+        assert_eq!(get(&unasked, "gpsFix"), None, "not asked must be ABSENT, never 0");
+        assert_eq!(get(&unasked, "gpsFixAgeS"), None, "and carries no age either");
+
+        // ASKED AND ANSWERED WITH A FIX ⇒ 1.
+        assert_eq!(get(&base(Some(true), Some(100_000)), "gpsFix"), Some("1".into()));
+
+        // ASKED, ROUTER ANSWERED, NO LOCK ⇒ 0, with the age of the last real fix. 60 s here.
+        let lost = base(Some(false), Some(40_000));
+        assert_eq!(get(&lost, "gpsFix"), Some("0".into()), "reachable and lockless is a positive 0");
+        assert_eq!(get(&lost, "gpsFixAgeS"), Some("60".into()), "and says how long it has been lockless");
+
+        // Never a negative age from a clock that went backwards.
+        assert_eq!(get(&base(Some(false), Some(200_000)), "gpsFixAgeS"), Some("0".into()), "age is floored at 0");
+
+        // 🔴 A LOCKLESS POLL MUST NOT RESTAMP THE AGE, or the outage reads "just now" for ever.
+        assert_eq!(fix_stamp(Some(40_000), false, 100_000), Some(40_000), "no fix keeps the old stamp");
+        assert_eq!(fix_stamp(Some(40_000), true, 100_000), Some(100_000), "a fix stamps now");
+        assert_eq!(fix_stamp(None, false, 100_000), None, "never had one, still none");
+        assert_eq!(fix_stamp(None, true, 100_000), Some(100_000), "the first fix stamps");
+
+        // A router that has NEVER had a fix reports the loss with no age rather than a fake one.
+        let never = base(Some(false), None);
+        assert_eq!(get(&never, "gpsFix"), Some("0".into()));
+        assert_eq!(get(&never, "gpsFixAgeS"), None, "no age is honest; 0 would read as 'just now'");
+
+        // 🔴 THE COST RULE: gpsFix is STATE (stored, change-only) and gpsFixAgeS is LIVE-ONLY. An age
+        // stored as state would differ every poll and defeat the cloud's unchanged-reading
+        // suppression — a write per router per keyframe, for ever.
+        assert!(crate::batch::MODEM_STATE.contains(&"gpsFix"), "gpsFix must be STATE");
+        assert!(crate::batch::MODEM_LIVE_ONLY.contains(&"gpsFixAgeS"), "gpsFixAgeS must be LIVE-ONLY");
+        assert!(!crate::batch::MODEM_STATE.contains(&"gpsFixAgeS"), "an age must never be stored state");
     }
 
     #[test]
