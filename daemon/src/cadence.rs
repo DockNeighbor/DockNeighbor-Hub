@@ -42,7 +42,17 @@ pub const CHECKIN_ANCHOR_SECS: u64 = 15 * 60;
 /// Taking the idle check-in to an hour would have dragged it to TWO HOURS with it, and a two-hour-
 /// old position would have gone up looking fresh. It is a staleness rule about positions, not about
 /// how often the boat says hello, so it is its own number.
-pub const MAX_KEYFRAME_FIX_AGE_MS: i64 = 30 * 60 * 1000;
+///
+/// ONE HOUR since 0.3.61 (owner ruling, Jonathan 2026-10-05: "yes, raise it to an hour"). At 30 min
+/// it had fallen BETWEEN the anchor period (15) and away mode (60), which opened a silent hole: in
+/// away mode a GPS that stopped had its last fix dropped from the keyframe after half an hour, and
+/// the cloud then saw NO position at all for the rest of the hour — no fix, and before `gpsFix` no
+/// word of why either. That is the shape of the MVP incident. At or above the away period the fix
+/// survives to the next keyframe, and `gpsFix: 0` is what says the lock is gone.
+///
+/// It must still stay BELOW the idle check-in, or a position older than a whole reporting period
+/// would go up looking fresh. Both halves are gated (sc4-internal check-checkin-cadence-drift).
+pub const MAX_KEYFRAME_FIX_AGE_MS: i64 = 60 * 60 * 1000;
 /// The first keyframe after start waits this long, so the first router, valve and GPS reads are in it.
 pub const FIRST_CHECKIN_SECS: u64 = 45;
 /// THE FIRST RETRY after a failed keyframe (owner ruling, Jonathan 2026-10-05: "retries should
@@ -493,7 +503,15 @@ mod tests {
     /// hours, and a two-hour-old position would have gone up looking fresh.
     #[test]
     fn the_stale_fix_rule_did_not_follow_the_check_in_period() {
-        assert_eq!(MAX_KEYFRAME_FIX_AGE_MS, 30 * 60 * 1000, "still half an hour");
+        // 🔴 BOUNDED ON BOTH SIDES, and the lower bound is the one that was missing. Asserted as a
+        // RELATIONSHIP to the two periods it sits between, not as a bare number: that is what makes
+        // a future cadence change surface here instead of silently re-opening the hole.
+        assert!(
+            MAX_KEYFRAME_FIX_AGE_MS >= CHECKIN_ZONE_SECS as i64 * 1000,
+            "a fix must survive to the next AWAY-MODE keyframe ({} min); below that, a stopped GPS \
+             goes silent for the rest of the period with no position and no explanation",
+            CHECKIN_ZONE_SECS / 60,
+        );
         assert!(
             MAX_KEYFRAME_FIX_AGE_MS < CHECKIN_SECS as i64 * 1000,
             "the idle check-in is now LONGER than the stale-fix rule, so the rule must be its own \
@@ -891,7 +909,16 @@ mod tests {
         assert!(!keyframe_carries_fix(&g, false, 1_000));
         assert!(keyframe_carries_fix(&g, true, 1_000));
         assert!(keyframe_carries_fix(&Geofence::default(), false, 1_000));
-        assert!(!keyframe_carries_fix(&Geofence::default(), false, 31 * 60_000), "a stale fix never rides as fresh");
+        // Against the CONSTANT, not a magic 31 minutes: this read "31 * 60_000" and silently stopped
+        // testing the boundary the moment the owner moved the rule from 30 min to an hour.
+        assert!(
+            !keyframe_carries_fix(&Geofence::default(), false, MAX_KEYFRAME_FIX_AGE_MS + 1),
+            "a fix one millisecond past the limit never rides as fresh",
+        );
+        assert!(
+            keyframe_carries_fix(&Geofence::default(), false, MAX_KEYFRAME_FIX_AGE_MS),
+            "and one exactly at the limit still rides — the rule is `older than`, not `at`",
+        );
         let mut z = Geofence::default();
         z.sync_watch(Some(&crate::geofence::Watch {
             sig: 6,
