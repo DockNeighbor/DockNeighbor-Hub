@@ -14,7 +14,7 @@ Implementations of **one wire contract**:
 | | `daemon/` | `hub/` | `hub-lite/` (hub-lite) |
 | --- | --- | --- | --- |
 | Language | Rust | TypeScript (Node 18+, zero runtime deps) | POSIX shell + uhttpd CGI |
-| Hosts | Windows / macOS, as a boot service | Raspberry Pi, Docker, desktop | GL.iNet / OpenWrt-class routers (KBs footprint) |
+| Hosts | Windows / macOS as a boot service; **Raspberry Pi (64-bit) and Docker** — see [`daemon/docker/`](daemon/docker/) | *(frozen 2026-08-19 — its Pi/Docker path moved to `daemon/`)* | GL.iNet / OpenWrt-class routers (KBs footprint) |
 | Does | webhook receiver, roll-up aggregation, LinkTap valve control, heartbeat; ships an installer and a tray monitor | webhook receiver, roll-up aggregation, NMEA 0183 TCP GPS source | webhook receive-and-forward, roll-up, modem + GPS telemetry, immediate alarm passthrough |
 
 A hub-lite is a **subset of a hub, never a variant**: every side speaks the same batch report
