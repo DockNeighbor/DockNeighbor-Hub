@@ -2556,6 +2556,10 @@ async fn update_conditions(rt: &Rt, offer: &str) -> crate::update_gate::UpdateCo
         cycle_running: rt.linktap.lock().await.as_ref().is_some_and(|r| r.any_cycle_running()),
         local_hour: local_hour(),
         offer_was_rolled_back: crate::update_gate::skipped(&skip, offer),
+        // Read per decision rather than cached at boot: a hub does not change container-hood while
+        // running, but a cached answer is one more thing that can be wrong after a restart, and
+        // this is four cheap reads on a path that runs once an update check.
+        containerised: crate::update_gate::containerised_here(),
     }
 }
 
