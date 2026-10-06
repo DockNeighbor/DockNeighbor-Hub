@@ -66,6 +66,11 @@ uuid = { version = "1", features = ["v4"] }
 # hub can listen on 10110/2000/... while a chartplotter program on the same PC (TimeZero, OpenCPN)
 # already holds the port. Already in the tree via tokio; `all` exposes set_reuse_port.
 socket2 = { version = "0.6", features = ["all"] }
+# LOCAL hour for the update quiet window (update_gate.rs). Already in the tree transitively, so this
+# adds no code; `local-offset` uses the thread-safe libc `localtime_r` and returns an Option, which
+# is exactly the shape the gate wants — an unresolvable timezone BLOCKS the update
+# (Blocked::LocalTimeUnknown) rather than guessing an hour.
+time = { version = "0.3", default-features = false, features = ["std", "local-offset"] }
 # The Starlink dish speaks gRPC on the LAN (starlink.rs): prost's derive declares the dozen
 # messages the hub reads (no protoc, no generated code), h2 carries one unary call per read —
 # reqwest is built without HTTP/2 and gRPC needs the trailers it would not expose anyway.

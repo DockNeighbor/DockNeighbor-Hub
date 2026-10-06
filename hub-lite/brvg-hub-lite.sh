@@ -839,7 +839,18 @@ collect_gps() {
       # the point: a router with no GPS antenna port answers the AT read forever with "no fix",
       # so the dongle has to be tried even when the modem is present and healthy.
       _fix=""
-      if [ "$(detect_platform)" = "glinet" ]; then
+      # 🔴 THE PREDICATE IS THE AT PORT, NOT THE VENDOR (DN-OS session, 2026-10-05). This read
+      # `detect_platform() = glinet`, which is true only where /etc/glversion or /etc/gl-metadata
+      # exists — i.e. on GL.iNet's OWN firmware. A GL-X750 FLASHED TO DOCKNEIGHBOR OS has neither
+      # (they belong to the vendor image; handoff/read-glinet.sh reads glversion before the flash,
+      # not after), so on the platform we are standardising on, `auto` silently skipped the EC25's
+      # GNSS and fell straight through to a USB dongle — and a boat with no dongle had no position
+      # at all, which is precisely the silence that cost us a day on MVP.
+      #
+      # The honest precondition for an AT read is an AT port. `at_cmd` already guards on exactly
+      # this (`[ -c "$AT_PORT" ] || return 1`), as does collect_modem, so this now matches the rest
+      # of the file and works for any modem on any vendor's image.
+      if [ -c "$AT_PORT" ]; then
         _fix=$(gps_from_at)
       fi
       if [ -z "$_fix" ]; then _fix=$(gps_from_nmea "$(read_nmea_raw)"); fi
@@ -3528,8 +3539,12 @@ linktap_tick() {
 # The daemon asks GitHub for its latest tag; a hub-lite asks the feed it would actually update from,
 # so "update available" can never name a version self_update cannot install. The index is a few
 # hundred bytes; `opkg update` would also refresh every OpenWrt feed on a metered link, so it is not
-# used for looking. Every 6 hours, like the daemon.
-UPDATE_CHECK_SECS=21600
+# used for looking. WEEKLY, like the daemon (owner ruling, Jonathan 2026-10-05) — it was every 6 h.
+# The index itself is cheap here; what this saves on a router is the TLS handshake, which is 85-90%
+# of hub-lite's traffic because every request is its own curl (sc4-internal docs/METERED-MODE-SPEC).
+# As on the daemon, a week is not the delivery latency for an urgent release: `self_update` is a
+# command the cloud can queue, and this poll is only the routine unattended path.
+UPDATE_CHECK_SECS=604800
 
 # PURE: is dotted version $1 strictly newer than $2? Numeric per component; a missing component is 0.
 version_newer() {
@@ -3575,27 +3590,42 @@ RT_FILE="${BRVG_HUB_LITE_ROUTERS:-/usr/libexec/brvg-hub-lite/routers}"; [ -r "$R
 # handed through the SAME /api/hub door the LAN uses, with the role the worker vouched for, then posts
 # the answer (POST /api/hub-lite/live/result). When the lease is gone the poll is refused and the child
 # exits; the check-in returns to its unwatched period.
-# THE IDLE CHECK-IN IS ONE HOUR (owner, 2026-09-26). It was 900 while the App's connectivityStatus
-# LATE_CHECKIN_MS already said 65 min — so a router that DIED still read "Reported by the router N
-# ago" for up to 65 minutes instead of being flagged at ~20. The App tier was written for this
-# cadence and shipped ahead of it; this is the hub side catching up, and the two are now gated
-# together by sc4-internal scripts/check-checkin-cadence-drift.mjs.
+# THE IDLE CHECK-IN IS THREE HOURS (owner ruling, Jonathan 2026-10-05: "nothing armed 180 min").
+# It was one hour from 2026-09-26, and 900 before that.
+#
+# 🔴 THE OWNER SET CADENCE AND STALENESS AS PAIRS, AND NEITHER HALF MOVES ALONE: report every
+# 180 min / call the boat offline at 360 (Cloud connectivitySweep MIN_OFFLINE_MINS); away mode
+# 60 / 120; anchor 15 / 25 ("15 + 10 min of retries"). Every tier's "is it still there" number is
+# derived from this one — the App's LATE_CHECKIN_MS and PRIMARY_HOLD_MS, the zone's feed-stale rule,
+# the Cloud sweep — and the 2026-09-26 rise to an hour silently falsified three of them. That is why
+# sc4-internal scripts/check-checkin-cadence-drift.mjs exists: do not move these without it green.
 #
 # An ARMED watch shortens it, because then the check-in is the thing carrying the boat's position:
-# an anchor watch every 5 min, a security zone every 15. A live lease still wins at 60 s.
-CHECKIN_IDLE_SEC=3600
-CHECKIN_ZONE_SEC=900
-CHECKIN_ANCHOR_SEC=300
+# an anchor watch every 15 min, away mode (the security zone) every 60. A live lease wins at 60 s.
+CHECKIN_IDLE_SEC=10800
+CHECKIN_ZONE_SEC=3600
+CHECKIN_ANCHOR_SEC=900
 CHECKIN_LEASED_SEC=60
+# A MISSED CHECK-IN RETRIES IN ABOUT A MINUTE, THEN BACKS OFF (owner ruling, Jonathan 2026-10-05:
+# "retries should happen maybe once a minute at first, and then back off"). It was a flat 120 s that
+# never backed off, so a router whose WAN had been down a day paid 720 failed TLS handshakes — on a
+# metered link — to say nothing. 🔴 UNDER AN ANCHOR WATCH THERE IS NO BACKOFF: the owner's rule is
+# "not more than once a minute", because a dragging boat is worth the handshake.
+CHECKIN_RETRY_SEC=60
+CHECKIN_RETRY_MAX_SEC=900
+CHECKIN_RETRY_MAX_ANCHOR_SEC=60
 # 🔴 NOT THE CHECK-IN PERIOD, AND IT MUST NOT FOLLOW IT. Two rate limits used to be written as
 # `CHECKIN_IDLE_SEC - 30` purely because that was 15 minutes. Taking the check-in to an hour would
 # have dragged BOTH to an hour with it, silently:
 #   * the member-key refresh (keys_on_checkin) — a crew key the owner REVOKED would have kept
-#     working on the router for up to an hour instead of 15 minutes;
-#   * the idle LinkTap valve readings (lt_checkin_spool) — the app would draw hour-old valve state.
+#     working on the router for a whole check-in period (now THREE HOURS) instead of 15 minutes;
+#   * the idle LinkTap valve readings (lt_checkin_spool) — the app would draw three-hour-old state.
 # Neither has anything to do with how often the boat says hello, so both keep the old 15 minutes.
 IDLE_REPORT_SEC=900
 LIVE_LEASE=0; LIVE_UNTIL=0; LIVE_OK=0; CHECKIN_OK=1
+# Consecutive failed check-ins, for the retry backoff (checkin_retry_secs). Reset by the first
+# delivered one — a single lost payload must not slow the next recovery.
+CHECKIN_FAILS=0
 LAST_REPLY=""
 # The child's lease clock (epoch s). The main loop rewrites it on every leased check-in; the child
 # exits when it is gone or has passed. tmpfs.
@@ -3635,11 +3665,27 @@ apply_live_fields() {
 # PURE: seconds to the next check-in.
 #   $1 lease  $2 leaseUntil  $3 now  $4 last check-in succeeded (0/1)  $5 armed: "anchor"|"zone"|""
 #
-# Shortest wins, and they are already in that order: a live lease 60 (D6), an armed anchor watch 300,
-# an armed security zone 900, otherwise 3600. A FAILED check-in is retried within 2 minutes rather
-# than a whole period later — and that matters far more at an hour than it did at 15 minutes: a boat
-# whose WAN just came back should pick up an arm or a lease soon, and a failing request reaches no
-# cloud at all.
+#   $6 consecutive failed check-ins (for the retry backoff; 1 = this is the first retry)
+#
+# Shortest wins, and they are already in that order: a live lease 60 (D6), an armed anchor watch 900,
+# away mode (the security zone) 3600, otherwise 10800. A FAILED check-in does not wait a whole
+# period — it retries on checkin_retry_secs (about a minute, then backing off), which matters far
+# more at three hours than it did at 15 minutes: a router whose WAN just came back should pick up an
+# arm or a lease soon, and a failing request reaches no cloud at all.
+# PURE: the delay before retry number $1 (1 = first retry after a success); $2 = "anchor" when an
+# anchor watch is armed. Doubles from CHECKIN_RETRY_SEC, capped — and flat 60 s under an anchor
+# watch, whatever the count. VERBATIM PAIR with the daemon's cadence::checkin_retry_secs.
+checkin_retry_secs() {
+  _crf=${1:-1}; [ "$_crf" -lt 1 ] 2>/dev/null && _crf=1
+  if [ "${2:-}" = anchor ]; then echo "$CHECKIN_RETRY_MAX_ANCHOR_SEC"; return 0; fi
+  _crs=$CHECKIN_RETRY_SEC
+  while [ "$_crf" -gt 1 ] && [ "$_crs" -lt "$CHECKIN_RETRY_MAX_SEC" ]; do
+    _crs=$(( _crs * 2 )); _crf=$(( _crf - 1 ))
+  done
+  [ "$_crs" -gt "$CHECKIN_RETRY_MAX_SEC" ] && _crs=$CHECKIN_RETRY_MAX_SEC
+  echo "$_crs"
+}
+
 checkin_interval() {
   _cii=$CHECKIN_IDLE_SEC
   case "${5:-}" in
@@ -3647,7 +3693,10 @@ checkin_interval() {
     zone)   _cii=$CHECKIN_ZONE_SEC ;;
   esac
   [ "$1" = "1" ] && [ "${2:-0}" -gt "$3" ] 2>/dev/null && _cii=$CHECKIN_LEASED_SEC
-  [ "${4:-1}" = "1" ] || { [ "$_cii" -gt 120 ] && _cii=120; }
+  if [ "${4:-1}" != "1" ]; then
+    _cir=$(checkin_retry_secs "${6:-1}" "${5:-}")
+    [ "$_cii" -gt "$_cir" ] && _cii=$_cir
+  fi
   echo "$_cii"
 }
 
@@ -3748,7 +3797,7 @@ do_checkin() {
   fi
   # No batch (refused now, or refused within the re-probe window): the check-in is not optional, so
   # this tick finishes the 0.17.0 way. A retryable failure (an outage) does NOT come here — a second
-  # doomed request helps nobody, and checkin_interval already retries a failed check-in within 2 min.
+  # doomed request helps nobody, and checkin_interval already retries a failed check-in in about a minute.
   [ "$_dc_batched" = "1" ] || checkin_legacy "$1"
   live_link_manage "$(date +%s)"
   # Managed routers (routers.sh) report on the same cadence: their poll is a sample clock too.
@@ -4029,7 +4078,8 @@ main() {
     #    and the plan gate all travel through the drain), the keys and the link ride it.
     if [ "$(date +%s)" -ge "$_next_checkin" ]; then
       do_checkin "$(date +%s)"
-      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK" "$(watch_armed)") ))
+      if [ "$CHECKIN_OK" = 1 ]; then CHECKIN_FAILS=0; else CHECKIN_FAILS=$(( CHECKIN_FAILS + 1 )); fi
+      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK" "$(watch_armed)" "$CHECKIN_FAILS") ))
     elif relay_needs_retry; then
       # A failed batch or an undelivered alarm is retried on a short cadence rather than waiting out
       # the check-in (the daemon's shelly_retry_loop). A no-op while the spool is empty.
@@ -4070,7 +4120,8 @@ main() {
       do_checkin "$(date +%s)"
       _next_gps=$(( $(date +%s) + $(gps_sample_secs "$(date +%s)") ))
       _next_modem=${MODEM_NEXT_AT:-$(( $(date +%s) + MODEM_INTERVAL ))}
-      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK" "$(watch_armed)") ))
+      if [ "$CHECKIN_OK" = 1 ]; then CHECKIN_FAILS=0; else CHECKIN_FAILS=$(( CHECKIN_FAILS + 1 )); fi
+      _next_checkin=$(( $(date +%s) + $(checkin_interval "$LIVE_LEASE" "$LIVE_UNTIL" "$(date +%s)" "$CHECKIN_OK" "$(watch_armed)" "$CHECKIN_FAILS") ))
     fi
     command -v rt_tick >/dev/null 2>&1 && rt_tick   # managed routers: due reads run in the background (routers.sh)
     _lt_due=""
