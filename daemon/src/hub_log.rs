@@ -42,13 +42,11 @@ pub fn init(base: &Path) {
     // keeps only the state on the overlay (DN-OS session, 2026-10-05).
     //
     // Absolute paths only, and an unset or empty value keeps today's behaviour: beside the config.
-    let dir = match std::env::var(crate::hub_config::LOG_DIR_ENV) {
-        Ok(p) if !p.trim().is_empty() && Path::new(p.trim()).is_absolute() => PathBuf::from(p.trim()),
+    let dir = crate::hub_config::dir_override(std::env::var(crate::hub_config::LOG_DIR_ENV).ok().as_deref())
         // The SAME directory name as the config (hub_config::DIR_NAME), not a second literal that
         // agrees with it today: logs landing beside a config the daemon is not reading is precisely
         // the split-brain this rename exists to end.
-        _ => base.join(crate::hub_config::DIR_NAME).join("logs"),
-    };
+        .unwrap_or_else(|| base.join(crate::hub_config::DIR_NAME).join("logs"));
     if std::fs::create_dir_all(&dir).is_err() {
         return; // no log file; stderr still works, and nothing else changes
     }

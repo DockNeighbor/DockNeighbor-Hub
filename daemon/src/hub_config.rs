@@ -279,6 +279,22 @@ pub const STATE_DIR_ENV: &str = "DN_HUB_STATE_DIR";
 /// purpose: see the note there about NOR flash.
 pub const LOG_DIR_ENV: &str = "DN_HUB_LOG_DIR";
 
+/// PURE: a directory override, or None to use the platform default.
+///
+/// Absolute paths only. Empty, whitespace, unset and RELATIVE all fall back, because an unset or
+/// fat-fingered variable must never resolve the hub's state to `/` and state must not follow a
+/// working directory a service manager happened to choose.
+///
+/// Pure, and taking the value rather than reading the environment, for two reasons: tests must not
+/// mutate process-global state in a suite that runs in parallel threads (and `set_var` is unsafe
+/// from Rust 2024), and `is_absolute` is PLATFORM-DEPENDENT — `/overlay/dn-hub` is absolute on
+/// Linux and NOT on Windows, which wants a drive letter or a UNC path. That difference is correct
+/// and is why the test builds its path for the host it runs on rather than hard-coding a POSIX one.
+pub fn dir_override(raw: Option<&str>) -> Option<PathBuf> {
+    let p = raw?.trim();
+    (!p.is_empty() && Path::new(p).is_absolute()).then(|| PathBuf::from(p))
+}
+
 /// The platform's SHARED (all-users) data directory.
 ///  * Windows: `%ProgramData%` — the shared folder, readable by services and every login.
 ///  * macOS:   `/Library/Application Support` (the system one, not `~/Library`).
@@ -294,11 +310,8 @@ pub fn shared_base() -> PathBuf {
     // Empty or unset means "use the platform default", so an unset variable can never point the
     // hub at `/`. Relative paths are refused for the same reason: state must not follow a working
     // directory that a service manager chooses.
-    if let Ok(p) = std::env::var(STATE_DIR_ENV) {
-        let p = p.trim();
-        if !p.is_empty() && Path::new(p).is_absolute() {
-            return PathBuf::from(p);
-        }
+    if let Some(p) = dir_override(std::env::var(STATE_DIR_ENV).ok().as_deref()) {
+        return p;
     }
     #[cfg(target_os = "windows")]
     {
@@ -565,33 +578,22 @@ mod tests {
 
     /// 🔴 On OpenWrt `/var` is a symlink to `/tmp` (tmpfs), so the platform default would lose the
     /// vessel id and the bearer token on every reboot. The override is what makes a router viable
-    /// — and the REFUSALS matter as much as the acceptance: an unset or junk value must fall back
-    /// to the platform default, never to `/` or to a relative path a service manager chose.
+    /// — and the REFUSALS matter as much as the acceptance: anything that is not an absolute path
+    /// must fall back to the platform default, never resolve the hub's state to `/` or to wherever
+    /// a service manager left the working directory.
     #[test]
-    fn the_state_directory_override_accepts_only_an_absolute_path() {
-        let restore = std::env::var(STATE_DIR_ENV).ok();
-        let default = {
-            std::env::remove_var(STATE_DIR_ENV);
-            shared_base()
-        };
+    fn the_directory_override_accepts_only_an_absolute_path() {
+        // Built for the host: `/overlay/dn-hub` is absolute on Linux and NOT on Windows, which is
+        // why the first version of this test passed everywhere except the Windows runner.
+        let absolute = if cfg!(windows) { r"C:\dn-hub" } else { "/overlay/dn-hub" };
+        assert_eq!(dir_override(Some(absolute)), Some(PathBuf::from(absolute)), "an absolute path is taken");
 
-        std::env::set_var(STATE_DIR_ENV, "/overlay/dn-hub");
-        assert_eq!(shared_base(), PathBuf::from("/overlay/dn-hub"), "an absolute path is taken");
-
-        for junk in ["", "   ", "relative/path", "dn-hub"] {
-            std::env::set_var(STATE_DIR_ENV, junk);
-            assert_eq!(
-                shared_base(), default,
-                "{junk:?} must fall back to the platform default, never be used as a base",
-            );
+        for junk in [Some(""), Some("   "), Some("relative/path"), Some("dn-hub"), Some("./dn-hub"), None] {
+            assert_eq!(dir_override(junk), None, "{junk:?} must fall back to the platform default");
         }
-        std::env::remove_var(STATE_DIR_ENV);
-        assert_eq!(shared_base(), default, "unset is the platform default");
-
-        match restore {
-            Some(v) => std::env::set_var(STATE_DIR_ENV, v),
-            None => std::env::remove_var(STATE_DIR_ENV),
-        }
+        // On Windows a rooted-but-driveless path is ambiguous and is refused; on Unix it is the
+        // normal case. Asserted BOTH ways so the platform difference is deliberate, not incidental.
+        assert_eq!(dir_override(Some("/overlay/dn-hub")).is_some(), !cfg!(windows), "rooted-no-drive follows the platform");
     }
 
     #[test]
