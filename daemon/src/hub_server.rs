@@ -1977,6 +1977,9 @@ fn http_client() -> reqwest::Client {
 async fn checkin_loop(rt: Shared) {
     let client = http_client();
     let mut next_due = tokio::time::Instant::now() + Duration::from_secs(cadence::FIRST_CHECKIN_SECS);
+    // Consecutive failed check-ins, for the retry backoff (cadence::checkin_retry_secs). Reset by
+    // the first delivered one — a single lost payload must not slow the next recovery.
+    let mut failures: u32 = 0;
     loop {
         let cfg = hub_config::read_config_in(&rt.base);
         if cfg.token.is_empty() || cfg.vid.is_empty() || !cfg.enabled {
@@ -2001,14 +2004,21 @@ async fn checkin_loop(rt: Shared) {
         rt.last_checkin_ms.store(now_ms(), Ordering::SeqCst);
         match checkin_once(&rt, &client, &cfg).await {
             Ok(()) => {
+                failures = 0;
                 // The period follows the vessel's ARMED WATCH, re-read after every keyframe: arming
                 // an anchor watch must tighten the next one, not the one after the next.
                 let secs = cadence::checkin_interval_secs(rt.telemetry.lock().await.watch.as_ref());
                 next_due = tokio::time::Instant::now() + Duration::from_secs(secs);
             }
             Err(e) => {
-                crate::hlog!("hub: check-in failed: {e}");
-                next_due = tokio::time::Instant::now() + Duration::from_secs(cadence::CHECKIN_RETRY_SECS);
+                failures = failures.saturating_add(1);
+                // The ANCHOR WATCH is read for the retry too, not just the period (owner ruling
+                // 2026-10-05): under one, the backoff never slows past a minute.
+                let anchor_armed =
+                    rt.telemetry.lock().await.watch.as_ref().is_some_and(|w| w.anchor.is_some());
+                let secs = cadence::checkin_retry_secs(failures, anchor_armed);
+                crate::hlog!("hub: check-in failed ({failures}): {e} - retrying in {secs}s");
+                next_due = tokio::time::Instant::now() + Duration::from_secs(secs);
             }
         }
     }
@@ -2517,10 +2527,19 @@ async fn probation_loop(rt: Shared) {
     }
 }
 
-/// How often the daemon checks whether a newer release exists. Hours, not minutes: a release lands
-/// a few times a week at most, and this is visibility, not a safety path. Runs once at boot too, so
-/// a freshly started hub reports its update status on its first check-in rather than hours later.
-const UPDATE_CHECK_SECS: u64 = 6 * 3600;
+/// How often the daemon checks whether a newer release exists.
+///
+/// 🔴 WEEKLY (owner ruling, Jonathan 2026-10-05). It was every 6 h, and that poll follows a redirect
+/// into a ~207 KB page that GitHub serves WITHOUT gzip — about 25 MB a month on a boat's metered
+/// cellular link, a fifth of an idle hub's entire data budget, to ask a question whose answer is
+/// almost always "no" (sc4-internal docs/METERED-MODE-SPEC).
+///
+/// A WEEK IS NOT THE DELIVERY LATENCY FOR AN URGENT RELEASE, and that is what makes this safe: the
+/// cloud can queue a `self_update` command the hub runs on its next check-in
+/// (`run_commanded_self_update`), so a release that must go now is pushed rather than polled for.
+/// This poll is the routine, unattended path only. Runs once at boot too, so a freshly started hub
+/// reports its update status on its first check-in rather than a week later.
+const UPDATE_CHECK_SECS: u64 = 7 * 24 * 3600;
 
 /// An alarm counts as ACTIVE only if the sensor has re-asserted it this recently.
 ///
