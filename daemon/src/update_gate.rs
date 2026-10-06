@@ -41,6 +41,18 @@ pub enum Blocked {
     VersionRolledBack,
     /// The hub cannot tell its own local time, so it cannot know whether the window is open.
     LocalTimeUnknown,
+    /// 🔴 THE OWNER'S SWITCH HAS NOT REACHED THIS HUB YET. The cloud carries it on the batch reply
+    /// (`autoUpdate`, Cloud #584), and a hub that has not had a reply since boot — or is talking to
+    /// a worker that predates the field — does not know whether this vessel opted out. Treating
+    /// silence as consent would auto-update a boat whose owner had turned it off.
+    PolicyUnknown,
+    /// 🔴 THE HUB IS IN A CONTAINER (owner ruling, Jonathan 2026-10-05: "yes refuse updates in
+    /// docker"). A container is replaced by pulling a new image, never by swapping the binary
+    /// inside a running one: an in-place update would be silently reverted on the next pull, and
+    /// the probation watcher would be counting a deadline against a filesystem that is about to be
+    /// discarded. Refused STRUCTURALLY rather than by the owner switch — a policy you can
+    /// misconfigure is one that eventually will be.
+    Containerised,
 }
 
 impl Blocked {
@@ -54,6 +66,8 @@ impl Blocked {
             Blocked::CycleRunning => "a watering cycle is running",
             Blocked::VersionRolledBack => "this version was rolled back here before",
             Blocked::LocalTimeUnknown => "the hub does not know its local time",
+            Blocked::PolicyUnknown => "the vessel's automatic-update setting has not reached this hub yet",
+            Blocked::Containerised => "this hub runs in a container - update it by pulling a new image",
         }
     }
 }
@@ -118,6 +132,8 @@ pub struct UpdateConditions {
     pub local_hour: Option<u8>,
     /// True when the version on offer is one this machine already rolled back.
     pub offer_was_rolled_back: bool,
+    /// True when this process is running inside a container (`containerised`).
+    pub containerised: bool,
 }
 
 /// PURE: may this hub install an update right now?
@@ -125,7 +141,19 @@ pub struct UpdateConditions {
 /// ORDER IS DELIBERATE — the cheapest and most owner-visible reasons first, so the hub log says
 /// "automatic updates are off" rather than "outside the quiet window" for a vessel that opted out.
 /// After that, the physical-safety rules, which are the ones that must never be skipped.
+pub fn may_update_known(p: Option<&UpdatePolicy>, c: &UpdateConditions) -> Result<(), Blocked> {
+    match p {
+        None => Err(Blocked::PolicyUnknown),
+        Some(p) => may_update(p, c),
+    }
+}
+
 pub fn may_update(p: &UpdatePolicy, c: &UpdateConditions) -> Result<(), Blocked> {
+    // FIRST, and before the owner's switch: this one is not a preference. A container cannot
+    // meaningfully replace its own binary whatever the vessel has chosen.
+    if c.containerised {
+        return Err(Blocked::Containerised);
+    }
     if !p.enabled {
         return Err(Blocked::OwnerDisabled);
     }
@@ -150,6 +178,109 @@ pub fn may_update(p: &UpdatePolicy, c: &UpdateConditions) -> Result<(), Blocked>
         None => Err(Blocked::LocalTimeUnknown),
         Some(h) if in_quiet_window(p, h) => Ok(()),
         Some(_) => Err(Blocked::NotQuietYet),
+    }
+}
+
+/// PURE: does this evidence say the process is inside a container?
+///
+/// Four independent signals, because no single one covers every runtime: Docker writes
+/// `/.dockerenv`, Podman writes `/run/.containerenv`, systemd-nspawn and podman set `container=`,
+/// and every OCI runtime leaves its mark in PID 1's cgroup path.
+///
+/// 🔴 THE DANGEROUS DIRECTION IS THE FALSE POSITIVE, and it is quiet. A bare Pi wrongly read as a
+/// container would never update itself again and would say so only in its log — the same
+/// "silently never works" failure `PolicyUnknown` exists to avoid. So the cgroup test matches
+/// RUNTIME names only; a host that merely has Docker installed has none of them in PID 1's path.
+pub fn containerised(dockerenv: bool, containerenv: bool, container_var: Option<&str>, pid1_cgroup: &str) -> bool {
+    if dockerenv || containerenv {
+        return true;
+    }
+    if container_var.is_some_and(|v| !v.trim().is_empty()) {
+        return true;
+    }
+    let c = pid1_cgroup.to_ascii_lowercase();
+    ["/docker/", "docker-", "/containerd", "containerd-", "kubepods", "/lxc/", "libpod"].iter().any(|m| c.contains(m))
+}
+
+/// The impure half: read the evidence off this machine. Linux-only by nature — a macOS or Windows
+/// desktop is never the containerised case this rule is about.
+pub fn containerised_here() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        containerised(
+            std::path::Path::new("/.dockerenv").exists(),
+            std::path::Path::new("/run/.containerenv").exists(),
+            std::env::var("container").ok().as_deref(),
+            &std::fs::read_to_string("/proc/1/cgroup").unwrap_or_default(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+
+    /// 🔴 THE FALSE POSITIVE IS THE DANGEROUS ONE, AND IT IS SILENT. A bare Pi wrongly read as a
+    /// container would never update itself again and would say so only in its log. These are the
+    /// real `/proc/1/cgroup` shapes of hosts that are NOT containers.
+    #[test]
+    fn a_bare_host_is_never_read_as_a_container() {
+        for (what, cgroup) in [
+            ("cgroup v2, systemd", "0::/init.scope\n"),
+            ("cgroup v2, bare", "0::/\n"),
+            ("cgroup v1, systemd", "11:devices:/init.scope\n1:name=systemd:/init.scope\n"),
+            ("empty / unreadable /proc", ""),
+            // A host that merely HAS Docker installed: dockerd is a service, PID 1 is not in it.
+            ("a Docker HOST", "0::/init.scope\n"),
+        ] {
+            assert!(
+                !containerised(false, false, None, cgroup),
+                "{what} must not be read as a container — a false positive silently disables updates for ever",
+            );
+        }
+        // An empty or whitespace `container=` is not evidence either.
+        assert!(!containerised(false, false, Some(""), "0::/"), "an empty container= is not evidence");
+        assert!(!containerised(false, false, Some("   "), "0::/"), "whitespace is not evidence");
+    }
+
+    #[test]
+    fn every_runtime_we_know_of_is_recognised() {
+        assert!(containerised(true, false, None, ""), "/.dockerenv — Docker");
+        assert!(containerised(false, true, None, ""), "/run/.containerenv — Podman");
+        assert!(containerised(false, false, Some("systemd-nspawn"), ""), "container= — nspawn");
+        assert!(containerised(false, false, Some("podman"), ""), "container= — podman");
+        for cg in [
+            "12:pids:/docker/3f2a1b\n",
+            "0::/system.slice/docker-3f2a.scope\n",
+            "0::/kubepods/besteffort/pod123/abc\n",
+            "11:cpu:/lxc/mybox\n",
+            "0::/machine.slice/libpod-abc.scope\n",
+            "0::/system.slice/containerd.service/kube\n",
+        ] {
+            assert!(containerised(false, false, None, cg), "cgroup should be a container: {cg:?}");
+        }
+    }
+
+    /// Owner 2026-10-05 ("yes refuse updates in docker"): structural, so it outranks even the
+    /// owner's own switch — a container that was told to auto-update still must not.
+    #[test]
+    fn a_container_refuses_before_anything_else_is_considered() {
+        let p = UpdatePolicy::default();
+        let c = UpdateConditions { local_hour: Some(3), containerised: true, ..UpdateConditions::default() };
+        assert_eq!(may_update(&p, &c), Err(Blocked::Containerised), "a container never self-updates");
+        // ...and the same conditions WITHOUT the container flag are a clean pass, so this test is
+        // proving the flag and not something else about the fixture.
+        let bare = UpdateConditions { containerised: false, ..c };
+        assert_eq!(may_update(&p, &bare), Ok(()), "the same hub outside a container may update");
+        assert_eq!(
+            Blocked::Containerised.as_str(),
+            "this hub runs in a container - update it by pulling a new image",
+            "the log line must tell the owner what to do instead",
+        );
     }
 }
 
@@ -277,6 +408,42 @@ pub fn with_skipped(list: &str, version: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── silence is not consent ──────────────────────────────────────────────────────────────────
+    #[test]
+    fn a_hub_that_has_not_been_told_does_not_update() {
+        // 🔴 BOTH WRONG READINGS ARE REAL FAILURES. Treating "never told" as ON auto-updates a boat
+        // whose owner opted out; treating it as OFF makes the feature quietly never work on any
+        // vessel. It is UNKNOWN, and unknown blocks — the same rule as LocalTimeUnknown.
+        let open = UpdateConditions { local_hour: Some(3), ..UpdateConditions::default() };
+        assert_eq!(may_update_known(None, &open), Err(Blocked::PolicyUnknown));
+        // Told ON, in the window, nothing happening: the one case that installs.
+        assert_eq!(may_update_known(Some(&UpdatePolicy::default()), &open), Ok(()));
+        // Told OFF is a refusal that names the owner, not the clock.
+        let off = UpdatePolicy { enabled: false, ..UpdatePolicy::default() };
+        assert_eq!(may_update_known(Some(&off), &open), Err(Blocked::OwnerDisabled));
+        assert!(Blocked::PolicyUnknown.as_str().contains("has not reached this hub"));
+    }
+
+    #[test]
+    fn the_physical_rules_outrank_the_owners_switch_being_on() {
+        // In the window, told ON — and still refused, one reason at a time. These are the rules that
+        // stop a boat restarting mid-alarm, so they must not be reachable only by luck of ordering.
+        let base = UpdateConditions { local_hour: Some(3), ..UpdateConditions::default() };
+        let p = UpdatePolicy::default();
+        for (c, want) in [
+            (UpdateConditions { alarm_active: true, ..base }, Blocked::AlarmActive),
+            (UpdateConditions { valve_closing: true, ..base }, Blocked::ValveClosing),
+            (UpdateConditions { cycle_running: true, ..base }, Blocked::CycleRunning),
+            (UpdateConditions { armed: true, ..base }, Blocked::WatchArmed),
+            (UpdateConditions { local_hour: Some(13), ..base }, Blocked::NotQuietYet),
+            (UpdateConditions { local_hour: None, ..base }, Blocked::LocalTimeUnknown),
+        ] {
+            assert_eq!(may_update_known(Some(&p), &c), Err(want), "{c:?}");
+        }
+    }
+
+
 
     // ── the skip list: what stops a rollback becoming a loop ────────────────────────────────────
     #[test]
