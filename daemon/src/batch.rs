@@ -293,6 +293,7 @@ pub const MODEM_LIVE_ONLY: &[&str] = &[
     "uptime",                       // device uptime counter
     "downMbps", "upMbps",           // data-rate figures
     "sats",                         // GPS satellites in view (a router's; gps.measurement is another event)
+    "gpsFixAgeS",                   // seconds since this router's GNSS last had a lock — changes every poll
 ];
 /// `modem.measurement` STATE — always sent. Listed for the tests and the reader; the rule itself is
 /// "everything not live-only", so a field missing here is still sent.
@@ -311,6 +312,9 @@ pub const MODEM_LIVE_ONLY: &[&str] = &[
 pub const MODEM_STATE: &[&str] = &[
     "up", "upSrc", "reason", "atMs", "outage", "alerts", "carrier", "mode", "sim", "wan", "wanSrc", "dataMb", "ip", "model", "fw",
     "av", "update", "released",
+    // "router up, no GPS fix" (Cloud #586). STATE on purpose: it changes only when the lock does, so
+    // an outage costs two writes. Its companion `gpsFixAgeS` is live-only for the opposite reason.
+    "gpsFix",
 ];
 /// `linktap.measurement`: the valve's radio signal is the one live-only field.
 pub const LINKTAP_LIVE_ONLY: &[&str] = &["signal"];
