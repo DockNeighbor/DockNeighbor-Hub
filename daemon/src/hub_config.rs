@@ -272,11 +272,47 @@ pub fn config_path_in(base: &Path) -> PathBuf {
     base.join(DIR_NAME).join(FILE_NAME)
 }
 
+/// Overrides the platform's shared data directory (`shared_base`). Absolute paths only; empty or
+/// unset falls back to the platform default. DN naming, because it is a new identifier.
+pub const STATE_DIR_ENV: &str = "DN_HUB_STATE_DIR";
+/// Overrides where the hub writes its log (`hub_log::init`). SEPARATE from the state directory on
+/// purpose: see the note there about NOR flash.
+pub const LOG_DIR_ENV: &str = "DN_HUB_LOG_DIR";
+
+/// PURE: a directory override, or None to use the platform default.
+///
+/// Absolute paths only. Empty, whitespace, unset and RELATIVE all fall back, because an unset or
+/// fat-fingered variable must never resolve the hub's state to `/` and state must not follow a
+/// working directory a service manager happened to choose.
+///
+/// Pure, and taking the value rather than reading the environment, for two reasons: tests must not
+/// mutate process-global state in a suite that runs in parallel threads (and `set_var` is unsafe
+/// from Rust 2024), and `is_absolute` is PLATFORM-DEPENDENT — `/overlay/dn-hub` is absolute on
+/// Linux and NOT on Windows, which wants a drive letter or a UNC path. That difference is correct
+/// and is why the test builds its path for the host it runs on rather than hard-coding a POSIX one.
+pub fn dir_override(raw: Option<&str>) -> Option<PathBuf> {
+    let p = raw?.trim();
+    (!p.is_empty() && Path::new(p).is_absolute()).then(|| PathBuf::from(p))
+}
+
 /// The platform's SHARED (all-users) data directory.
 ///  * Windows: `%ProgramData%` — the shared folder, readable by services and every login.
 ///  * macOS:   `/Library/Application Support` (the system one, not `~/Library`).
 ///  * Linux:   `/var/lib`.
 pub fn shared_base() -> PathBuf {
+    // 🔴 OVERRIDE FIRST, AND IT IS NOT A CONVENIENCE — ON OPENWRT THE DEFAULT IS WRONG.
+    // `/var` is a symlink to `/tmp` there (tmpfs, in RAM), so a hub keeping its state under
+    // `/var/lib` would lose its vessel id and bearer token on EVERY REBOOT and silently re-enrol,
+    // giving the owner a second device against their boat (DN-OS session, 2026-10-05). The
+    // persistent writable space on a DockNeighbor OS router is the jffs2 overlay, so its service
+    // sets this to a path under `/etc`.
+    //
+    // Empty or unset means "use the platform default", so an unset variable can never point the
+    // hub at `/`. Relative paths are refused for the same reason: state must not follow a working
+    // directory that a service manager chooses.
+    if let Some(p) = dir_override(std::env::var(STATE_DIR_ENV).ok().as_deref()) {
+        return p;
+    }
     #[cfg(target_os = "windows")]
     {
         if let Ok(p) = std::env::var("ProgramData") {
@@ -538,6 +574,26 @@ mod tests {
         let old: HubConfig = serde_json::from_str(r#"{"hub_id":"hub_1","vid":"v1","name":"Central","enabled":true}"#).unwrap();
         assert!(!old.web_ui_disabled, "absent field must mean the local web app stays ON");
         assert!(!old.debug_log_batches, "absent field must mean batch bodies are NOT logged");
+    }
+
+    /// 🔴 On OpenWrt `/var` is a symlink to `/tmp` (tmpfs), so the platform default would lose the
+    /// vessel id and the bearer token on every reboot. The override is what makes a router viable
+    /// — and the REFUSALS matter as much as the acceptance: anything that is not an absolute path
+    /// must fall back to the platform default, never resolve the hub's state to `/` or to wherever
+    /// a service manager left the working directory.
+    #[test]
+    fn the_directory_override_accepts_only_an_absolute_path() {
+        // Built for the host: `/overlay/dn-hub` is absolute on Linux and NOT on Windows, which is
+        // why the first version of this test passed everywhere except the Windows runner.
+        let absolute = if cfg!(windows) { r"C:\dn-hub" } else { "/overlay/dn-hub" };
+        assert_eq!(dir_override(Some(absolute)), Some(PathBuf::from(absolute)), "an absolute path is taken");
+
+        for junk in [Some(""), Some("   "), Some("relative/path"), Some("dn-hub"), Some("./dn-hub"), None] {
+            assert_eq!(dir_override(junk), None, "{junk:?} must fall back to the platform default");
+        }
+        // On Windows a rooted-but-driveless path is ambiguous and is refused; on Unix it is the
+        // normal case. Asserted BOTH ways so the platform difference is deliberate, not incidental.
+        assert_eq!(dir_override(Some("/overlay/dn-hub")).is_some(), !cfg!(windows), "rooted-no-drive follows the platform");
     }
 
     #[test]

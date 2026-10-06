@@ -34,10 +34,19 @@ static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 pub fn init(base: &Path) {
-    // The SAME directory name as the config (hub_config::DIR_NAME), not a second literal that
-    // agrees with it today: logs landing beside a config the daemon is not reading is precisely the
-    // split-brain this rename exists to end.
-    let dir = base.join(crate::hub_config::DIR_NAME).join("logs");
+    // 🔴 THE LOG IS OVERRIDDEN SEPARATELY FROM THE STATE, AND THE REASON IS FLASH WEAR.
+    // This file is APPENDED TO ON EVERY LOG LINE and rotates at 2 MB. On a router that is NOR
+    // flash with jffs2, where the state directory has to live on the overlay to survive a reboot —
+    // so pointing both at the same persistent place would churn the flash all day to store lines
+    // nobody reads unless something is wrong. A DockNeighbor OS service points this at tmpfs and
+    // keeps only the state on the overlay (DN-OS session, 2026-10-05).
+    //
+    // Absolute paths only, and an unset or empty value keeps today's behaviour: beside the config.
+    let dir = crate::hub_config::dir_override(std::env::var(crate::hub_config::LOG_DIR_ENV).ok().as_deref())
+        // The SAME directory name as the config (hub_config::DIR_NAME), not a second literal that
+        // agrees with it today: logs landing beside a config the daemon is not reading is precisely
+        // the split-brain this rename exists to end.
+        .unwrap_or_else(|| base.join(crate::hub_config::DIR_NAME).join("logs"));
     if std::fs::create_dir_all(&dir).is_err() {
         return; // no log file; stderr still works, and nothing else changes
     }

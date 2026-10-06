@@ -60,16 +60,14 @@ Config is environment variables (enroll the hub in the app to mint `DEVICE_TOKEN
 | `CRADLEPOINT_PASSWORD` | | — |
 | `GPS_INTERVAL` | | `120` (floor 30) — poll / stationary-report cadence, same name as the hub-lite's |
 
-**Docker** (multi-arch via buildx — amd64 / arm64 / armv7):
+**Docker — RETIRED (owner ruling, Jonathan 2026-10-05).** This implementation's `Dockerfile` has
+been removed. A Pi or a container runs the **full Rust daemon**, which is the one full-hub
+implementation for every capable host (the 2026-08-19 convergence ruling that froze this tier, and
+the 2026-10-05 ruling that settled the Pi): see [`../daemon/docker/`](../daemon/docker/). Leaving a
+Dockerfile here was an invitation to containerise the frozen implementation by accident.
 
-```sh
-docker build -t brvg-hub .
-docker run -d --net host \
-  -e VID=… -e DEVICE_ID=… -e DEVICE_TOKEN=… brvg-hub
-```
-
-`--net host` so the Shellys on the LAN can reach `:8181` and mDNS works; on a locked-down network
-publish `-p 8181:8181` instead.
+The daemon's image is 64-bit only (`linux/amd64`, `linux/arm64`) — there is no armv7 build, by
+ruling. A containerised hub also refuses to self-update: you replace it by pulling a new image.
 
 **Pi / bare Linux** (systemd):
 

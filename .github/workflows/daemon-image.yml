@@ -1,0 +1,85 @@
+# The daemon's container image (owner ruling, Jonathan 2026-10-05: a Pi runs the full hub,
+# "docker is fine"). Multi-arch linux/amd64 + linux/arm64, published to GHCR.
+#
+# 🔴 SEPARATE FROM daemon-release.yml ON PURPOSE. The release workflow is the path every hub in the
+# field updates through; a new publish step that fails there would fail a RELEASE. This runs after
+# a release is published, downloads that release's own assets, and can fail on its own without
+# taking the release with it. Re-runnable by hand for a release that already shipped.
+#
+# The image carries the SAME binaries the release published — never a rebuild. See
+# daemon/docker/Dockerfile for why that matters.
+name: daemon-image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build the image from (e.g. daemon-v0.3.61)'
+        required: true
+        type: string
+
+concurrency:
+  group: daemon-image-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    # Only daemon releases: hub-lite and DN-OS tags share this repo's release list.
+    if: startsWith(github.event.release.tag_name || inputs.tag, 'daemon-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the tag and version
+        id: v
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#daemon-v}" >> "$GITHUB_OUTPUT"
+
+      # 🔴 THE ASSET NAMES ARE THE RELEASE'S, AND A MISSING ONE IS A FAILURE, NOT AN EMPTY IMAGE.
+      # `gh release download` exits non-zero if a pattern matches nothing, and the explicit test
+      # below is what stops a buildx run producing an image whose binary is a zero-byte file.
+      - name: Stage the released binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ steps.v.outputs.tag }}" \
+            --pattern 'brvg-hub-linux-x64' --pattern 'brvg-hub-linux-arm64' --dir dist
+          # buildx names arches amd64/arm64; the release names them x64/arm64.
+          mv dist/brvg-hub-linux-x64 dist/brvg-hub-linux-amd64
+          for a in amd64 arm64; do
+            f="dist/brvg-hub-linux-$a"
+            [ -s "$f" ] || { echo "::error::$f is missing or empty — refusing to build an image around it"; exit 1; }
+            echo "$a: $(stat -c%s "$f") bytes"
+          done
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # GHCR inherits the repository's visibility, so a private repo's image is private. That is
+      # the intent: this is not open source (see the repo README).
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: daemon/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/dockneighbor-hub:${{ steps.v.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/dockneighbor-hub:latest
+          provenance: false
