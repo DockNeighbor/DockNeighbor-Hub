@@ -1,8 +1,14 @@
 # BRVG phone-home hub-lite (Phase A)
 
-One POSIX-shell hub-lite, two homes: a **GL.iNet router** (busybox ash, procd) and a **Raspberry
-Pi-class hub** (systemd). It pushes GPS and modem telemetry **outbound** over HTTPS to the hosted
-worker on a timer, so the vehicle reports without the app being onsite.
+One POSIX-shell hub-lite, on routers running **[DockNeighbor OS](https://github.com/DockNeighbor/DockNeighbor-OS)**
+(busybox ash, procd). It pushes GPS and modem telemetry **outbound** over HTTPS to the hosted worker on a timer,
+so the vehicle reports without the app being onsite.
+
+> **DockNeighbor OS only (owner ruling, 2026-10-05).** hub-lite no longer supports third-party operating systems:
+> no stock GL.iNet or stock OpenWrt install, no Raspberry Pi / systemd install (a Pi-class box runs the Rust
+> `daemon/`, which has an `aarch64-unknown-linux-musl` build). The hub-lite is becoming the daemon's lite
+> feature profile (R59); until then this shell hub-lite ships inside the DockNeighbor OS image, from this
+> repo's signed feed.
 
 > ⚠️ **This heading used to say "Phase A = telemetry push; the Phase B command channel is
 > deliberately not in this skeleton", and it was years of commits out of date.** It was read as
@@ -106,50 +112,24 @@ minted once by an admin via `POST /api/hub-lite/enroll {vid, deviceId}` (Firebas
 re-enroll rotates, DELETE revokes). Legacy fallback when `DEVICE_TOKEN` is empty: the per-vehicle
 webhook key (`VEHICLE_KEY` → `/api/shelly?...&k=`). Both land in the identical cloud pipeline.
 
-## Install — from the app (the normal path)
+## Install — it comes with DockNeighbor OS
 
-Router panel → **☁️ Cloud reporting → Connect to cloud**. The desktop app mints this device's
-token and installs the hub-lite onto the router over SSH using the admin password it already holds:
-script, init service and the token-bearing config are written, the service is enabled, started and
-verified. **No files are edited by hand.**
+The DockNeighbor OS image carries the `brvg-hub-lite` package from this repo's signed feed (pinned by version
+and sha256 in DockNeighbor-OS `profiles/hub-lite/upstream.env`), and the hub-lite's own `self_update` keeps it
+current from the same feed. A router on its vendor's firmware gets DockNeighbor OS from the app (router panel →
+DockNeighbor OS), and the app's cloud key for it rides that flash's handoff, so it comes back reporting. Nothing
+is installed by hand, and the app no longer installs the hub-lite over SSH.
 
-Availability: desktop (Tauri) builds only — the SSH client is deliberately kept out of the Android
-binary (see `src-tauri/Cargo.toml`). Where it isn't available the app shows the manual steps below
-instead of a button that cannot work. The eventual all-platform path is an **opkg feed**
-(`plugins.install_package` exists in the 4.x RPC surface, so a signed .ipk installs with no SSH at
-all) — that lands with the packaged hub-lite under the signed-artifact bar.
+To re-key a router, the app writes `/etc/brvg-hub-lite.conf` and restarts the service (desktop), or shows the
+config with `chmod 600` + `/etc/init.d/brvg-hub-lite restart` to run by hand.
 
-## Install — by hand (fallback / non-GL.iNet)
-
-GL.iNet (tested platform: GL-X750, fw 4.3.28)
-
-```sh
-scp hub-lite/brvg-hub-lite.sh root@192.168.8.1:/usr/bin/brvg-hub-lite
-scp hub-lite/brvg-hub-lite.conf.example root@192.168.8.1:/etc/brvg-hub-lite.conf
-scp hub-lite/openwrt/etc/init.d/brvg-hub-lite root@192.168.8.1:/etc/init.d/brvg-hub-lite
-ssh root@192.168.8.1 'chmod 755 /usr/bin/brvg-hub-lite /etc/init.d/brvg-hub-lite; chmod 600 /etc/brvg-hub-lite.conf'
-# edit /etc/brvg-hub-lite.conf (VID, DEVICE_ID, VEHICLE_KEY), then:
-ssh root@192.168.8.1 '/etc/init.d/brvg-hub-lite enable && /etc/init.d/brvg-hub-lite start; logread -f | grep brvg'
-```
+### The modem's AT port
 
 GPS/modem are read with AT commands straight to the modem port — the hub-lite runs as root
 on-device, so no RPC login is involved. `AT_PORT` defaults to `/dev/ttyUSB2` (correct for the
 X750's EC25). **X3000-class PCIe modems (RM520) expose a different device** — check
 `ls /dev/mhi_* /dev/ttyUSB*` on the unit and set `AT_PORT`; expect `/dev/mhi_DUN`-style names
 [unverified until an X3000 is on the bench].
-
-## Install — Raspberry Pi hub
-
-**One command**: `sudo sh hub-lite/hub/install.sh` (see [hub/README.md](hub/README.md) for what the
-box is for and the hardware notes). The manual steps below are the same thing, unpacked.
-
-```sh
-sudo cp hub-lite/brvg-hub-lite.sh /usr/local/bin/brvg-hub-lite && sudo chmod 755 /usr/local/bin/brvg-hub-lite
-sudo cp hub-lite/brvg-hub-lite.conf.example /etc/brvg-hub-lite.conf && sudo chmod 600 /etc/brvg-hub-lite.conf
-sudo cp hub-lite/systemd/brvg-hub-lite.service /etc/systemd/system/
-# edit /etc/brvg-hub-lite.conf, then:
-sudo systemctl enable --now brvg-hub-lite && journalctl -fu brvg-hub-lite
-```
 
 ### GPS on a router with no GPS antenna port
 
