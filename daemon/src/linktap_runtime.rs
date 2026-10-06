@@ -182,6 +182,12 @@ impl Runtime {
         out
     }
 
+    /// Is ANY watched valve mid-cycle? One of `update_gate::UpdateConditions` — a restart during a
+    /// run can lose the volume cutoff that bounds it, so the hub does not update through one.
+    pub fn any_cycle_running(&self) -> bool {
+        self.tracks.values().any(|t| matches!(t.state, cycle::State::Running(_)))
+    }
+
     /// Take the reopen this valve is owed, if any. Taking CLEARS it, so a caller that fails to
     /// perform the open does not retry it on every poll for the rest of the day — a valve that
     /// silently reopens minutes later is worse than one that stayed shut and said so.

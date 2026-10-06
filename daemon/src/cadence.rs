@@ -1,10 +1,11 @@
-// THE HUB → CLOUD CADENCE — what is sent now, and what waits for the 15-minute keyframe.
+// THE HUB → CLOUD CADENCE — what is sent now, and what waits for the next keyframe.
 //
 // Owner ruling (Jonathan, 2026-09-15): "There should be 100–200 updates from the hub to the cloud a day
 // — one every ~15 min when not underway, the GPS is not moving, and nothing is alarming." Spec: the hub
 // cadence audit §2.1/§2.2 (thresholds proposed there and approved with the ruling) and §4 H1–H9.
 //
-// Principle: ONE consolidated keyframe per boat every 15 min while idle; an immediate single event on a
+// Principle: ONE consolidated keyframe per boat per check-in period (180 min idle, 60 in away mode, 15
+// under an anchor watch — owner ruling 2026-10-05); an immediate single event on a
 // real change; faster only while a watch is armed (geofence.rs), a member is watching (the lease) or
 // the boat is underway. THE HUB decides what changed, always against the last value it SENT — so a slow
 // drift eventually goes out and an oscillation across a line does not chatter.
@@ -16,27 +17,69 @@ use crate::geofence;
 
 /// The consolidated keyframe cadence while idle and NOTHING is armed.
 ///
-/// ONE HOUR since 0.3.57 (owner, 2026-09-26). It was 15 min while the App's connectivityStatus
-/// LATE_CHECKIN_MS already read 65 min, so a device that DIED still showed as reporting for up to
-/// an hour. The App tier shipped ahead of this one; sc4-internal's cadence drift gate now holds the
-/// two together.
-pub const CHECKIN_SECS: u64 = 60 * 60;
-/// An armed SECURITY ZONE keeps the old quarter-hour: the keyframe is what carries the position,
-/// and a zone alone buys no heartbeat (owner ruling 2026-09-15).
-pub const CHECKIN_ZONE_SECS: u64 = 15 * 60;
-/// An armed ANCHOR WATCH. Tighter than the zone even though the watch already sends its own 60 s
-/// heartbeat: the heartbeat proves liveness only, and the keyframe is what carries device state.
-pub const CHECKIN_ANCHOR_SECS: u64 = 5 * 60;
+/// THREE HOURS since 0.3.61 (owner ruling, Jonathan 2026-10-05: "nothing armed 180 min"). It was
+/// one hour from 0.3.57, and 15 min before that.
+///
+/// 🔴 EVERY TIER'S "IS IT STILL THERE" THRESHOLD IS DERIVED FROM THIS ONE, AND NONE OF THEM MOVES
+/// BY ITSELF. The owner set the pairs: report every 180 min, call the boat offline at 360
+/// (connectivitySweep MIN_OFFLINE_MINS); away mode 60 / 120; anchor 15 / 25. The 0.3.57 rise to an
+/// hour silently falsified three constants that justified their own values by "a hub reports every
+/// 15 minutes" (App ZONE_FEED_STALE_MS and PRIMARY_HOLD_MS, Cloud POSITION_FEED_STALE_MS), which is
+/// what sc4-internal's cadence drift gate now exists to catch. Do not move this without it green.
+pub const CHECKIN_SECS: u64 = 180 * 60;
+/// AWAY MODE (the security zone, relabelled by the owner 2026-10-05) — one hour, paired with a
+/// 120-minute feed-stale threshold. A zone alone still buys no heartbeat (owner ruling 2026-09-15):
+/// the keyframe is what carries the position, and a breach does not wait for it — `zone.motion`
+/// fires locally at the GPS sample rate and is sent immediately (geofence.rs).
+pub const CHECKIN_ZONE_SECS: u64 = 60 * 60;
+/// An armed ANCHOR WATCH — 15 min (owner ruling 2026-10-05), paired with a 25-minute loss threshold
+/// ("15 + 10 min of retries"). It was 5 min. A DRAG IN PROGRESS IS UNAFFECTED: the watch beats every
+/// 60 s while outside its circle (geofence::HEARTBEAT_SECS) and samples every 30 s, so this governs
+/// only how often an undisturbed boat at anchor says hello.
+pub const CHECKIN_ANCHOR_SECS: u64 = 15 * 60;
 /// 🔴 THE OLDEST FIX A KEYFRAME MAY CARRY — NOT a multiple of the check-in period, deliberately.
 /// This was written `2 * CHECKIN_SECS`, meaning "two check-ins" back when that was 30 minutes.
 /// Taking the idle check-in to an hour would have dragged it to TWO HOURS with it, and a two-hour-
 /// old position would have gone up looking fresh. It is a staleness rule about positions, not about
 /// how often the boat says hello, so it is its own number.
-pub const MAX_KEYFRAME_FIX_AGE_MS: i64 = 30 * 60 * 1000;
+///
+/// ONE HOUR since 0.3.61 (owner ruling, Jonathan 2026-10-05: "yes, raise it to an hour"). At 30 min
+/// it had fallen BETWEEN the anchor period (15) and away mode (60), which opened a silent hole: in
+/// away mode a GPS that stopped had its last fix dropped from the keyframe after half an hour, and
+/// the cloud then saw NO position at all for the rest of the hour — no fix, and before `gpsFix` no
+/// word of why either. That is the shape of the MVP incident. At or above the away period the fix
+/// survives to the next keyframe, and `gpsFix: 0` is what says the lock is gone.
+///
+/// It must still stay BELOW the idle check-in, or a position older than a whole reporting period
+/// would go up looking fresh. Both halves are gated (sc4-internal check-checkin-cadence-drift).
+pub const MAX_KEYFRAME_FIX_AGE_MS: i64 = 60 * 60 * 1000;
 /// The first keyframe after start waits this long, so the first router, valve and GPS reads are in it.
 pub const FIRST_CHECKIN_SECS: u64 = 45;
-/// After a failed keyframe, try again this soon (not the full 15 minutes).
-pub const CHECKIN_RETRY_SECS: u64 = 120;
+/// THE FIRST RETRY after a failed keyframe (owner ruling, Jonathan 2026-10-05: "retries should
+/// happen maybe once a minute at first, and then back off").
+///
+/// It was a FLAT 120 s that never backed off and never gave up — a boat whose uplink had been down
+/// for a day paid 720 failed TLS handshakes to say nothing, on a metered cellular link, and a boat
+/// that had just missed one beat waited two minutes to find out. Both ends were wrong.
+pub const CHECKIN_RETRY_SECS: u64 = 60;
+/// The retry backoff ceiling when nothing is armed. 15 min keeps a long outage cheap while staying
+/// far below every check-in period, so recovery is never gated on the normal cadence.
+pub const CHECKIN_RETRY_MAX_SECS: u64 = 15 * 60;
+/// 🔴 THE CEILING WHILE AN ANCHOR WATCH IS ARMED — owner ruling 2026-10-05: "for the anchor alarm,
+/// the back off should not be more than once a minute." A dragging boat is the one case where the
+/// cost of another handshake is not worth one second of silence, so the backoff does not apply.
+pub const CHECKIN_RETRY_MAX_ANCHOR_SECS: u64 = 60;
+
+/// PURE: how long to wait before retry number `failures` (1 = the first retry after a success).
+///
+/// Doubles from 60 s, capped — 60, 120, 240, 480, 900, 900… and flat 60 s whenever an ANCHOR WATCH
+/// is armed, whatever the failure count. `failures == 0` is "no failure", which is still answered
+/// with the first delay rather than zero: a caller that forgets to count must not spin.
+pub fn checkin_retry_secs(failures: u32, anchor_armed: bool) -> u64 {
+    let cap = if anchor_armed { CHECKIN_RETRY_MAX_ANCHOR_SECS } else { CHECKIN_RETRY_MAX_SECS };
+    let steps = failures.saturating_sub(1).min(16);
+    CHECKIN_RETRY_SECS.saturating_mul(1u64 << steps).min(cap)
+}
 /// Two check-ins are never closer than this, however many wakes arrive (refresh, lease, events).
 pub const MIN_CHECKIN_GAP_MS: i64 = 5_000;
 /// `POST /api/hub/refresh` calls within this window coalesce into one wake (§A7.2).
@@ -397,7 +440,7 @@ pub fn keyframe_carries_fix(g: &geofence::Geofence, leased: bool, fix_age_ms: i6
 }
 
 /// PURE: seconds until the next keyframe, from the vessel's armed watch. Shortest wins, and they are
-/// already in that order: an anchor watch 5 min, a security zone 15, otherwise the idle hour. A
+/// already in that order: an anchor watch 15 min, away mode (the zone) 60, otherwise the idle 180. A
 /// stood-down watch (`sig: 0`, both rings `None`) is idle, like no watch at all.
 pub fn checkin_interval_secs(watch: Option<&geofence::Watch>) -> u64 {
     match watch {
@@ -422,11 +465,37 @@ mod tests {
 
     #[test]
     fn checkin_interval_follows_the_armed_watch() {
-        assert_eq!(checkin_interval_secs(None), 60 * 60, "nothing armed is the idle hour");
-        assert_eq!(checkin_interval_secs(Some(&watch_of(false, false))), 60 * 60, "a stood-down watch is idle");
-        assert_eq!(checkin_interval_secs(Some(&watch_of(false, true))), 15 * 60, "a security zone keeps the quarter-hour");
-        assert_eq!(checkin_interval_secs(Some(&watch_of(true, false))), 5 * 60, "an anchor watch is 5 min");
-        assert_eq!(checkin_interval_secs(Some(&watch_of(true, true))), 5 * 60, "the anchor watch is the tighter of the two");
+        assert_eq!(checkin_interval_secs(None), 180 * 60, "nothing armed is the idle three hours");
+        assert_eq!(checkin_interval_secs(Some(&watch_of(false, false))), 180 * 60, "a stood-down watch is idle");
+        assert_eq!(checkin_interval_secs(Some(&watch_of(false, true))), 60 * 60, "away mode (the zone) is the hour");
+        assert_eq!(checkin_interval_secs(Some(&watch_of(true, false))), 15 * 60, "an anchor watch is 15 min");
+        assert_eq!(checkin_interval_secs(Some(&watch_of(true, true))), 15 * 60, "the anchor watch is the tighter of the two");
+    }
+
+    /// Owner ruling 2026-10-05: a missed check-in retries in about a minute and then backs off —
+    /// EXCEPT under an anchor watch, where it never slows past once a minute.
+    #[test]
+    fn a_missed_checkin_retries_in_a_minute_then_backs_off() {
+        // Unarmed: 60, 120, 240, 480, then pinned at the 15-minute ceiling.
+        let unarmed: Vec<u64> = (1..=7).map(|f| checkin_retry_secs(f, false)).collect();
+        assert_eq!(unarmed, vec![60, 120, 240, 480, 900, 900, 900], "doubles from a minute, capped at 15");
+        // 🔴 The anchor watch never backs off past a minute — the whole point of the ruling.
+        for f in 1..=50 {
+            assert_eq!(
+                checkin_retry_secs(f, true), 60,
+                "failure {f} under an anchor watch must still retry within a minute",
+            );
+        }
+        // The first retry is never slower than the ceiling allows, and never zero.
+        assert_eq!(checkin_retry_secs(0, false), CHECKIN_RETRY_SECS, "no failures still answers a real delay");
+        assert!(checkin_retry_secs(0, false) > 0 && checkin_retry_secs(99, true) > 0, "a retry delay is never zero");
+        // A retry is always FASTER than the cadence it is recovering, or it is not a retry.
+        for (period, armed) in [(CHECKIN_SECS, false), (CHECKIN_ZONE_SECS, false), (CHECKIN_ANCHOR_SECS, true)] {
+            assert!(
+                checkin_retry_secs(99, armed) < period,
+                "the retry ceiling must stay below the {period}s period it recovers",
+            );
+        }
     }
 
     /// 🔴 THE COUPLING THAT WOULD HAVE SHIPPED SILENTLY. The oldest fix a keyframe may carry was
@@ -434,7 +503,15 @@ mod tests {
     /// hours, and a two-hour-old position would have gone up looking fresh.
     #[test]
     fn the_stale_fix_rule_did_not_follow_the_check_in_period() {
-        assert_eq!(MAX_KEYFRAME_FIX_AGE_MS, 30 * 60 * 1000, "still half an hour");
+        // 🔴 BOUNDED ON BOTH SIDES, and the lower bound is the one that was missing. Asserted as a
+        // RELATIONSHIP to the two periods it sits between, not as a bare number: that is what makes
+        // a future cadence change surface here instead of silently re-opening the hole.
+        assert!(
+            MAX_KEYFRAME_FIX_AGE_MS >= CHECKIN_ZONE_SECS as i64 * 1000,
+            "a fix must survive to the next AWAY-MODE keyframe ({} min); below that, a stopped GPS \
+             goes silent for the rest of the period with no position and no explanation",
+            CHECKIN_ZONE_SECS / 60,
+        );
         assert!(
             MAX_KEYFRAME_FIX_AGE_MS < CHECKIN_SECS as i64 * 1000,
             "the idle check-in is now LONGER than the stale-fix rule, so the rule must be its own \
@@ -479,12 +556,14 @@ mod tests {
         let (beats, _) = run(false);
         assert_eq!(beats, 12, "one heartbeat every 5 minutes, the first at once for the new arm");
         let (beats, keyframes) = run(true);
-        assert_eq!(keyframes, 12, "an armed anchor watch keyframes every 5 minutes");
+        assert_eq!(keyframes, 4, "an armed anchor watch keyframes every 15 minutes (owner 2026-10-05)");
         // ONE, not zero: a newly armed watch heartbeats at once so the cloud does not wait 5 minutes
         // for it, and that first beat lands on the same second as the first keyframe. Every later
         // heartbeat coincides with a keyframe and so is never sent on its own.
-        assert_eq!(beats, 1, "only the new arm's immediate heartbeat is sent on its own");
-        assert!((12..=13).contains(&(beats + keyframes)), "about 12 check-ins an armed hour, unchanged");
+        // The keyframe no longer coincides with every beat: at 15-min keyframes and 5-min beats, two
+        // of each three beats now fall between keyframes and are sent on their own.
+        assert_eq!(beats, 9, "the beats that no longer land on a keyframe are sent on their own");
+        assert_eq!(beats + keyframes, 13, "still about 12 posts an armed hour — the 5-min heartbeat, not the keyframe, sets this");
         assert_eq!(anchor_heartbeat_secs(true), 60, "a drag in progress beats every 60 s");
     }
 
@@ -672,7 +751,7 @@ mod tests {
     fn rssi_and_sinr_are_never_router_events_but_the_uplink_is() {
         let base = p(&[("up", "1"), ("upSrc", "read"), ("wan", "lte"), ("rssi", "-71"), ("sinr", "12")]);
         // 🔴 D8: the first poll after a restart IS an event now — the cloud has never heard this
-        // router from this hub, and waiting up to 15 minutes for a keyframe is how a router that was
+        // router from this hub, and waiting a whole check-in period for a keyframe is how a router that was
         // unreachable at boot stayed invisible.
         assert!(router_is_event(None, &base), "the first poll after a restart is an event");
         let sent = RouterSent::from_params(&base);
@@ -722,7 +801,7 @@ mod tests {
     /// the same gates the shell uses; what leaves the hub is the keyframe schedule plus the immediate
     /// sends the gates allow. The ruling is 100–200 a day; idle must sit at about 100.
     #[test]
-    fn an_idle_docked_boat_sends_about_one_hundred_times_a_day() {
+    fn an_idle_docked_boat_sends_about_a_dozen_times_a_day() {
         let day_s: i64 = 24 * 3600;
         let mut rng = Lcg(42);
         let mut sends = 0u32;
@@ -809,11 +888,11 @@ mod tests {
             }
         }
         eprintln!("idle docked boat: {sends} sends in 24 h ({keyframes} keyframes)");
-        // 0.3.57: one keyframe an hour, not four. THIS IS THE SAVING, so it is asserted as a number
-        // and not left to be inferred — an idle boat drops from 96 keyframes a day to 24.
-        assert_eq!(keyframes, 24, "one keyframe an hour");
-        assert!(sends <= 32, "an idle docked boat must be about 30 sends/day now, got {sends}");
-        assert!(sends >= 24, "and never fewer than its keyframes");
+        // 0.3.61: one keyframe every THREE hours. THIS IS THE SAVING, so it is asserted as a number
+        // and not left to be inferred — an idle boat has gone 96 → 24 → 8 keyframes a day.
+        assert_eq!(keyframes, 8, "one keyframe every three hours (owner 2026-10-05)");
+        assert!(sends <= 16, "an idle docked boat must be about 13 sends/day now, got {sends}");
+        assert!(sends >= keyframes, "and never fewer than its keyframes");
     }
 
     #[test]
@@ -830,7 +909,16 @@ mod tests {
         assert!(!keyframe_carries_fix(&g, false, 1_000));
         assert!(keyframe_carries_fix(&g, true, 1_000));
         assert!(keyframe_carries_fix(&Geofence::default(), false, 1_000));
-        assert!(!keyframe_carries_fix(&Geofence::default(), false, 31 * 60_000), "a stale fix never rides as fresh");
+        // Against the CONSTANT, not a magic 31 minutes: this read "31 * 60_000" and silently stopped
+        // testing the boundary the moment the owner moved the rule from 30 min to an hour.
+        assert!(
+            !keyframe_carries_fix(&Geofence::default(), false, MAX_KEYFRAME_FIX_AGE_MS + 1),
+            "a fix one millisecond past the limit never rides as fresh",
+        );
+        assert!(
+            keyframe_carries_fix(&Geofence::default(), false, MAX_KEYFRAME_FIX_AGE_MS),
+            "and one exactly at the limit still rides — the rule is `older than`, not `at`",
+        );
         let mut z = Geofence::default();
         z.sync_watch(Some(&crate::geofence::Watch {
             sig: 6,

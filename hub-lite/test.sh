@@ -1596,6 +1596,34 @@ check "cradlepoint: unset port is HTTPS on 443 (daemon default)" "https://192.16
 check "cradlepoint: 443 is https" "https://h" "$(cradlepoint_base h 443)"
 check "cradlepoint: 80 is http" "http://h" "$(cradlepoint_base h 80)"
 check "cradlepoint: any other port is http with the port" "http://h:8080" "$(cradlepoint_base h 8080)"
+# 🔴 GPS_SOURCE=auto MUST TRY THE MODEM WHEREVER THERE IS AN AT PORT (DN-OS session finding,
+# 2026-10-05). This was gated on detect_platform() = "glinet", true only on GL.iNet's OWN firmware
+# (/etc/glversion, /etc/gl-metadata) — so a GL-X750 flashed to DockNeighbor OS, which has neither,
+# silently skipped its EC25's GNSS and fell through to a USB dongle it may not have. /dev/null is a
+# character device, so it stands in for a present AT port without needing root to mknod.
+( GPS_SOURCE=auto; AT_PORT=/dev/null
+  gps_from_at()   { echo "FROM_AT"; }
+  gps_from_nmea() { echo "FROM_NMEA"; }
+  read_nmea_raw() { echo ""; }
+  gps_from_gpsd() { echo "FROM_GPSD"; }
+  check "gps auto: an AT port present means the modem is tried first" "FROM_AT" "$(collect_gps)" )
+
+( GPS_SOURCE=auto; AT_PORT=/definitely/not/a/device
+  gps_from_at()   { echo "FROM_AT"; }
+  gps_from_nmea() { echo "FROM_NMEA"; }
+  read_nmea_raw() { echo ""; }
+  gps_from_gpsd() { echo "FROM_GPSD"; }
+  check "gps auto: no AT port falls through to the dongle" "FROM_NMEA" "$(collect_gps)" )
+
+# And the vendor is NOT the predicate any more: a box with an AT port and no GL.iNet marker still
+# tries the modem. PLATFORM is forced to generic to stand in for DockNeighbor OS.
+( GPS_SOURCE=auto; AT_PORT=/dev/null; PLATFORM=generic
+  gps_from_at()   { echo "FROM_AT"; }
+  gps_from_nmea() { echo "FROM_NMEA"; }
+  read_nmea_raw() { echo ""; }
+  gps_from_gpsd() { echo "FROM_GPSD"; }
+  check "gps auto: DockNeighbor OS (not glinet) still tries the modem" "FROM_AT" "$(collect_gps)" )
+
 ( CRADLEPOINT_HOST=192.168.0.1; CRADLEPOINT_PORT=""; curl() { echo "$*" > "$T/cp"; }; read_gps_cradlepoint )
 check "cradlepoint: the https poll passes -k (NCOS self-signs on the LAN)" "1" "$(grep -c -- '-k .*https://192.168.0.1/api/status/gps' "$T/cp")"
 vn() { if version_newer "$1" "$2"; then echo yes; else echo no; fi; }
@@ -2533,19 +2561,24 @@ NOLEASE_REPLY='{"status":"ok","event":"hub.checkin","lease":0,"leaseUntil":0,"ch
 check "live fields: a leased reply" "1 4102444800 60 1" "$(printf '%s' "$LEASE_REPLY" | parse_live_fields)"
 check "live fields: nobody watching" "0 0 900 0" "$(printf '%s' "$NOLEASE_REPLY" | parse_live_fields)"
 check "live fields: a reply without them (switch off) says nothing" "" "$(printf '{"status":"ok","leases":1}' | parse_live_fields)"
-check "cadence: 60 min unwatched" "3600" "$(checkin_interval 0 0 1000 1)"
+check "cadence: 180 min unwatched" "10800" "$(checkin_interval 0 0 1000 1)"
 check "cadence: 1 min while a lease is live" "60" "$(checkin_interval 1 2000 1000 1)"
-check "cadence: a lease that has run out is unwatched" "3600" "$(checkin_interval 1 999 1000 1)"
-check "cadence: a failed check-in retries within 2 min" "120" "$(checkin_interval 0 0 1000 0)"
+check "cadence: a lease that has run out is unwatched" "10800" "$(checkin_interval 1 999 1000 1)"
+check "cadence: a failed check-in retries within a minute" "60" "$(checkin_interval 0 0 1000 0 "" 1)"
 
 # 0.18.10 (owner 2026-09-26): an ARMED watch shortens the hour, because then the check-in is what
 # carries the boat's position. Shortest wins, and a lease still beats both.
-check "cadence: an armed anchor watch is 5 min" "300" "$(checkin_interval 0 0 1000 1 anchor)"
-check "cadence: an armed security zone is 15 min" "900" "$(checkin_interval 0 0 1000 1 zone)"
+check "cadence: an armed anchor watch is 15 min" "900" "$(checkin_interval 0 0 1000 1 anchor)"
+check "cadence: away mode (the zone) is 60 min" "3600" "$(checkin_interval 0 0 1000 1 zone)"
 check "cadence: a live lease beats an armed anchor watch" "60" "$(checkin_interval 1 2000 1000 1 anchor)"
-check "cadence: a failed check-in still retries within 2 min while armed" "120" "$(checkin_interval 0 0 1000 0 anchor)"
+check "cadence: a failed check-in still retries within a minute while armed" "60" "$(checkin_interval 0 0 1000 0 anchor 1)"
+# Owner ruling 2026-10-05: the backoff doubles from a minute, EXCEPT under an anchor watch.
+check "retry: backs off 60-120-240-480, capped at 900" "60 120 240 480 900 900" "$(for f in 1 2 3 4 5 9; do printf "%s " "$(checkin_retry_secs "$f" "")"; done | sed "s/ $//")"
+check "retry: an anchor watch never backs off past a minute" "60 60 60 60" "$(for f in 1 2 9 50; do printf "%s " "$(checkin_retry_secs "$f" anchor)"; done | sed "s/ $//")"
+check "retry: a long outage under anchor still retries in a minute" "60" "$(checkin_interval 0 0 1000 0 anchor 99)"
+check "retry: a long outage unarmed backs off to the ceiling" "900" "$(checkin_interval 0 0 1000 0 "" 99)"
 # An unknown arm must fall back to idle, never to 0 — a 0 would busy-loop the check-in.
-check "cadence: an unrecognised arm falls back to the idle hour" "3600" "$(checkin_interval 0 0 1000 1 nonsense)"
+check "cadence: an unrecognised arm falls back to the idle period" "10800" "$(checkin_interval 0 0 1000 1 nonsense)"
 
 # watch_armed picks the tighter watch when both are on.
 _wa=$(mktemp -d)
@@ -2560,7 +2593,7 @@ rm -rf "$_wa"; unset ANCHOR_STATE ZONE_STATE
 # `CHECKIN_IDLE_SEC - 30` only because that happened to be 15 minutes. Tying them to the check-in
 # would have let a REVOKED crew key keep working for an hour, and made the app draw hour-old valve
 # state. They read IDLE_REPORT_SEC now, and it must stay 15 min while the check-in is an hour.
-check "cadence: the idle check-in is an hour" "3600" "$CHECKIN_IDLE_SEC"
+check "cadence: the idle check-in is three hours" "10800" "$CHECKIN_IDLE_SEC"
 check "cadence: the report period stayed 15 min and did NOT follow the check-in" "900" "$IDLE_REPORT_SEC"
 check "cadence: the member-key refresh is rate-limited by the report period, not the check-in" "1" \
   "$(grep -c 'KEYS_ASKED_AT )) -ge $(( IDLE_REPORT_SEC - 30 ))' "$HL_DIR/brvg-hub-lite.sh")"
@@ -2621,9 +2654,9 @@ B_LEASE='{"status":"ok","processed":1,"failed":0,"touched":0,"skipped":0,"lease"
   DEVICE_TOKEN=""; : > "$C17/urls"; do_checkin 10180
   echo "legacy=$(grep -c 'hub.checkin' "$C17/urls") reqs=$(wc -l < "$C17/urls" | tr -d ' ')" >> "$C17/ci"
 )
-check "check-in: 3600 s after a batch reply with no lease, and it cost ONE request (0.17.0 spent two)" "idle=3600 reqs=1" "$(sed -n 1p "$C17/ci")"
+check "check-in: 10800 s after a batch reply with no lease, and it cost ONE request (0.17.0 spent two)" "idle=10800 reqs=1" "$(sed -n 1p "$C17/ci")"
 check "check-in: the batch reply's lease switches the cadence to 60 s, and its anchor is adopted" "leased=60 anchor=1757750400000" "$(sed -n 2p "$C17/ci")"
-check "check-in: back to 3600 s when a batch reply stops carrying the lease" "switch-off=3600" "$(sed -n 3p "$C17/ci")"
+check "check-in: back to 10800 s when a batch reply stops carrying the lease" "switch-off=10800" "$(sed -n 3p "$C17/ci")"
 check "check-in: never on the legacy VEHICLE_KEY path (/api/shelly would alert every 15 min)" "legacy=0 reqs=0" "$(sed -n 4p "$C17/ci")"
 check "check-in: three check-ins, three POSTs to /api/hub-lite/batch and no GET at all" "3 0" \
   "$(grep -c '^POST' "$C17/urls.ci") $(grep -c '^GET' "$C17/urls.ci")"

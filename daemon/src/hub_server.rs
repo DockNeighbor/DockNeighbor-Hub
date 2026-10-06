@@ -331,6 +331,12 @@ pub struct Rt {
     /// tear down a healthy, brand-new socket — turning a diagnostic into an outage generator. So the
     /// check-in records this counter before it posts and only drops the socket if it has not moved.
     /// The worker has advertised `heardAgo: 1` on a batch reply (batch::heard_ago_supported).
+    /// The owner's automatic-update switch as the cloud last stated it (`autoUpdate`, Cloud #584).
+    ///
+    /// `None` = NEVER TOLD, which blocks the update (`Blocked::PolicyUnknown`). Silence is not
+    /// consent: a hub that has had no reply since boot, or talks to a worker predating the field,
+    /// must not update a vessel whose owner may have opted out.
+    pub auto_update: tokio::sync::RwLock<Option<bool>>,
     pub heard_ago_ok: std::sync::atomic::AtomicBool,
     pub relay_gen: std::sync::atomic::AtomicU64,
     /// Ask the relay task to drop its socket and reconnect (see relay_gen).
@@ -502,6 +508,7 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         web: tokio::sync::RwLock::new(web),
         web_ui_disabled: std::sync::atomic::AtomicBool::new(web_ui_disabled),
         nonce_ping_secs: std::sync::atomic::AtomicU64::new(nonce_ping_secs),
+        auto_update: tokio::sync::RwLock::new(None),
         heard_ago_ok: std::sync::atomic::AtomicBool::new(false),
         relay_gen: std::sync::atomic::AtomicU64::new(0),
         relay_drop: tokio::sync::Notify::new(),
@@ -1970,6 +1977,9 @@ fn http_client() -> reqwest::Client {
 async fn checkin_loop(rt: Shared) {
     let client = http_client();
     let mut next_due = tokio::time::Instant::now() + Duration::from_secs(cadence::FIRST_CHECKIN_SECS);
+    // Consecutive failed check-ins, for the retry backoff (cadence::checkin_retry_secs). Reset by
+    // the first delivered one — a single lost payload must not slow the next recovery.
+    let mut failures: u32 = 0;
     loop {
         let cfg = hub_config::read_config_in(&rt.base);
         if cfg.token.is_empty() || cfg.vid.is_empty() || !cfg.enabled {
@@ -1994,14 +2004,21 @@ async fn checkin_loop(rt: Shared) {
         rt.last_checkin_ms.store(now_ms(), Ordering::SeqCst);
         match checkin_once(&rt, &client, &cfg).await {
             Ok(()) => {
+                failures = 0;
                 // The period follows the vessel's ARMED WATCH, re-read after every keyframe: arming
                 // an anchor watch must tighten the next one, not the one after the next.
                 let secs = cadence::checkin_interval_secs(rt.telemetry.lock().await.watch.as_ref());
                 next_due = tokio::time::Instant::now() + Duration::from_secs(secs);
             }
             Err(e) => {
-                crate::hlog!("hub: check-in failed: {e}");
-                next_due = tokio::time::Instant::now() + Duration::from_secs(cadence::CHECKIN_RETRY_SECS);
+                failures = failures.saturating_add(1);
+                // The ANCHOR WATCH is read for the retry too, not just the period (owner ruling
+                // 2026-10-05): under one, the backoff never slows past a minute.
+                let anchor_armed =
+                    rt.telemetry.lock().await.watch.as_ref().is_some_and(|w| w.anchor.is_some());
+                let secs = cadence::checkin_retry_secs(failures, anchor_armed);
+                crate::hlog!("hub: check-in failed ({failures}): {e} - retrying in {secs}s");
+                next_due = tokio::time::Instant::now() + Duration::from_secs(secs);
             }
         }
     }
@@ -2186,6 +2203,13 @@ async fn post_batch(
                 // `relayUp: 0` — the worker holds no socket for this vessel, whatever our end thinks.
                 // Absent means an older worker or a reply that predates the opt-in; absent is never
                 // "no socket" (batch::relay_up).
+                if let Some(on) = batch::auto_update(&reply) {
+                    let mut slot = rt.auto_update.write().await;
+                    if *slot != Some(on) {
+                        crate::hlog!("hub: automatic updates are {} for this vessel", if on { "ON" } else { "OFF" });
+                        *slot = Some(on);
+                    }
+                }
                 if batch::heard_ago_supported(&reply) && !rt.heard_ago_ok.swap(true, Ordering::SeqCst) {
                     crate::hlog!("hub: the cloud understands heardAgoS - resent readings now carry their age");
                 }
@@ -2503,10 +2527,60 @@ async fn probation_loop(rt: Shared) {
     }
 }
 
-/// How often the daemon checks whether a newer release exists. Hours, not minutes: a release lands
-/// a few times a week at most, and this is visibility, not a safety path. Runs once at boot too, so
-/// a freshly started hub reports its update status on its first check-in rather than hours later.
-const UPDATE_CHECK_SECS: u64 = 6 * 3600;
+/// How often the daemon checks whether a newer release exists.
+///
+/// 🔴 WEEKLY (owner ruling, Jonathan 2026-10-05). It was every 6 h, and that poll follows a redirect
+/// into a ~207 KB page that GitHub serves WITHOUT gzip — about 25 MB a month on a boat's metered
+/// cellular link, a fifth of an idle hub's entire data budget, to ask a question whose answer is
+/// almost always "no" (sc4-internal docs/METERED-MODE-SPEC).
+///
+/// A WEEK IS NOT THE DELIVERY LATENCY FOR AN URGENT RELEASE, and that is what makes this safe: the
+/// cloud can queue a `self_update` command the hub runs on its next check-in
+/// (`run_commanded_self_update`), so a release that must go now is pushed rather than polled for.
+/// This poll is the routine, unattended path only. Runs once at boot too, so a freshly started hub
+/// reports its update status on its first check-in rather than a week later.
+const UPDATE_CHECK_SECS: u64 = 7 * 24 * 3600;
+
+/// An alarm counts as ACTIVE only if the sensor has re-asserted it this recently.
+///
+/// 🔴 WITHOUT A WINDOW THIS RULE NEVER CLEARS. `shelly_latest` is never evicted, so one flood event
+/// whose all-clear twin never arrived — a sensor pulled out, a battery dead mid-alarm — would block
+/// every automatic update on that boat FOR EVER, silently. A sensor that is genuinely still wet
+/// keeps reporting; one that stopped reporting two hours ago is a question for the offline alert,
+/// not a reason to refuse a 03:00 update indefinitely.
+const ALARM_ACTIVE_WITHIN_MS: i64 = 2 * 3600 * 1000;
+
+/// The hub's local hour, or None when the timezone cannot be resolved.
+fn local_hour() -> Option<u8> {
+    time::OffsetDateTime::now_local().ok().map(|t| t.hour())
+}
+
+/// Everything the update gate needs that only the hub can see.
+async fn update_conditions(rt: &Rt, offer: &str) -> crate::update_gate::UpdateConditions {
+    let now = now_ms();
+    let t = rt.telemetry.lock().await;
+    // Reuse the SAME classifier the valve-closing path uses, rather than a second opinion about what
+    // counts as an alarm: `is_flood_shutoff` already excludes `.measurement`/`.change`, the
+    // `_off`/`.off` all-clears and sensor faults.
+    let alarm_active = t.shelly_latest.values().any(|c| {
+        crate::linktap_runtime::is_flood_shutoff(&c.event) && c.heard_ms > 0 && now - c.heard_ms <= ALARM_ACTIVE_WITHIN_MS
+    });
+    let armed = t.watch.as_ref().is_some_and(|w| w.anchor.is_some() || w.zone.is_some());
+    drop(t);
+    let skip = std::fs::read_to_string(crate::update_gate::skip_path(&rt.base)).unwrap_or_default();
+    crate::update_gate::UpdateConditions {
+        armed,
+        alarm_active,
+        valve_closing: !rt.valve_closes.lock().await.is_empty(),
+        cycle_running: rt.linktap.lock().await.as_ref().is_some_and(|r| r.any_cycle_running()),
+        local_hour: local_hour(),
+        offer_was_rolled_back: crate::update_gate::skipped(&skip, offer),
+        // Read per decision rather than cached at boot: a hub does not change container-hood while
+        // running, but a cached answer is one more thing that can be wrong after a restart, and
+        // this is four cheap reads on a path that runs once an update check.
+        containerised: crate::update_gate::containerised_here(),
+    }
+}
 
 /// Poll GitHub for the latest daemon version and record it in `rt.update_available` when it is newer
 /// than the running one. Phase 1a: this only makes the gap VISIBLE (hub.status + /api/hub/status);
@@ -2539,6 +2613,45 @@ async fn update_check_loop(rt: Shared) {
                 *slot = available;
             }
         }
+        // ── AUTOMATIC INSTALL (owner's four rulings, 2026-09-25; ON by default 2026-10-04) ────────
+        //
+        // Phase 1a made the gap visible; this closes it. The decision is update_gate's, which is
+        // pure and tested; this is only the wiring that supplies what it needs and obeys the answer.
+        //
+        // 🔴 EVERY REFUSAL IS LOGGED WITH ITS REASON. "Why has my hub not updated" must have an
+        // answer that is not "it just does that" — and a hub that silently never updates is
+        // indistinguishable from one where this code is broken.
+        let offer = rt.update_available.read().await.clone();
+        if let Some(v) = offer {
+            let policy = rt.auto_update.read().await.map(|enabled| crate::update_gate::UpdatePolicy {
+                enabled,
+                ..crate::update_gate::UpdatePolicy::default()
+            });
+            let conds = update_conditions(&rt, &v).await;
+            match crate::update_gate::may_update_known(policy.as_ref(), &conds) {
+                Err(why) => crate::hlog!("hub: not installing {v} - {}", why.as_str()),
+                Ok(()) => {
+                    crate::hlog!("hub: installing {v} automatically (quiet window, nothing armed or running)");
+                    match crate::self_update::perform_update(&client).await {
+                        crate::self_update::UpdateOutcome::Swapped { to_version } => {
+                            arm_probation(&rt.base, &to_version);
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            let _restarting = crate::self_update::finalize_restart();
+                            crate::hlog!("hub: installed {to_version} automatically; restarting into it");
+                            #[cfg(unix)]
+                            std::process::exit(0);
+                        }
+                        crate::self_update::UpdateOutcome::UpToDate => {
+                            crate::hlog!("hub: automatic update found nothing to install after all");
+                        }
+                        crate::self_update::UpdateOutcome::Failed(e) => {
+                            crate::hlog!("hub: automatic update failed: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
         // The WEB APP rides the same cadence (web_bundle.rs). Its own client: a bundle is a few MB
         // and a Starlink afternoon is not a 20 s affair. A failure keeps the bundle in service.
         // Skipped entirely while the owner has the local web app turned off — no download at all.
@@ -6104,6 +6217,70 @@ mod tests {
             }
         }
         (false, None)
+    }
+
+    // ── the update gate's conditions, as the hub actually derives them ──────────────────────────
+    #[tokio::test]
+    async fn a_stale_uncleared_alarm_does_not_block_updates_for_ever() {
+        // 🔴 THE RULE THAT WOULD NEVER CLEAR. `shelly_latest` is never evicted, so one flood event
+        // whose all-clear never arrived — sensor pulled out, battery dead mid-alarm — would refuse
+        // every automatic update on that boat silently and permanently. A sensor still wet keeps
+        // reporting; one that went quiet two hours ago is the offline alert's problem.
+        let base = temp_base("gate_alarm");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, "https://unused.example".into());
+
+        // Fresh alarm: blocks.
+        {
+            let mut t = rt.telemetry.lock().await;
+            t.shelly_latest.insert("sh_bilge".into(), ShellyCached {
+                event: "flood.alarm".into(), params: vec![], heard_ms: now_ms(),
+            });
+        }
+        assert!(update_conditions(&rt, "9.9.9").await.alarm_active, "a flood heard now blocks");
+
+        // The SAME alarm, last heard three hours ago: no longer blocking.
+        {
+            let mut t = rt.telemetry.lock().await;
+            t.shelly_latest.get_mut("sh_bilge").unwrap().heard_ms = now_ms() - 3 * 3600 * 1000;
+        }
+        assert!(!update_conditions(&rt, "9.9.9").await.alarm_active, "a silent sensor must not block for ever");
+
+        // An all-clear is not an alarm, however fresh — is_flood_shutoff excludes `_off`.
+        {
+            let mut t = rt.telemetry.lock().await;
+            t.shelly_latest.insert("sh_bilge".into(), ShellyCached {
+                event: "flood.alarm_off".into(), params: vec![], heard_ms: now_ms(),
+            });
+        }
+        assert!(!update_conditions(&rt, "9.9.9").await.alarm_active, "the all-clear twin is not an alarm");
+
+        // Nor is a plain measurement from a flood sensor.
+        {
+            let mut t = rt.telemetry.lock().await;
+            t.shelly_latest.insert("sh_bilge".into(), ShellyCached {
+                event: "flood.measurement".into(), params: vec![], heard_ms: now_ms(),
+            });
+        }
+        assert!(!update_conditions(&rt, "9.9.9").await.alarm_active, "a measurement is not an alarm");
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_version_is_refused_by_the_gate_not_just_hidden() {
+        // The skip list already stops the update CHECK offering it; the gate must refuse it too, so
+        // a version that reaches here by any other route cannot reinstall itself into a loop.
+        let base = temp_base("gate_skip");
+        hub_config::write_config_in(&base, &seeded_cfg()).unwrap();
+        let rt = new_rt(base, "https://unused.example".into());
+        assert!(!update_conditions(&rt, "0.3.58").await.offer_was_rolled_back);
+        skip_version(&rt.base, "0.3.58");
+        let c = update_conditions(&rt, "0.3.58").await;
+        assert!(c.offer_was_rolled_back, "the gate sees the skip list");
+        assert_eq!(
+            crate::update_gate::may_update_known(Some(&crate::update_gate::UpdatePolicy::default()),
+                &crate::update_gate::UpdateConditions { local_hour: Some(3), ..c }),
+            Err(crate::update_gate::Blocked::VersionRolledBack),
+        );
     }
 
     #[tokio::test]
