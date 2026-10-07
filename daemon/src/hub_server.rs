@@ -34,7 +34,16 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+// 🔴 THE 64-BIT ATOMICS COME FROM `portable-atomic`, NOT `std` (R59/R75/R76).
+// 32-bit MIPS — the M2 station (mipsel_24kc) and the GL.iNet routers — has NO 64-bit atomic
+// instructions, so `std::sync::atomic::{AtomicU64, AtomicI64}` do not exist there and the daemon
+// simply will not compile. `portable-atomic` provides them with the same API, using the native
+// instruction where there is one and a lock-based fallback where there is not. On every target we
+// ship today (x86_64, aarch64, armv7) this compiles to exactly what `std` did.
+//
+// `AtomicUsize` and `Ordering` stay from `std`: pointer-width atomics exist everywhere.
+use portable_atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -322,7 +331,7 @@ pub struct Rt {
     pub web_ui_disabled: std::sync::atomic::AtomicBool,
     /// Live mirror of `hub_config::nonce_ping_secs`, so the relay can pick up a cadence change while
     /// a socket is open instead of at the next reconnect (which can be hours). Written by do_config.
-    pub nonce_ping_secs: std::sync::atomic::AtomicU64,
+    pub nonce_ping_secs: portable_atomic::AtomicU64,
     /// Bumped every time a relay socket is established (hub_relay.rs serve_once).
     ///
     /// 🔴 THIS EXISTS TO CLOSE A RACE, and without it `relayUp` would be worse than nothing. The
@@ -338,7 +347,7 @@ pub struct Rt {
     /// must not update a vessel whose owner may have opted out.
     pub auto_update: tokio::sync::RwLock<Option<bool>>,
     pub heard_ago_ok: std::sync::atomic::AtomicBool,
-    pub relay_gen: std::sync::atomic::AtomicU64,
+    pub relay_gen: portable_atomic::AtomicU64,
     /// Ask the relay task to drop its socket and reconnect (see relay_gen).
     pub relay_drop: tokio::sync::Notify,
     /// Epoch ms of the last REAL local event (an alarm, a valve transition, a command, a refresh, a
@@ -507,10 +516,10 @@ pub fn new_rt(base: PathBuf, worker_base: String) -> Shared {
         base,
         web: tokio::sync::RwLock::new(web),
         web_ui_disabled: std::sync::atomic::AtomicBool::new(web_ui_disabled),
-        nonce_ping_secs: std::sync::atomic::AtomicU64::new(nonce_ping_secs),
+        nonce_ping_secs: portable_atomic::AtomicU64::new(nonce_ping_secs),
         auto_update: tokio::sync::RwLock::new(None),
         heard_ago_ok: std::sync::atomic::AtomicBool::new(false),
-        relay_gen: std::sync::atomic::AtomicU64::new(0),
+        relay_gen: portable_atomic::AtomicU64::new(0),
         relay_drop: tokio::sync::Notify::new(),
         keys: tokio::sync::RwLock::new(keys),
         key_sync: tokio::sync::Mutex::new(crate::key_sync::KeySync::boot(
@@ -8019,5 +8028,63 @@ mod tests {
         assert!(event && up_of(&back.params) == "1");
         assert_eq!(st.health[&r.id], crate::router_health::RouterHealth::default());
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod mips_atomics_guard {
+    /// 🔴 THE DAEMON MUST NOT IMPORT std's 64-BIT ATOMICS — 32-BIT MIPS HAS NONE.
+    ///
+    /// `std::sync::atomic::{AtomicU64, AtomicI64}` do not exist on `mipsel_24kc` (the M2 station,
+    /// R76) or `mips_24kc` (the GL.iNet routers, R75), so one re-added import stops the lite
+    /// profile compiling at all. This guard exists because CI does NOT build those targets on
+    /// every PR: without it the breakage would surface weeks later, in a release, on a device
+    /// nobody can SSH into — and the author would have had no way to know.
+    ///
+    /// A comment would not have caught it. Use `portable_atomic::{AtomicU64, AtomicI64}`, which
+    /// is the same API and compiles to the same instruction wherever one exists.
+    #[test]
+    fn no_std_64_bit_atomics_anywhere_in_the_crate() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut files = 0usize;
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("read src/").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                    continue;
+                }
+                files += 1;
+                let text = std::fs::read_to_string(&p).expect("read a source file");
+                for (i, line) in text.lines().enumerate() {
+                    // Only IMPORTS and fully-qualified USES, not the prose explaining the rule.
+                    let code = line.split("//").next().unwrap_or("");
+                    // The needles are ASSEMBLED, never written whole: a literal
+                    // "std::sync::atomic::AtomicU64" in this file would make the guard flag
+                    // ITSELF, which is how the first version of it failed.
+                    let std_atomic = concat!("std::sync::", "atomic::");
+                    let hit_qualified = code.contains(&format!("{std_atomic}AtomicU64"))
+                        || code.contains(&format!("{std_atomic}AtomicI64"));
+                    let hit_import = code.contains(&format!("use {std_atomic}"))
+                        && (code.contains("AtomicU64") || code.contains("AtomicI64"));
+                    if hit_qualified || hit_import {
+                        offenders.push(format!("{}:{}  {}", p.display(), i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        // 🔴 THIRD BRANCH: a guard that walked nothing must FAIL, not quietly pass. A moved
+        // directory or a changed manifest dir would otherwise make this report "clean" for ever.
+        assert!(files > 20, "only walked {files} source files — this guard did not actually run");
+        assert!(
+            offenders.is_empty(),
+            "std's 64-bit atomics do not exist on 32-bit MIPS; use portable_atomic instead:\n  {}",
+            offenders.join("\n  "),
+        );
     }
 }

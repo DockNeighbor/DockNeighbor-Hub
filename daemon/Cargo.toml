@@ -78,6 +78,12 @@ prost = "0.13"
 h2 = "0.4"
 http = "1"
 bytes = "1"
+# 🔴 64-BIT ATOMICS ON 32-BIT MIPS (R59). The M2 station (mipsel_24kc) and the GL.iNet routers have
+# no 64-bit atomic instructions, so std's AtomicU64/AtomicI64 do not exist there. This provides them
+# with std's API — the native instruction where one exists, a lock-based fallback where none does.
+# `fallback` is what makes that true rather than a compile error; `require-cas` makes a target
+# without even 32-bit CAS fail LOUDLY at build time instead of silently selecting something odd.
+portable-atomic = { version = "1", default-features = false, features = ["std", "fallback", "require-cas"] }
 
 # The desktop tray stack — Windows AND macOS (owner 2026-08-20: "add a taskbar icon line on
 # windows to mac"). LINUX is deliberately excluded: the daemon runs there (containers) but has no
