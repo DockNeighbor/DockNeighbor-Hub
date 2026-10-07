@@ -7,9 +7,20 @@ on:
     branches: [main]
   pull_request:
 
+# A newer PR/branch push supersedes the older run. Each main run gets its own group (keyed by run_id)
+# because GitHub drops a PENDING run from a group when a newer one queues, even without
+# cancel-in-progress — and a main run is the only record that the merged tree passed.
+concurrency:
+  group: "ci-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}"
+  cancel-in-progress: true
+
+# Every job below carries timeout-minutes: 15. Without one a wedged step (a hung apt mirror, a stuck
+# cargo fetch) holds a hosted runner for GitHub's 6 h default. The slowest job, daemon-windows, has a
+# measured 30-day p90 under 4 min (whole-run p90 3.9); 15 is ~4x that, so only a hang trips it.
 jobs:
   hub:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: hub
@@ -28,6 +39,7 @@ jobs:
   # error severity. dash (ubuntu's sh) doubles as a busybox-ash POSIX check.
   hub-lite:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - name: Hub-lite parser tests
@@ -81,6 +93,7 @@ jobs:
   # Free: brvg-hub is a public repo, so GitHub-hosted Windows minutes are not billed.
   daemon-windows:
     runs-on: windows-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: daemon
@@ -94,6 +107,7 @@ jobs:
 
   daemon:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: daemon
@@ -147,6 +161,7 @@ jobs:
   # which is the only honest option but is also a red build. Do not "optimise" this checkout.
   version:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
         with:
